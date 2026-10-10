@@ -249,32 +249,12 @@ def execute_verifier(
     try:
         response = sandbox.process.exec(cmd, timeout=timeout)
     except Exception as exc:
-        err_str = str(exc).lower()
-        if 'timeout' in err_str or 'timed out' in err_str:
+        if is_command_timeout(exc):
             raise TimeoutError(f'Verifier execution exceeded {timeout}s timeout') from exc
         raise VerifierError(f'Verifier execution failed: {exc}') from exc
 
-    stdout = response.result.strip() if hasattr(response, 'result') else ''
-    exit_code = getattr(response, 'exit_code', -1)
-
-    # Exit codes 0 (passed) and 1 (failed) are normal verifier outcomes.
-    # Parse JSON regardless of exit code; only raise if no valid JSON found.
-    json_str = _extract_json_line(stdout)
-    if json_str is None:
-        stderr = getattr(response, 'stderr', '') or ''
-        raise VerifierError(
-            f'Verifier did not produce valid JSON. '
-            f'exit_code={exit_code}, stdout: {stdout!r}, stderr: {stderr!r}'
-        )
-
-    try:
-        result = VerifierResult.model_validate_json(json_str)
-    except Exception as exc:
-        raise VerifierError(
-            f'Failed to parse verifier JSON: {exc}. Raw output: {json_str!r}'
-        ) from exc
-
-    return result
+    # Exit codes 0 (passed) and 1 (failed) are normal verifier outcomes, so parse regardless.
+    return parse_verifier_output(response.result.strip(), f'exit_code={response.exit_code}')
 
 
 def cleanup_sandbox(sandbox: Sandbox, daytona: Daytona) -> None:
@@ -293,6 +273,32 @@ def cleanup_sandbox(sandbox: Sandbox, daytona: Daytona) -> None:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def parse_verifier_output(stdout: str, context: str = '') -> VerifierResult:
+    """Parse the last JSON line of verifier stdout into a VerifierResult.
+
+    Args:
+        stdout: Verifier stdout.
+        context: Extra diagnostics (exit code, stderr) for the error message.
+
+    Raises:
+        VerifierError: If there is no JSON line or it does not match the protocol.
+    """
+    json_str = _extract_json_line(stdout)
+    if json_str is None:
+        raise VerifierError(f'Verifier did not produce valid JSON. stdout: {stdout!r} {context}')
+    try:
+        return VerifierResult.model_validate_json(json_str)
+    except ValueError as exc:
+        raise VerifierError(f'Failed to parse verifier JSON: {exc}. Raw: {json_str!r}') from exc
+
+
+def is_command_timeout(exc: Exception) -> bool:
+    """Return True if a Daytona exec failed because the command outran its timeout."""
+    from daytona import DaytonaProcessExecutionTimeoutError
+
+    return isinstance(exc, DaytonaProcessExecutionTimeoutError)
 
 
 def _extract_json_line(stdout: str) -> str | None:
@@ -380,22 +386,8 @@ class LocalExecutor:
             stdout = proc.stdout.strip()
             stderr = proc.stderr.strip()
 
-            json_str = _extract_json_line(stdout)
-            if json_str is None:
-                raise VerifierError(
-                    f'Local verifier did not produce valid JSON. '
-                    f'stdout: {stdout!r}, stderr: {stderr!r}'
-                )
-
-            try:
-                result = VerifierResult.model_validate_json(json_str)
-            except Exception as exc:
-                raise VerifierError(
-                    f'Failed to parse local verifier JSON: {exc}. Raw: {json_str!r}'
-                ) from exc
-
             return ExecutionResult(
-                verifier_result=result,
+                verifier_result=parse_verifier_output(stdout, f'stderr: {stderr!r}'),
                 stderr=stderr,
                 exit_code=proc.returncode,
             )
@@ -478,22 +470,8 @@ class AsyncLocalExecutor:
             stderr = stderr_bytes.decode('utf-8', errors='replace').strip()
             exit_code = proc.returncode if proc.returncode is not None else -1
 
-            json_str = _extract_json_line(stdout)
-            if json_str is None:
-                raise VerifierError(
-                    f'Async local verifier did not produce valid JSON. '
-                    f'stdout: {stdout!r}, stderr: {stderr!r}'
-                )
-
-            try:
-                result = VerifierResult.model_validate_json(json_str)
-            except Exception as exc:
-                raise VerifierError(
-                    f'Failed to parse async local verifier JSON: {exc}. Raw: {json_str!r}'
-                ) from exc
-
             return ExecutionResult(
-                verifier_result=result,
+                verifier_result=parse_verifier_output(stdout, f'stderr: {stderr!r}'),
                 stderr=stderr,
                 exit_code=exit_code,
             )

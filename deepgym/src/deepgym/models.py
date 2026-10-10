@@ -319,6 +319,9 @@ class MultiTurnEnvironment(BaseModel):
     timeout_per_step: int = Field(default=30, ge=1)
     """Timeout per individual step in seconds."""
 
+    setup_timeout: int = Field(default=120, ge=1)
+    """Timeout for setup_script and setup_code each, in seconds (desktop apps boot slowly)."""
+
     allowed_actions: frozenset[ActionType] = frozenset({'code', 'bash', 'write_file', 'done'})
     """Action types the agent may use. Anything else is rejected."""
 

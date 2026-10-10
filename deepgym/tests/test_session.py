@@ -1,9 +1,12 @@
 """Tests for deepgym.session -- live multi-turn episodes on the local backend."""
 
+import asyncio
+import threading
+
 import pytest
 from pydantic import ValidationError
 
-from deepgym import ComputerUseEnvironment, DeepGym
+from deepgym import AsyncDeepGym, ComputerUseEnvironment, DeepGym
 from deepgym.exceptions import DeepGymError, SandboxError, VerifierError
 from deepgym.models import Action, MultiTurnEnvironment, Observation, Trajectory
 from deepgym.session import _signals_done
@@ -217,6 +220,45 @@ class TestLocalEpisodes:
             with pytest.raises(VerifierError, match='unparseable'):
                 session.step(Action(content='print(1)'))
 
+    def test_step_verifier_stderr_is_ignored(self, dg: DeepGym) -> None:
+        noisy = 'import sys\nprint("DeprecationWarning: x", file=sys.stderr)\nprint(0.5)\n'
+        env = MultiTurnEnvironment(task='t', max_steps=1, step_verifier_code=noisy)
+        trajectory, _ = dg.run_episode(env, lambda obs: Action(content='print(1)'))
+        assert trajectory.step_rewards == [0.5]
+
+    def test_failed_step_verifier_ends_episode_consistently(self, dg: DeepGym) -> None:
+        env = MultiTurnEnvironment(task='t', max_steps=5, step_verifier_code='print("nope")')
+        with dg.session(env) as session:
+            session.start()
+            with pytest.raises(VerifierError):
+                session.step(Action(content='print(1)'))
+            assert session.done
+            assert len(session.trajectory.steps) == len(session.trajectory.step_rewards) == 1
+
+    def test_setup_has_its_own_timeout(self, dg: DeepGym) -> None:
+        env = MultiTurnEnvironment(
+            task='t', setup_script='sleep 2; echo ready', timeout_per_step=1, setup_timeout=10
+        )
+        with dg.session(env) as session:
+            assert session.start().content.strip() == 'ready'
+
+    def test_concurrent_steps_are_serialized(self, dg: DeepGym) -> None:
+        env = MultiTurnEnvironment(task='t', max_steps=20)
+        with dg.session(env) as session:
+            session.start()
+
+            def worker() -> None:
+                for _ in range(5):
+                    session.step(Action(action_type='bash', content='sleep 0.02'))
+
+            threads = [threading.Thread(target=worker) for _ in range(3)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            steps = [obs.step for obs, _ in session.trajectory.steps]
+        assert steps == list(range(15))
+
     def test_step_timeout_becomes_observation(self, dg: DeepGym) -> None:
         env = MultiTurnEnvironment(task='t', max_steps=1, timeout_per_step=1)
         with dg.session(env) as session:
@@ -255,3 +297,11 @@ class TestSessionGuards:
     def test_run_rejects_multi_turn_env(self, dg: DeepGym) -> None:
         with pytest.raises(DeepGymError, match='run_episode'):
             dg.run(MultiTurnEnvironment(task='t'), model_output='')
+
+    def test_async_run_rejects_multi_turn_env(self) -> None:
+        with pytest.raises(DeepGymError, match='run_episode'):
+            asyncio.run(AsyncDeepGym(mode='local').run(MultiTurnEnvironment(task='t'), ''))
+
+    def test_eval_rejects_agent_suites(self, dg: DeepGym) -> None:
+        with pytest.raises(DeepGymError, match='needs an agent'):
+            dg.eval('computer-use', {})

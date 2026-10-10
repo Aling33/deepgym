@@ -328,6 +328,8 @@ class DeepGym:
         from deepgym.registry import load_suite
 
         envs = load_suite(suite)
+        if any(isinstance(env, MultiTurnEnvironment) for env in envs):
+            raise DeepGymError(f'Suite {suite!r} needs an agent: use dg.run_episode() per env')
         results: list[RunResult] = []
 
         # Build a lookup from environment directory name to solution.

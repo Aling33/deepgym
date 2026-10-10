@@ -36,7 +36,7 @@ from pydantic import ValidationError
 from verl.tools.base_tool import BaseTool, OpenAIFunctionToolSchema, ToolResponse
 
 from deepgym.core import DeepGym
-from deepgym.exceptions import DeepGymError, SandboxError, VerifierError
+from deepgym.exceptions import ActionError
 from deepgym.models import Action, ActionType, Observation
 from deepgym.registry import load_environment
 from deepgym.session import Session
@@ -116,9 +116,7 @@ class DeepGymSessionTool(BaseTool):
             obs, reward, done = await asyncio.to_thread(session.step, action)
         except ValidationError as exc:
             return ToolResponse(text=f'Invalid action: {exc.errors()[0]["msg"]}'), 0.0, {}
-        except (SandboxError, VerifierError):
-            raise
-        except DeepGymError as exc:
+        except ActionError as exc:
             return ToolResponse(text=str(exc)), 0.0, {}
         return _to_response(obs), reward, {'done': done}
 

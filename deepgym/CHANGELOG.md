@@ -13,6 +13,12 @@
 - Setup scripts that exit non-zero raise `SandboxError`; shell steps report `exit_code` in observation metadata; both backends run commands under bash
 - Step verifiers that print garbage now raise `VerifierError` instead of scoring 0
 - CI: ruff skips markdown task prompts and JSON payloads stored as `.py`, which formatting would change
+- `ActionError` for actions the environment rejects (not allowed, unknown key name); the verl tool returns these to the model as text and raises everything else
+- Sessions serialize concurrent step/score/close calls; a failed step verifier ends the episode with a consistent trajectory; step-verifier stderr is ignored
+- `setup_timeout` (default 120s) bounds setup separately from per-step actions
+- Daytona sessions create their work dir up front and tell command timeouts apart from connection timeouts via the SDK's typed errors
+- `dg.eval()` and `AsyncDeepGym.run()` reject multi-turn envs with a clear error instead of crashing
+- One shared `parse_verifier_output()` replaces five copies of verifier JSON parsing
 - Breaking: removed `MultiTurnRunner` (use `dg.run_episode()`), `ScreenshotVerifier`, and `ToolUseEnvironment`; `ComputerUseEnvironment` is now a desktop `MultiTurnEnvironment`
 - Breaking: `file_organizer` and `cli_task` are now type `coding` (they were single-shot scripts, not computer use); computer-use envs only appear in the `computer-use` suite
 - Switched the Daytona dependency from the deprecated `daytona-sdk` to `daytona`; Daytona session sandboxes block outbound network

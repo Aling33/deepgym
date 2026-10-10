@@ -17,16 +17,18 @@ from deepgym.models import (
     BatchResult,
     Environment,
     EvalResult,
+    MultiTurnEnvironment,
     RunResult,
     VerifierResult,
 )
 from deepgym.sandbox import (
     AsyncLocalExecutor,
-    _extract_json_line,
     _shell_escape,
     _validate_env_vars,
     build_run_result,
+    is_command_timeout,
     is_standalone_verifier,
+    parse_verifier_output,
 )
 from deepgym.verifier_template import wrap_verifier
 
@@ -109,7 +111,10 @@ class AsyncDeepGym:
             SandboxError: If sandbox operations fail.
             VerifierError: If verifier output is invalid.
             TimeoutError: If execution exceeds the timeout.
+            DeepGymError: If *env* is multi-turn (it needs an agent, not one output).
         """
+        if isinstance(env, MultiTurnEnvironment):
+            raise DeepGymError('Multi-turn environments need an agent: use dg.run_episode()')
         if self._api_url is not None:
             return await self._run_http(env, model_output)
 
@@ -610,28 +615,12 @@ class AsyncDeepGym:
         try:
             response = await sandbox.process.exec(cmd, timeout=timeout)
         except Exception as exc:
-            err_str = str(exc).lower()
-            if 'timeout' in err_str or 'timed out' in err_str:
+            if is_command_timeout(exc):
                 raise TimeoutError(f'Verifier execution exceeded {timeout}s timeout') from exc
             raise VerifierError(f'Verifier execution failed: {exc}') from exc
 
-        stdout = response.result.strip() if hasattr(response, 'result') else ''
-        exit_code = getattr(response, 'exit_code', -1)
-
-        # Exit codes 0 (passed) and 1 (failed) are normal verifier outcomes.
-        # Parse JSON regardless of exit code; only raise if no valid JSON found.
-        json_str = _extract_json_line(stdout)
-        if json_str is None:
-            stderr = getattr(response, 'stderr', '') or ''
-            raise VerifierError(
-                f'Verifier did not produce valid JSON. '
-                f'exit_code={exit_code}, stdout: {stdout!r}, stderr: {stderr!r}'
-            )
-
-        try:
-            return VerifierResult.model_validate_json(json_str)
-        except Exception as exc:
-            raise VerifierError(f'Failed to parse verifier JSON: {exc}. Raw: {json_str!r}') from exc
+        # Exit codes 0 (passed) and 1 (failed) are normal verifier outcomes, so parse regardless.
+        return parse_verifier_output(response.result.strip(), f'exit_code={response.exit_code}')
 
     async def _cleanup_sandbox(self, sandbox: Sandbox) -> None:
         """Safely destroy a sandbox, swallowing errors."""
@@ -671,4 +660,7 @@ class AsyncDeepGym:
         """
         from deepgym.registry import load_suite
 
-        return load_suite(suite)
+        envs = load_suite(suite)
+        if any(isinstance(env, MultiTurnEnvironment) for env in envs):
+            raise DeepGymError(f'Suite {suite!r} needs an agent: use dg.run_episode() per env')
+        return envs

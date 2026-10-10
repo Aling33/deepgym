@@ -362,12 +362,12 @@ def _drop_session(session_id: str) -> Session | None:
 
 
 def _evict_idle_sessions() -> None:
-    """Close sessions untouched for longer than the idle TTL so abandoned ones free slots."""
+    """Free slots held by sessions idle past the TTL; their sandboxes close in the background."""
     cutoff = time.monotonic() - _SESSION_IDLE_TTL_S
     for session_id in [sid for sid, used in list(_last_used.items()) if used < cutoff]:
         session = _drop_session(session_id)
         if session is not None:
-            session.close()
+            threading.Thread(target=session.close, daemon=True).start()
 
 
 @v1_router.post('/sessions', response_model=SessionResponse, status_code=status.HTTP_201_CREATED)
