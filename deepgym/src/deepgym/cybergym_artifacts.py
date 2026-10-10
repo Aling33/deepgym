@@ -170,7 +170,9 @@ class CyberGymPatchEnvironment(Environment):
             level=self.level,
         )
         patch_text = extract_patch(model_output)
-        payload = build_payload(self.row, artifacts, timeout=int(kwargs.get('timeout', self.timeout)))
+        payload = build_payload(
+            self.row, artifacts, timeout=int(kwargs.get('timeout', self.timeout))
+        )
         script = build_cybergym_patch_runner_script()
         timeout = int(kwargs.get('timeout', self.timeout))
 
@@ -186,7 +188,9 @@ class CyberGymPatchEnvironment(Environment):
 
             from deepgym.sandbox import build_run_result
 
-            return build_run_result(verifier_result, time.perf_counter() * 0, 'local', stderr, exit_code)
+            return build_run_result(
+                verifier_result, time.perf_counter() * 0, 'local', stderr, exit_code
+            )
 
         verifier_result, stderr, exit_code, sandbox_id = _run_daytona_runner(
             self,
@@ -201,18 +205,26 @@ class CyberGymPatchEnvironment(Environment):
 
         from deepgym.sandbox import build_run_result
 
-        return build_run_result(verifier_result, time.perf_counter() * 0, sandbox_id, stderr, exit_code)
+        return build_run_result(
+            verifier_result, time.perf_counter() * 0, sandbox_id, stderr, exit_code
+        )
 
 
-def build_payload(row: dict[str, Any], artifacts: CyberGymArtifacts, *, timeout: int) -> dict[str, Any]:
+def build_payload(
+    row: dict[str, Any], artifacts: CyberGymArtifacts, *, timeout: int
+) -> dict[str, Any]:
     """Build runner payload."""
-    ref_patch = artifacts.patch.read_text(encoding='utf-8', errors='replace') if artifacts.patch else ''
+    ref_patch = (
+        artifacts.patch.read_text(encoding='utf-8', errors='replace') if artifacts.patch else ''
+    )
     description = (
         artifacts.description.read_text(encoding='utf-8', errors='replace')
         if artifacts.description
         else str(row.get('vulnerability_description') or '')
     )
-    error_text = artifacts.error.read_text(encoding='utf-8', errors='replace') if artifacts.error else ''
+    error_text = (
+        artifacts.error.read_text(encoding='utf-8', errors='replace') if artifacts.error else ''
+    )
     return {
         'task_id': artifacts.task_id,
         'project': row.get('project_name', ''),
