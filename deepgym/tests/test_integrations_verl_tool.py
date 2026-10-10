@@ -48,7 +48,7 @@ def tool_module(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
     monkeypatch.setitem(sys.modules, 'verl.tools.base_tool', base_tool)
     monkeypatch.delitem(sys.modules, 'deepgym.integrations.verl_tool', raising=False)
     module = importlib.import_module('deepgym.integrations.verl_tool')
-    monkeypatch.setattr(module, 'load_environment', lambda name: ENV)
+    monkeypatch.setattr(module, 'load_environment', lambda name, variant=0: ENV)
     return module
 
 

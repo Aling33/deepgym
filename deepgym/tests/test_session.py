@@ -4,7 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from deepgym import ComputerUseEnvironment, DeepGym
-from deepgym.exceptions import DeepGymError
+from deepgym.exceptions import DeepGymError, SandboxError, VerifierError
 from deepgym.models import Action, MultiTurnEnvironment, Observation, Trajectory
 from deepgym.session import _signals_done
 
@@ -54,7 +54,7 @@ class TestActionValidation:
         with pytest.raises(ValidationError, match='key needs content'):
             Action(action_type='key')
 
-    @pytest.mark.parametrize('path', [None, '/etc/passwd', '../escape.txt', 'a/../../b'])
+    @pytest.mark.parametrize('path', [None, '/etc/passwd', '../escape.txt', 'a/../../b', '.', ''])
     def test_write_file_rejects_unsafe_paths(self, path: str | None) -> None:
         with pytest.raises(ValidationError, match='relative path'):
             Action(action_type='write_file', path=path, content='x')
@@ -194,6 +194,28 @@ class TestLocalEpisodes:
         trajectory, _ = dg.run_episode(env, agent)
         assert trajectory.step_rewards == [0.5, 0.0]
         assert trajectory.total_reward == 0.5
+
+    def test_failing_setup_raises(self, dg: DeepGym) -> None:
+        env = MultiTurnEnvironment(task='t', setup_script='echo broken >&2; exit 3')
+        with dg.session(env) as session:
+            with pytest.raises(SandboxError, match='exited 3'):
+                session.start()
+
+    def test_command_exit_code_in_observation(self, dg: DeepGym) -> None:
+        env = MultiTurnEnvironment(task='t', max_steps=3)
+        with dg.session(env) as session:
+            session.start()
+            failed = session.step(Action(action_type='bash', content='false')).observation
+            wrote = session.step(Action(action_type='write_file', path='a.txt', content='x'))
+        assert failed.metadata == {'exit_code': 1}
+        assert wrote.observation.metadata is None
+
+    def test_broken_step_verifier_raises(self, dg: DeepGym) -> None:
+        env = MultiTurnEnvironment(task='t', max_steps=2, step_verifier_code='print("nope")')
+        with dg.session(env) as session:
+            session.start()
+            with pytest.raises(VerifierError, match='unparseable'):
+                session.step(Action(content='print(1)'))
 
     def test_step_timeout_becomes_observation(self, dg: DeepGym) -> None:
         env = MultiTurnEnvironment(task='t', max_steps=1, timeout_per_step=1)

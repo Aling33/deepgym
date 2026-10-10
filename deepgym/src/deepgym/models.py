@@ -264,7 +264,7 @@ class Action(BaseModel):
             raise ValueError(f'{kind} needs content')
         if kind == 'write_file':
             rel = PurePosixPath(self.path or '')
-            if not self.path or rel.is_absolute() or '..' in rel.parts:
+            if not rel.parts or rel.is_absolute() or '..' in rel.parts:
                 raise ValueError('write_file needs a relative path without ".."')
         return self
 

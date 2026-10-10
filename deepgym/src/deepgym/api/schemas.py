@@ -230,8 +230,13 @@ class BenchmarkAuditRequest(BaseModel):
 class CreateSessionRequest(BaseModel):
     """Request body for POST /v1/sessions."""
 
-    environment: str | ComputerUseEnvironment | MultiTurnEnvironment
-    """Registry name (e.g. 'signup_form') or an inline multi-turn environment spec."""
+    environment: str | MultiTurnEnvironment | ComputerUseEnvironment = Field(
+        union_mode='left_to_right'
+    )
+    """Registry name (e.g. 'signup_form') or an inline spec; no 'type' means multi-turn."""
+
+    variant: int = Field(default=0, ge=0)
+    """Parameter set to load for a registry computer-use env (ignored for inline specs)."""
 
 
 # ---------------------------------------------------------------------------

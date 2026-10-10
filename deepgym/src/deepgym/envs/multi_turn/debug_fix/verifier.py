@@ -12,7 +12,7 @@ import json
 import sys
 from pathlib import Path
 
-work_dir = Path(__file__).parent
+work_dir = Path.cwd()
 
 
 def run_tests():

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -328,22 +330,44 @@ def create_snapshot(_body: CreateSnapshotRequest) -> None:
 # ---------------------------------------------------------------------------
 # Live multi-turn sessions
 # ---------------------------------------------------------------------------
-# ponytail: in-memory, no idle eviction. Abandoned Daytona sandboxes are
-# ephemeral and auto-stop on Daytona's side; add a TTL sweep if the cap bites.
+# ponytail: in-memory store, single process. Move to a shared store if the API scales out.
 
 _MAX_SESSIONS = 100
+_SESSION_IDLE_TTL_S = 30 * 60
 _sessions: dict[str, Session] = {}
+_last_used: dict[str, float] = {}
+# Counts live sessions plus ones still booting, so parallel creates can't overshoot the cap.
+_session_slots = threading.BoundedSemaphore(_MAX_SESSIONS)
 
 
 def _get_session(session_id: str) -> Session:
-    """Resolve a live session or raise 404."""
+    """Resolve a live session (marking it used) or raise 404."""
     session = _sessions.get(session_id)
     if session is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session '{session_id}' not found.",
         )
+    _last_used[session_id] = time.monotonic()
     return session
+
+
+def _drop_session(session_id: str) -> Session | None:
+    """Remove a session from the store and free its slot; the caller closes it."""
+    session = _sessions.pop(session_id, None)
+    _last_used.pop(session_id, None)
+    if session is not None:
+        _session_slots.release()
+    return session
+
+
+def _evict_idle_sessions() -> None:
+    """Close sessions untouched for longer than the idle TTL so abandoned ones free slots."""
+    cutoff = time.monotonic() - _SESSION_IDLE_TTL_S
+    for session_id in [sid for sid, used in list(_last_used.items()) if used < cutoff]:
+        session = _drop_session(session_id)
+        if session is not None:
+            session.close()
 
 
 @v1_router.post('/sessions', response_model=SessionResponse, status_code=status.HTTP_201_CREATED)
@@ -352,14 +376,10 @@ def create_session(
     dg: Annotated[DeepGym, Depends(get_deepgym)],
 ) -> SessionResponse:
     """Open a live sandbox for one episode and return the first observation."""
-    if len(_sessions) >= _MAX_SESSIONS:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail='Session limit reached'
-        )
     env = body.environment
     if isinstance(env, str):
         try:
-            env = load_environment(env)
+            env = load_environment(env, variant=body.variant)
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     if not isinstance(env, MultiTurnEnvironment):
@@ -367,15 +387,25 @@ def create_session(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail='Sessions need a multi-turn environment; use /v1/run for single-turn ones.',
         )
-    with _http_errors(fallback_status=status.HTTP_400_BAD_REQUEST):
-        session = dg.session(env)
-        try:
-            observation = session.start()
-        except BaseException:
-            session.close()
-            raise
+    _evict_idle_sessions()
+    if not _session_slots.acquire(blocking=False):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail='Session limit reached'
+        )
+    try:
+        with _http_errors(fallback_status=status.HTTP_400_BAD_REQUEST):
+            session = dg.session(env)
+            try:
+                observation = session.start()
+            except BaseException:
+                session.close()
+                raise
+    except BaseException:
+        _session_slots.release()
+        raise
     session_id = uuid.uuid4().hex
     _sessions[session_id] = session
+    _last_used[session_id] = time.monotonic()
     return SessionResponse(
         session_id=session_id, sandbox_id=session.sandbox_id, observation=observation
     )
@@ -400,8 +430,13 @@ def score_session(session_id: str) -> RunResult:
 @v1_router.delete('/sessions/{session_id}', status_code=status.HTTP_204_NO_CONTENT)
 def close_session(session_id: str) -> None:
     """Close the session and delete its sandbox."""
-    _get_session(session_id)
-    _sessions.pop(session_id).close()
+    session = _drop_session(session_id)
+    if session is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{session_id}' not found.",
+        )
+    session.close()
 
 
 # ---------------------------------------------------------------------------

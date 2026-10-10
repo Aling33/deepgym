@@ -11,14 +11,14 @@ Tool config (``actor_rollout_ref.rollout.multi_turn.tool_config_path``)::
         config:
           type: native
           environment: signup_form   # default; override per sample below
-          mode: daytona
+          mode: daytona             # default; 'local' runs model commands on this host
 
 Per-sample environment, in the dataset row::
 
     extra_info:
       tools_kwargs:
         computer:
-          create_kwargs: {environment: todo_list}
+          create_kwargs: {environment: todo_list, variant: 3}
 
 Sources:
     - https://github.com/verl-project/verl/blob/main/docs/sglang_multiturn/multiturn.rst
@@ -36,7 +36,7 @@ from pydantic import ValidationError
 from verl.tools.base_tool import BaseTool, OpenAIFunctionToolSchema, ToolResponse
 
 from deepgym.core import DeepGym
-from deepgym.exceptions import SandboxError
+from deepgym.exceptions import DeepGymError, SandboxError, VerifierError
 from deepgym.models import Action, ActionType, Observation
 from deepgym.registry import load_environment
 from deepgym.session import Session
@@ -82,7 +82,7 @@ class DeepGymSessionTool(BaseTool):
 
     def __init__(self, config: dict, tool_schema: OpenAIFunctionToolSchema | None) -> None:
         super().__init__(config, tool_schema or OpenAIFunctionToolSchema(**TOOL_SCHEMA))
-        self._dg = DeepGym(mode=config.get('mode', 'auto'))
+        self._dg = DeepGym(mode=config.get('mode', 'daytona'))
         self._sessions: dict[str, Session] = {}
 
     async def create(
@@ -90,8 +90,12 @@ class DeepGymSessionTool(BaseTool):
     ) -> tuple[str, ToolResponse]:
         """Open a sandbox for one rollout and return the first observation."""
         instance_id = instance_id or str(uuid4())
-        name = kwargs.get('create_kwargs', {}).get('environment', self.config['environment'])
-        session = self._dg.session(load_environment(name))
+        create_kwargs = kwargs.get('create_kwargs', {})
+        env = load_environment(
+            create_kwargs.get('environment', self.config['environment']),
+            variant=create_kwargs.get('variant', 0),
+        )
+        session = await asyncio.to_thread(self._dg.session, env)
         try:
             obs = await asyncio.to_thread(session.start)
         except BaseException:
@@ -112,9 +116,9 @@ class DeepGymSessionTool(BaseTool):
             obs, reward, done = await asyncio.to_thread(session.step, action)
         except ValidationError as exc:
             return ToolResponse(text=f'Invalid action: {exc.errors()[0]["msg"]}'), 0.0, {}
-        except SandboxError:
+        except (SandboxError, VerifierError):
             raise
-        except Exception as exc:  # noqa: BLE001 - not-allowed actions etc. go back to the model
+        except DeepGymError as exc:
             return ToolResponse(text=str(exc)), 0.0, {}
         return _to_response(obs), reward, {'done': done}
 

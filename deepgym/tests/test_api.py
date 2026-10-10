@@ -1,6 +1,7 @@
 """Tests for the DeepGym FastAPI application."""
 
 import os
+import threading
 from unittest.mock import patch
 
 import pytest
@@ -8,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from deepgym.api.app import app
 from deepgym.api.deps import get_deepgym
+from deepgym.api import routes
 from deepgym.api.routes import _environments, _sessions
 from deepgym.core import DeepGym
 
@@ -36,6 +38,8 @@ def _close_sessions():
     for session in _sessions.values():
         session.close()
     _sessions.clear()
+    routes._last_used.clear()
+    routes._session_slots = threading.BoundedSemaphore(routes._MAX_SESSIONS)
 
 
 @pytest.fixture(autouse=True)
@@ -386,6 +390,51 @@ class TestSessions:
 
     def test_unknown_env_is_404(self, client: TestClient) -> None:
         resp = client.post('/v1/sessions', json={'environment': 'no_such_env_xyz'})
+        assert resp.status_code == 404
+
+    def test_session_cap_counts_booting_and_live_sessions(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(routes, '_session_slots', threading.BoundedSemaphore(1))
+        first = client.post('/v1/sessions', json={'environment': FILE_CHECK_ENV})
+        assert first.status_code == 201
+        assert client.post('/v1/sessions', json={'environment': FILE_CHECK_ENV}).status_code == 429
+
+        session_id = first.json()['session_id']
+        assert client.delete(f'/v1/sessions/{session_id}').status_code == 204
+        assert client.delete(f'/v1/sessions/{session_id}').status_code == 404
+        assert client.post('/v1/sessions', json={'environment': FILE_CHECK_ENV}).status_code == 201
+
+    def test_failed_start_frees_its_slot(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(routes, '_session_slots', threading.BoundedSemaphore(1))
+        assert client.post('/v1/sessions', json={'environment': 'signup_form'}).status_code == 400
+        assert client.post('/v1/sessions', json={'environment': FILE_CHECK_ENV}).status_code == 201
+
+    def test_inline_env_without_type_is_multi_turn(self, client: TestClient) -> None:
+        spec = {key: value for key, value in FILE_CHECK_ENV.items() if key != 'type'}
+        created = client.post('/v1/sessions', json={'environment': spec})
+        assert created.status_code == 201
+        step = client.post(
+            f'/v1/sessions/{created.json()["session_id"]}/step',
+            json={'action_type': 'bash', 'content': 'echo hello > out.txt'},
+        )
+        assert step.status_code == 200
+
+    def test_idle_sessions_are_evicted(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(routes, '_session_slots', threading.BoundedSemaphore(1))
+        stale = client.post('/v1/sessions', json={'environment': FILE_CHECK_ENV}).json()
+        routes._last_used[stale['session_id']] -= routes._SESSION_IDLE_TTL_S + 1
+
+        fresh = client.post('/v1/sessions', json={'environment': FILE_CHECK_ENV})
+        assert fresh.status_code == 201
+        assert client.post(f'/v1/sessions/{stale["session_id"]}/score').status_code == 404
+
+    def test_bad_variant_is_404(self, client: TestClient) -> None:
+        resp = client.post('/v1/sessions', json={'environment': 'todo_list', 'variant': 99})
         assert resp.status_code == 404
 
     def test_desktop_env_needs_daytona(self, client: TestClient) -> None:
