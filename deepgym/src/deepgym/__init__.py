@@ -10,11 +10,7 @@ from deepgym.benchmark_envs import (
     TerminalBenchEnvironment,
 )
 from deepgym.benchmark_ops import BenchmarkAuditReport, BenchmarkLeak, BenchmarkManifestEntry
-from deepgym.computer_use import (
-    ComputerUseEnvironment,
-    ScreenshotVerifier,
-    ToolUseEnvironment,
-)
+from deepgym.computer_use import ComputerUseEnvironment
 from deepgym.core import DeepGym
 from deepgym.gym import AsyncDeepGymEnv, DeepGymEnv, GymInfo, GymObservation
 from deepgym.integrations.reward import AsyncRewardFunction, RewardFunction
@@ -30,9 +26,9 @@ from deepgym.models import (
     Trajectory,
     VerifierResult,
 )
-from deepgym.multi_turn import MultiTurnRunner
 from deepgym.registry import list_environments, load_environment, load_suite
 from deepgym.reward_qa import RewardAuditor, VerifierAuditReport
+from deepgym.session import Session, StepResult
 from deepgym.verifier import Verifier
 
 __all__ = [
@@ -54,16 +50,15 @@ __all__ = [
     'GymObservation',
     'MixedEnvironment',
     'MultiTurnEnvironment',
-    'MultiTurnRunner',
     'Observation',
     'PatchVerifier',
     'RewardAuditor',
     'RewardFunction',
     'RunResult',
-    'ScreenshotVerifier',
+    'Session',
+    'StepResult',
     'SWEBenchProEnvironment',
     'TerminalBenchEnvironment',
-    'ToolUseEnvironment',
     'CaseResult',
     'Trajectory',
     'Verifier',

@@ -1,10 +1,6 @@
 """Sandbox lifecycle management for DeepGym.
 
 Handles creation, setup, execution, and teardown of Daytona sandboxes.
-
-NOTE: Daytona SDK import names may vary across versions. Verify the import
-paths (Daytona, CreateSandboxFromSnapshotParams, CreateSandboxFromImageParams,
-Image, Sandbox) against the installed daytona-sdk version.
 """
 
 from __future__ import annotations
@@ -26,10 +22,7 @@ from deepgym.models import Environment, RunResult, VerifierResult
 from deepgym.verifier_template import wrap_verifier
 
 if TYPE_CHECKING:
-    try:
-        from daytona import Daytona, Sandbox
-    except ImportError:
-        from daytona_sdk import Daytona, Sandbox
+    from daytona import Daytona, Sandbox
 
 logger = logging.getLogger(__name__)
 
@@ -149,26 +142,16 @@ def create_sandbox(env: Environment, daytona: Daytona) -> Sandbox:
     Raises:
         SandboxError: If sandbox creation fails.
     """
-    # NOTE: Import here so module-level import failures don't break the
-    # entire package when daytona-sdk is not installed.
     try:
         from daytona import (
             CreateSandboxFromImageParams,
             CreateSandboxFromSnapshotParams,
             Image,
         )
-    except ImportError:
-        try:
-            from daytona_sdk import (
-                CreateSandboxFromImageParams,
-                CreateSandboxFromSnapshotParams,
-                Image,
-            )
-        except ImportError as exc:
-            raise SandboxError(
-                'daytona-sdk is required but could not be imported. '
-                'Install it with: pip install daytona-sdk'
-            ) from exc
+    except ImportError as exc:
+        raise SandboxError(
+            "daytona is required. Install it with: pip install 'deepgym[daytona]'"
+        ) from exc
 
     try:
         if env.snapshot:

@@ -31,11 +31,11 @@ dependencies = [
 
 [project.optional-dependencies]
 server = ["fastapi>=0.100", "uvicorn[standard]>=0.20"]
-daytona = ["daytona-sdk"]
+daytona = ["daytona>=0.223"]
 hf = ["datasets>=2.14", "huggingface_hub>=0.20"]
 lm_eval = ["lm_eval>=0.4"]
 dev = ["pytest", "pytest-asyncio", "ruff", "fastapi>=0.100", "uvicorn[standard]>=0.20"]
-all = ["daytona-sdk", "fastapi>=0.100", "uvicorn[standard]>=0.20", "datasets>=2.14", "huggingface_hub>=0.20", "pytest", "pytest-asyncio", "ruff"]
+all = ["daytona>=0.223", "fastapi>=0.100", "uvicorn[standard]>=0.20", "datasets>=2.14", "huggingface_hub>=0.20", "pytest", "pytest-asyncio", "ruff"]
 
 [project.urls]
 Homepage = "https://deepgym.io"
@@ -64,6 +64,10 @@ select = ["E", "F", "I", "N", "W", "UP", "Q"]
 
 [tool.ruff.lint.flake8-quotes]
 inline-quotes = "single"
+
+[tool.ruff.lint.per-file-ignores]
+# These run with envs/computer_use/_checks.py prepended (load_state, report).
+"src/deepgym/envs/computer_use/*/verifier.py" = ["F821"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

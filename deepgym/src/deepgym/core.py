@@ -5,13 +5,22 @@ from __future__ import annotations
 import logging
 import os
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Literal
 
 from deepgym.benchmark_envs import build_run_requests
 from deepgym.exceptions import DeepGymError, SandboxError, TimeoutError, VerifierError
-from deepgym.models import BatchResult, Environment, EvalResult, RunResult
+from deepgym.models import (
+    Action,
+    BatchResult,
+    Environment,
+    EvalResult,
+    MultiTurnEnvironment,
+    Observation,
+    RunResult,
+    Trajectory,
+)
 from deepgym.sandbox import (
     LocalExecutor,
     build_run_result,
@@ -21,6 +30,7 @@ from deepgym.sandbox import (
     is_standalone_verifier,
     setup_sandbox,
 )
+from deepgym.session import DaytonaBackend, LocalBackend, Session, run_episode
 from deepgym.verifier_template import wrap_verifier
 
 logger = logging.getLogger(__name__)
@@ -68,13 +78,10 @@ class DeepGym:
         """Initialise the Daytona SDK client."""
         try:
             from daytona import Daytona, DaytonaConfig
-        except ImportError:
-            try:
-                from daytona_sdk import Daytona, DaytonaConfig
-            except ImportError as exc:
-                raise DeepGymError(
-                    "daytona-sdk is required. Install it with: pip install 'deepgym[daytona]'"
-                ) from exc
+        except ImportError as exc:
+            raise DeepGymError(
+                "daytona is required. Install it with: pip install 'deepgym[daytona]'"
+            ) from exc
 
         kwargs = {}
         if api_key:
@@ -99,6 +106,8 @@ class DeepGym:
             A RunResult with score, pass/fail, stdout, stderr, timing, and
             sandbox id.
         """
+        if isinstance(env, MultiTurnEnvironment):
+            raise DeepGymError('Multi-turn environments need an agent: use dg.run_episode()')
         if hasattr(env, 'run_with_deepgym'):
             return env.run_with_deepgym(self, model_output, **kwargs)  # type: ignore[return-value]
 
@@ -159,6 +168,40 @@ class DeepGym:
             return build_run_result(verifier_result, elapsed_ms, sandbox_id)
         finally:
             cleanup_sandbox(sandbox, self._daytona)
+
+    # ------------------------------------------------------------------
+    # Multi-turn episodes
+    # ------------------------------------------------------------------
+
+    def session(self, env: MultiTurnEnvironment) -> Session:
+        """Open a live session for one episode of *env* on this client's backend.
+
+        Args:
+            env: The multi-turn or computer-use environment.
+
+        Returns:
+            An unstarted Session. Call start(), then step() until done, then score().
+
+        Raises:
+            SandboxError: If the Daytona sandbox cannot be created.
+        """
+        if self._local_executor is not None:
+            return Session(env, LocalBackend())
+        return Session(env, DaytonaBackend(self._daytona, env))
+
+    def run_episode(
+        self, env: MultiTurnEnvironment, agent: Callable[[Observation], Action]
+    ) -> tuple[Trajectory, RunResult]:
+        """Run one full episode of *env* driven by *agent* and score it.
+
+        Args:
+            env: The multi-turn or computer-use environment.
+            agent: Callable mapping an observation to the next action.
+
+        Returns:
+            Tuple of (trajectory, final_result).
+        """
+        return run_episode(self.session(env), agent)
 
     # ------------------------------------------------------------------
     # Batch run

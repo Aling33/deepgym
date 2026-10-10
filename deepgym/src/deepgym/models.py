@@ -5,8 +5,8 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
-from pathlib import Path
-from typing import Any, Literal
+from pathlib import Path, PurePosixPath
+from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -189,18 +189,84 @@ class Observation(BaseModel):
     done: bool = False
     """Whether the episode is finished."""
 
+    screenshot: str | None = None
+    """Base64-encoded PNG of the desktop, at display resolution (desktop sessions only)."""
+
     metadata: dict[str, Any] | None = None
     """Optional structured metadata for the observation."""
 
 
+ShellActionType = Literal['code', 'bash', 'write_file']
+GuiActionType = Literal[
+    'click',
+    'double_click',
+    'right_click',
+    'move',
+    'drag',
+    'type',
+    'key',
+    'scroll',
+    'screenshot',
+    'wait',
+]
+ActionType = Literal[ShellActionType, GuiActionType, 'done']
+
+GUI_ACTIONS: frozenset[GuiActionType] = frozenset(get_args(GuiActionType))
+
+_POINTER_ACTIONS = frozenset({'click', 'double_click', 'right_click', 'move', 'scroll', 'drag'})
+_TEXT_ACTIONS = frozenset({'type', 'key'})
+_SCROLL_DIRECTIONS = frozenset({'up', 'down', 'left', 'right'})
+
+
 class Action(BaseModel):
-    """Represent an agent action."""
+    """Represent an agent action.
 
-    content: str
-    """The action content (code to run, command to execute, etc.)."""
+    Shell actions (code, bash, write_file) run in the session work directory.
+    GUI actions drive the desktop; coordinates are screenshot pixels.
+    """
 
-    action_type: str = 'code'
-    """Type: code, bash, click, type, scroll, etc."""
+    action_type: ActionType = 'code'
+    """What to do. ``done`` ends the episode."""
+
+    content: str = ''
+    """Code, shell command, file contents, text to type, key chord ('ctrl+s'),
+    or scroll direction (up/down/left/right)."""
+
+    x: int | None = Field(default=None, ge=0)
+    """Pointer x for click/move/scroll, or drag start."""
+
+    y: int | None = Field(default=None, ge=0)
+    """Pointer y for click/move/scroll, or drag start."""
+
+    to_x: int | None = Field(default=None, ge=0)
+    """Drag end x."""
+
+    to_y: int | None = Field(default=None, ge=0)
+    """Drag end y."""
+
+    path: str | None = None
+    """Target path for write_file, relative to the work directory."""
+
+    amount: int = Field(default=1, ge=1, le=60)
+    """Scroll clicks, or seconds for wait."""
+
+    @model_validator(mode='after')
+    def check_arguments(self) -> Action:
+        """Reject actions missing the arguments their type needs."""
+        kind = self.action_type
+        if kind in _POINTER_ACTIONS and (self.x is None or self.y is None):
+            raise ValueError(f'{kind} needs x and y')
+        if kind == 'drag' and (self.to_x is None or self.to_y is None):
+            raise ValueError('drag needs to_x and to_y')
+        if kind == 'scroll' and self.content not in _SCROLL_DIRECTIONS:
+            raise ValueError(f'scroll content must be one of {sorted(_SCROLL_DIRECTIONS)}')
+        if kind in _TEXT_ACTIONS and not self.content:
+            raise ValueError(f'{kind} needs content')
+        if kind == 'write_file':
+            rel = PurePosixPath(self.path or '')
+            if not self.path or rel.is_absolute() or '..' in rel.parts:
+                raise ValueError('write_file needs a relative path without ".."')
+        return self
 
 
 class Trajectory(BaseModel):
@@ -220,13 +286,26 @@ class Trajectory(BaseModel):
 
 
 class MultiTurnEnvironment(BaseModel):
-    """Define a multi-turn environment where agents take multiple steps."""
+    """Define a multi-turn environment where agents take multiple steps.
+
+    One episode runs in one live sandbox: files are written, setup runs,
+    the agent acts step by step, then the final verifier inspects the state.
+    """
+
+    name: str | None = None
+    """Optional stable environment identifier used for routing and reporting."""
 
     task: str
     """The task description / prompt presented to the agent."""
 
+    files: dict[str, str] = Field(default_factory=dict)
+    """Text files written into the work directory before setup (relative path -> content)."""
+
+    setup_script: str = ''
+    """Bash run in the work directory after files are written (start servers, open apps)."""
+
     setup_code: str = ''
-    """Code to initialise the environment state."""
+    """Python run after setup_script. Its output is the first observation."""
 
     step_verifier_code: str = ''
     """Optional verifier run after each step (for intermediate rewards)."""
@@ -240,8 +319,33 @@ class MultiTurnEnvironment(BaseModel):
     timeout_per_step: int = Field(default=30, ge=1)
     """Timeout per individual step in seconds."""
 
+    allowed_actions: frozenset[ActionType] = frozenset({'code', 'bash', 'write_file', 'done'})
+    """Action types the agent may use. Anything else is rejected."""
+
+    desktop: bool = False
+    """Start a desktop (Xvfb + xfce) and return screenshots. Needs the Daytona backend."""
+
+    snapshot: str | None = None
+    """Daytona snapshot to boot. None uses Daytona's default image (has xfce + Chromium)."""
+
+    difficulty: Literal['easy', 'medium', 'hard'] = 'medium'
+    """Task difficulty level."""
+
+    domain: str = 'agentic'
+    """Task domain (e.g. browser, desktop, terminal)."""
+
+    tags: list[str] = Field(default_factory=list)
+    """Freeform tags for filtering and categorization."""
+
     type: Literal['multi-turn'] = 'multi-turn'
     """Environment type discriminator."""
+
+    @model_validator(mode='after')
+    def check_desktop_actions(self) -> MultiTurnEnvironment:
+        """Reject GUI actions on environments without a desktop."""
+        if not self.desktop and self.allowed_actions & GUI_ACTIONS:
+            raise ValueError('GUI actions need desktop=True')
+        return self
 
 
 class BatchResult(BaseModel):

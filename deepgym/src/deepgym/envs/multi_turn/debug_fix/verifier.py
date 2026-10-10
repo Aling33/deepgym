@@ -2,7 +2,7 @@
 
 Check that buggy.py has been fixed so all tests pass.
 
-NOTE: This environment requires MultiTurnRunner and cannot be used via the
+NOTE: This environment needs a multi-turn session and cannot be used via the
 standard single-turn dg.run() path. The verifier imports sibling files
 (buggy.py, test_buggy.py) that must be present in the working directory.
 It is intentionally NOT registered in registry.json.
