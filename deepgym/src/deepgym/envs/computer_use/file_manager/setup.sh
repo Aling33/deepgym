@@ -1,4 +1,5 @@
 set -euo pipefail
+bash _shared/lockdown.sh thunar
 docs="$HOME/Documents"
 rm -rf "$docs"
 mkdir -p "$docs"

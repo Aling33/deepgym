@@ -6,6 +6,7 @@ import importlib.resources
 import json
 import logging
 from pathlib import Path
+from string import Template
 
 from deepgym.computer_use import ComputerUseEnvironment
 from deepgym.models import Environment
@@ -245,7 +246,9 @@ def _benchmark_entries(registry: list[dict], benchmark_name: str) -> list[dict]:
     return sorted(result, key=lambda entry: str(entry.get('path', '')))
 
 
-_COMPUTER_USE_SPEC_FILES = frozenset({'task.md', 'verifier.py', 'metadata.json', 'setup.sh'})
+_COMPUTER_USE_SPEC_FILES = frozenset(
+    {'task.md', 'verifier.py', 'metadata.json', 'setup.sh', 'variants.json'}
+)
 
 
 def _read_text_files(root: Path, prefix: str = '') -> dict[str, str]:
@@ -257,14 +260,25 @@ def _read_text_files(root: Path, prefix: str = '') -> dict[str, str]:
     }
 
 
-def _load_computer_use_env(env_dir: Path, metadata: dict) -> ComputerUseEnvironment:
+def _load_computer_use_env(env_dir: Path, metadata: dict, variant: int) -> ComputerUseEnvironment:
     """Build a ComputerUseEnvironment from task.md, verifier.py, setup.sh, and app files.
 
     Every other file in the directory, plus the sibling ``_shared/`` runtime files,
     is written into the session work directory before setup runs. The verifier gets
-    ``_checks.py`` prepended rather than importing it from disk, so nothing the agent
-    can reach in the sandbox is executed at scoring time.
+    ``_checks.py`` and the variant's ``PARAMS`` prepended rather than importing
+    anything from disk, so nothing the agent can reach is executed at scoring time.
+    ``$name`` placeholders in task.md are filled from the same params.
+
+    Raises:
+        ValueError: If *variant* is out of range.
     """
+    variants_path = env_dir / 'variants.json'
+    variants = (
+        json.loads(variants_path.read_text(encoding='utf-8')) if variants_path.exists() else [{}]
+    )
+    if not 0 <= variant < len(variants):
+        raise ValueError(f'{env_dir.name} has {len(variants)} variants, got variant={variant}')
+    params = variants[variant]
     files = _read_text_files(env_dir.parent / '_shared', prefix='_shared/')
     files |= {
         rel: text
@@ -274,9 +288,9 @@ def _load_computer_use_env(env_dir: Path, metadata: dict) -> ComputerUseEnvironm
     setup_path = env_dir / 'setup.sh'
     return ComputerUseEnvironment(
         name=env_dir.name,
-        task=(env_dir / 'task.md').read_text(encoding='utf-8'),
+        task=Template((env_dir / 'task.md').read_text(encoding='utf-8')).substitute(params),
         final_verifier_code=(env_dir.parent / '_checks.py').read_text(encoding='utf-8')
-        + '\n\n'
+        + f'\n\nPARAMS = {params!r}\n\n'
         + (env_dir / 'verifier.py').read_text(encoding='utf-8'),
         setup_script=setup_path.read_text(encoding='utf-8') if setup_path.exists() else '',
         files=files,
@@ -289,7 +303,7 @@ def _load_computer_use_env(env_dir: Path, metadata: dict) -> ComputerUseEnvironm
 
 
 def _load_env_from_dir(
-    env_dir: Path, metadata: dict | None = None
+    env_dir: Path, metadata: dict | None = None, variant: int = 0
 ) -> Environment | ComputerUseEnvironment:
     """Build an Environment from an environment directory.
 
@@ -331,7 +345,9 @@ def _load_env_from_dir(
 
     if env_type == 'computer-use':
         file_metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
-        return _load_computer_use_env(env_dir, {**file_metadata, **(metadata or {})})
+        return _load_computer_use_env(env_dir, {**file_metadata, **(metadata or {})}, variant)
+    if variant:
+        raise ValueError(f'{env_dir.name} has no variants; only computer-use envs do')
 
     return Environment(
         name=env_dir.name,
@@ -344,7 +360,7 @@ def _load_env_from_dir(
     )
 
 
-def load_environment(name: str) -> Environment | ComputerUseEnvironment:
+def load_environment(name: str, variant: int = 0) -> Environment | ComputerUseEnvironment:
     """Load an environment by name from the built-in library.
 
     Search order: registry.json entries, then built-in envs, then cache.
@@ -352,6 +368,8 @@ def load_environment(name: str) -> Environment | ComputerUseEnvironment:
     Args:
         name: Registered environment name (e.g. 'coin_change', 'two_sum').
               Must not contain path separators or start with '.'.
+        variant: Which parameter set of a computer-use env to load (see the
+            'variants' count in list_environments()). Other envs only have 0.
 
     Returns:
         Configured Environment ready for dg.run().
@@ -401,19 +419,19 @@ def load_environment(name: str) -> Environment | ComputerUseEnvironment:
             entry = benchmark_entries[0]
             env_dir = _find_env_dir(entry['path'])
             if env_dir is not None:
-                return _load_env_from_dir(env_dir, metadata=entry)
+                return _load_env_from_dir(env_dir, metadata=entry, variant=variant)
 
     lookup_tokens = _name_tokens(normalized_name)
     for entry in registry:
         if lookup_tokens & _entry_tokens(entry):
             env_dir = _find_env_dir(entry['path'])
             if env_dir is not None:
-                return _load_env_from_dir(env_dir, metadata=entry)
+                return _load_env_from_dir(env_dir, metadata=entry, variant=variant)
 
     # 2. Direct directory lookup across all sources.
     env_dir = _find_env_dir(normalized_name)
     if env_dir is not None:
-        return _load_env_from_dir(env_dir)
+        return _load_env_from_dir(env_dir, variant=variant)
 
     available = [e.get('path', e.get('name')) for e in registry]
     raise ValueError(f"Environment '{name}' not found. Available: {available}")

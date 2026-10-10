@@ -1,34 +1,33 @@
-"""Runs with _checks.py prepended (load_state, report)."""
+"""Runs with _checks.py (load_state, report) and PARAMS prepended."""
 
 from pathlib import Path
 
+CONTENTS = {
+    'report.pdf': 'Q3 revenue summary\n',
+    'notes.txt': 'milk, eggs, bread\n',
+    'photo.jpg': 'not really a photo\n',
+}
+
 docs = Path.home() / 'Documents'
-archive = docs / 'Archive'
+folder = docs / PARAMS['folder']
+move, old, new, keep = PARAMS['move'], PARAMS['rename_from'], PARAMS['rename_to'], PARAMS['keep']
 
 
-def has(path: Path, text: str) -> bool:
-    return path.is_file() and path.read_text() == text
+def has(path: Path, original: str) -> bool:
+    return path.is_file() and path.read_text() == CONTENTS[original]
 
 
 report(
     progress={
-        'archive_created': archive.is_dir(),
-        'report_moved': has(archive / 'report.pdf', 'Q3 revenue summary\n')
-        and not (docs / 'report.pdf').exists(),
-        'notes_renamed': has(docs / 'todo.txt', 'milk, eggs, bread\n')
-        and not (docs / 'notes.txt').exists(),
+        'folder_created': folder.is_dir(),
+        'file_moved': has(folder / move, move) and not (docs / move).exists(),
+        'file_renamed': has(docs / new, old) and not (docs / old).exists(),
     },
     guards={
-        'no_files_lost': (
-            has(docs / 'report.pdf', 'Q3 revenue summary\n')
-            or has(archive / 'report.pdf', 'Q3 revenue summary\n')
-        )
-        and (
-            has(docs / 'notes.txt', 'milk, eggs, bread\n')
-            or has(docs / 'todo.txt', 'milk, eggs, bread\n')
-        ),
-        'photo_kept': has(docs / 'photo.jpg', 'not really a photo\n'),
-        'nothing_else_archived': not archive.is_dir()
-        or {p.name for p in archive.iterdir()} <= {'report.pdf'},
+        'no_files_lost': (has(docs / move, move) or has(folder / move, move))
+        and (has(docs / old, old) or has(docs / new, old)),
+        'other_file_kept': has(docs / keep, keep),
+        'nothing_else_in_folder': not folder.is_dir()
+        or {p.name for p in folder.iterdir()} <= {move},
     },
 )

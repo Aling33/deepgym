@@ -1,7 +1,7 @@
 The file manager is open in your Documents folder. Using the file manager:
 
-1. Create a new folder named "Archive" inside Documents.
-2. Move report.pdf into the Archive folder.
-3. Rename notes.txt to todo.txt.
+1. Create a new folder named "$folder" inside Documents.
+2. Move $move into the $folder folder.
+3. Rename $rename_from to $rename_to.
 
-Leave photo.jpg where it is. Use the `done` action when finished.
+Leave $keep where it is. Use the `done` action when finished.

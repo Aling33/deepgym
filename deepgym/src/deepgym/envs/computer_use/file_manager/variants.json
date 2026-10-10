@@ -1,0 +1,10 @@
+[
+    {"folder": "Archive", "move": "report.pdf", "rename_from": "notes.txt", "rename_to": "todo.txt", "keep": "photo.jpg"},
+    {"folder": "Backup", "move": "photo.jpg", "rename_from": "report.pdf", "rename_to": "summary.pdf", "keep": "notes.txt"},
+    {"folder": "Old", "move": "notes.txt", "rename_from": "photo.jpg", "rename_to": "beach.jpg", "keep": "report.pdf"},
+    {"folder": "Done", "move": "report.pdf", "rename_from": "photo.jpg", "rename_to": "holiday.jpg", "keep": "notes.txt"},
+    {"folder": "Keep", "move": "photo.jpg", "rename_from": "notes.txt", "rename_to": "groceries.txt", "keep": "report.pdf"},
+    {"folder": "Finance", "move": "notes.txt", "rename_from": "report.pdf", "rename_to": "q3.pdf", "keep": "photo.jpg"},
+    {"folder": "Archive 2026", "move": "report.pdf", "rename_from": "notes.txt", "rename_to": "list.txt", "keep": "photo.jpg"},
+    {"folder": "Shared", "move": "photo.jpg", "rename_from": "report.pdf", "rename_to": "board.pdf", "keep": "notes.txt"}
+]

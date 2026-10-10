@@ -5,11 +5,14 @@ import os
 import pytest
 
 from deepgym import DeepGym, load_environment
-from tests.computer_use_trajectories import DONE, REFERENCE
+from tests.computer_use_trajectories import DONE, REFERENCE, variants
 
 pytestmark = pytest.mark.skipif(
     not os.getenv('DAYTONA_API_KEY'), reason='needs DAYTONA_API_KEY for live sandboxes'
 )
+
+# First and last variant of each env; the full sweep is too slow for a test run.
+CASES = [(name, v) for name in sorted(REFERENCE) for v in (0, len(variants(name)) - 1)]
 
 
 @pytest.fixture(scope='module')
@@ -17,10 +20,11 @@ def dg() -> DeepGym:
     return DeepGym(mode='daytona')
 
 
-@pytest.mark.parametrize('name', sorted(REFERENCE))
-def test_reference_trajectory_passes(dg: DeepGym, name: str) -> None:
-    actions = iter(REFERENCE[name])
-    trajectory, result = dg.run_episode(load_environment(name), lambda obs: next(actions))
+@pytest.mark.parametrize(('name', 'variant'), CASES)
+def test_reference_trajectory_passes(dg: DeepGym, name: str, variant: int) -> None:
+    actions = iter(REFERENCE[name](variants(name)[variant]))
+    env = load_environment(name, variant=variant)
+    trajectory, result = dg.run_episode(env, lambda obs: next(actions))
     assert result.passed, result.output
     assert trajectory.steps[0][0].screenshot
 

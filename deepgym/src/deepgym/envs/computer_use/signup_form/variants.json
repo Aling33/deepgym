@@ -1,0 +1,10 @@
+[
+    {"name": "Ada Lovelace", "email": "ada@example.com", "plan": "Team"},
+    {"name": "Alan Turing", "email": "alan@example.org", "plan": "Pro"},
+    {"name": "Grace Hopper", "email": "grace.hopper@navy.example", "plan": "Free"},
+    {"name": "Katherine Johnson", "email": "kjohnson@nasa.example", "plan": "Team"},
+    {"name": "Linus Torvalds", "email": "linus@kernel.example", "plan": "Pro"},
+    {"name": "Margaret Hamilton", "email": "mhamilton@mit.example", "plan": "Team"},
+    {"name": "Edsger Dijkstra", "email": "ewd@utexas.example", "plan": "Free"},
+    {"name": "Barbara Liskov", "email": "liskov@csail.example", "plan": "Pro"}
+]
