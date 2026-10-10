@@ -276,9 +276,17 @@ print(result.score, result.output)            # "3/3 changes made"
 
 Or in one call: `trajectory, result = dg.run_episode(env, my_agent)`.
 
+Each task has 8 seeded variants (different names, values, files) so a policy
+can't memorize one answer: `load_environment('todo_list', variant=3)`. The count
+is in `list_environments()` under `variants`.
+
 Verifiers split checks into *progress* (the changes the task asked for) and
-*guards* (work was saved, nothing else broke). Any failed guard scores 0, so
-neither doing nothing nor clicking Save on untouched state earns reward.
+*guards* (work was saved, nothing else broke, no duplicate rows). Any failed
+guard scores 0, so neither doing nothing nor clicking Save on untouched state
+earns reward. Setup locks the desktop down before the agent starts: no terminal,
+run dialog, or browser devtools, and browser tasks get no file manager.
+Known gap: Thunar's "Open with custom command" still runs commands in the
+file-manager task.
 
 The same session API runs shell-based multi-turn tasks (`MultiTurnEnvironment`),
 and the local backend works for those without Daytona.
@@ -288,13 +296,14 @@ and the local backend works for those without Daytona.
 `deepgym serve` exposes sessions to trainers in any language:
 
 ```
-POST   /v1/sessions                {"environment": "todo_list"}  -> session_id, observation
+POST   /v1/sessions                {"environment": "todo_list", "variant": 3}  -> session_id, observation
 POST   /v1/sessions/{id}/step      {"action_type": "type", "content": "Pay rent"}
 POST   /v1/sessions/{id}/score     -> RunResult
 DELETE /v1/sessions/{id}
 ```
 
-`environment` can also be an inline `MultiTurnEnvironment` spec.
+`environment` can also be an inline `MultiTurnEnvironment` spec. Idle sessions
+are closed after 30 minutes; at most 100 run at once.
 
 ### Drop into verl
 
@@ -313,6 +322,9 @@ tools:
   - class_name: deepgym.integrations.verl_tool.DeepGymSessionTool
     config: {type: native, environment: signup_form, mode: daytona}
 ```
+
+Pick the env and variant per dataset row with
+`extra_info.tools_kwargs.computer.create_kwargs: {environment: todo_list, variant: 3}`.
 
 ### Drop into OpenRLHF
 
