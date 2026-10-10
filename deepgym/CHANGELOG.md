@@ -19,6 +19,10 @@
 - Daytona sessions create their work dir up front and tell command timeouts apart from connection timeouts via the SDK's typed errors
 - `dg.eval()` and `AsyncDeepGym.run()` reject multi-turn envs with a clear error instead of crashing
 - One shared `parse_verifier_output()` replaces five copies of verifier JSON parsing
+- Daytona sessions wait for sandbox deletion before freeing an API slot, bound every desktop call with a request timeout, and delete sandboxes left behind by a failed create (found via a per-session label)
+- Session API store is locked so idle eviction can't race a session that was just used
+- Computer-use app state saves are atomic and applied in order (todo app chains its saves)
+- Local backend runs each command in its own process group and kills leftovers on timeout and close
 - Breaking: removed `MultiTurnRunner` (use `dg.run_episode()`), `ScreenshotVerifier`, and `ToolUseEnvironment`; `ComputerUseEnvironment` is now a desktop `MultiTurnEnvironment`
 - Breaking: `file_organizer` and `cli_task` are now type `coding` (they were single-shot scripts, not computer use); computer-use envs only appear in the `computer-use` suite
 - Switched the Daytona dependency from the deprecated `daytona-sdk` to `daytona`; Daytona session sandboxes block outbound network

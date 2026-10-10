@@ -339,24 +339,29 @@ _sessions: dict[str, Session] = {}
 _last_used: dict[str, float] = {}
 # Counts live sessions plus ones still booting, so parallel creates can't overshoot the cap.
 _session_slots = threading.BoundedSemaphore(_MAX_SESSIONS)
+# Guards _sessions/_last_used so a lookup's touch and eviction's idle check can't interleave.
+_store_lock = threading.Lock()
 
 
 def _get_session(session_id: str) -> Session:
     """Resolve a live session (marking it used) or raise 404."""
-    session = _sessions.get(session_id)
+    with _store_lock:
+        session = _sessions.get(session_id)
+        if session is not None:
+            _last_used[session_id] = time.monotonic()
     if session is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session '{session_id}' not found.",
         )
-    _last_used[session_id] = time.monotonic()
     return session
 
 
 def _drop_session(session_id: str) -> Session | None:
     """Remove a session from the store; the caller must pass it to _close_and_free."""
-    _last_used.pop(session_id, None)
-    return _sessions.pop(session_id, None)
+    with _store_lock:
+        _last_used.pop(session_id, None)
+        return _sessions.pop(session_id, None)
 
 
 def _close_and_free(session: Session) -> None:
@@ -370,13 +375,14 @@ def _close_and_free(session: Session) -> None:
 def _evict_idle_sessions() -> int:
     """Close sessions idle past the TTL in the background; return how many were evicted."""
     cutoff = time.monotonic() - _SESSION_IDLE_TTL_S
-    evicted = 0
-    for session_id in [sid for sid, used in list(_last_used.items()) if used < cutoff]:
-        session = _drop_session(session_id)
-        if session is not None:
-            threading.Thread(target=_close_and_free, args=(session,), daemon=True).start()
-            evicted += 1
-    return evicted
+    with _store_lock:
+        idle = [sid for sid, used in _last_used.items() if used < cutoff]
+        expired = [_sessions.pop(sid) for sid in idle]
+        for sid in idle:
+            del _last_used[sid]
+    for session in expired:
+        threading.Thread(target=_close_and_free, args=(session,), daemon=True).start()
+    return len(expired)
 
 
 @v1_router.post('/sessions', response_model=SessionResponse, status_code=status.HTTP_201_CREATED)
@@ -417,8 +423,9 @@ def create_session(
         _session_slots.release()
         raise
     session_id = uuid.uuid4().hex
-    _sessions[session_id] = session
-    _last_used[session_id] = time.monotonic()
+    with _store_lock:
+        _sessions[session_id] = session
+        _last_used[session_id] = time.monotonic()
     return SessionResponse(
         session_id=session_id, sandbox_id=session.sandbox_id, observation=observation
     )

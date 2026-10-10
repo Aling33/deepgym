@@ -257,17 +257,18 @@ def execute_verifier(
     return parse_verifier_output(response.result.strip(), f'exit_code={response.exit_code}')
 
 
-def cleanup_sandbox(sandbox: Sandbox, daytona: Daytona) -> None:
-    """Safely destroy a sandbox, swallowing any errors.
+def cleanup_sandbox(sandbox: Sandbox, daytona: Daytona, *, wait: bool = False) -> None:
+    """Safely destroy a sandbox, logging rather than raising errors.
 
     Args:
         sandbox: The sandbox to destroy.
         daytona: The Daytona client that owns the sandbox.
+        wait: Block until Daytona confirms the sandbox is gone.
     """
     try:
-        daytona.delete(sandbox)
+        daytona.delete(sandbox, wait=wait)
     except Exception:
-        logger.debug('Failed to clean up sandbox %s (ignored)', getattr(sandbox, 'id', '?'))
+        logger.warning('Failed to clean up sandbox %s', getattr(sandbox, 'id', '?'))
 
 
 # ---------------------------------------------------------------------------

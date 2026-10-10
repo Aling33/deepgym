@@ -1,7 +1,9 @@
 """Tests for deepgym.session -- live multi-turn episodes on the local backend."""
 
 import asyncio
+import os
 import threading
+import time
 
 import pytest
 from pydantic import ValidationError
@@ -258,6 +260,18 @@ class TestLocalEpisodes:
                 thread.join()
             steps = [obs.step for obs, _ in session.trajectory.steps]
         assert steps == list(range(15))
+
+    def test_background_processes_die_with_session(self, dg: DeepGym) -> None:
+        env = MultiTurnEnvironment(task='t', max_steps=2)
+        with dg.session(env) as session:
+            session.start()
+            obs = session.step(
+                Action(action_type='bash', content='sleep 600 >/dev/null 2>&1 & echo $!')
+            ).observation
+        pid = int(obs.content.strip())
+        time.sleep(0.2)
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
 
     def test_step_timeout_becomes_observation(self, dg: DeepGym) -> None:
         env = MultiTurnEnvironment(task='t', max_steps=1, timeout_per_step=1)

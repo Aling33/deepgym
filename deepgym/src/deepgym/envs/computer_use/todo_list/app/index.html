@@ -37,11 +37,18 @@
     { text: 'Call mom', done: false },
     { text: 'Write report', done: false },
   ];
-  const save = () => fetch('/api/state', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ items }),
-  });
+  // Chain saves so they reach the server in the order the changes happened,
+  // and keep chaining even if one save fails.
+  let saving = Promise.resolve();
+  const save = () => {
+    const body = JSON.stringify({ items });
+    const send = () => fetch('/api/state', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    });
+    saving = saving.then(send, send);
+  };
   const render = () => {
     const list = document.getElementById('list');
     list.replaceChildren(...items.map((item, i) => {
