@@ -1,0 +1,60 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>DeepGym - Create account</title>
+<style>
+  body { margin: 0; font: 16px system-ui, sans-serif; background: #eef1f5; color: #1f2933; }
+  main { width: 440px; margin: 60px auto; background: #fff; padding: 28px 32px; border-radius: 10px;
+         box-shadow: 0 2px 10px rgba(0,0,0,.08); }
+  h1 { font-size: 22px; margin: 0 0 20px; }
+  label { display: block; margin: 14px 0 6px; font-weight: 600; }
+  input[type=text], input[type=email], select { width: 100%; box-sizing: border-box; height: 38px;
+         padding: 0 10px; font-size: 16px; border: 1px solid #c3cad3; border-radius: 6px; }
+  .check { display: flex; gap: 8px; align-items: center; margin-top: 18px; font-weight: 400; }
+  .check input { width: 18px; height: 18px; }
+  button { margin-top: 22px; width: 100%; height: 42px; font-size: 16px; border: 0; border-radius: 6px;
+           background: #2563eb; color: #fff; cursor: pointer; }
+  #done { display: none; text-align: center; font-size: 20px; padding: 40px 0; }
+</style>
+</head>
+<body>
+<main>
+  <form id="form">
+    <h1>Create your account</h1>
+    <label for="name">Full name</label>
+    <input id="name" type="text" autocomplete="off">
+    <label for="email">Email</label>
+    <input id="email" type="email" autocomplete="off">
+    <label for="plan">Plan</label>
+    <select id="plan">
+      <option value="free">Free</option>
+      <option value="pro">Pro</option>
+      <option value="team">Team</option>
+    </select>
+    <label class="check"><input id="terms" type="checkbox"> I agree to the terms of service</label>
+    <button id="submit" type="submit">Create account</button>
+  </form>
+  <div id="done">Account created.</div>
+</main>
+<script>
+  document.getElementById('form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const value = (id) => document.getElementById(id).value;
+    await fetch('/api/state', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        submitted: true,
+        name: value('name'),
+        email: value('email'),
+        plan: value('plan'),
+        agreed: document.getElementById('terms').checked,
+      }),
+    });
+    e.target.style.display = 'none';
+    document.getElementById('done').style.display = 'block';
+  });
+</script>
+</body>
+</html>

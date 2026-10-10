@@ -1,7 +1,7 @@
 {
     "id": "cu-002",
     "name": "File Organizer",
-    "type": "computer-use",
+    "type": "coding",
     "difficulty": "easy",
     "domain": "filesystem",
     "tags": ["filesystem", "directories", "organization"]

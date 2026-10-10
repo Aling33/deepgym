@@ -1,0 +1,9 @@
+{
+    "id": "cu-101",
+    "name": "Browser Sign-up Form",
+    "type": "computer-use",
+    "difficulty": "easy",
+    "domain": "browser",
+    "tags": ["browser", "forms", "gui"],
+    "max_steps": 20
+}
