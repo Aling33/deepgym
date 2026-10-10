@@ -314,14 +314,25 @@ compute_score = make_verl_compute_score(env)
 # In verl config: custom_reward_function.path = "your_reward_module.py"
 ```
 
-For multi-turn agent RL, register the session tool in your verl tool config.
-Each rollout gets its own sandbox, and screenshots come back as images:
+For multi-turn agent RL, use DeepGym's agent loop plus its session tool. verl's
+stock `ToolAgentLoop` creates and releases a tool around every call, so the
+`deepgym_agent` loop keeps one sandbox per rollout, sets `reward_score` from the
+final verifier, and deletes the sandbox. Screenshots come back as images.
 
 ```yaml
+# agent_loop_config_path
+- name: deepgym_agent
+  _target_: deepgym.integrations.verl_tool.DeepGymAgentLoop
+
+# multi_turn.tool_config_path
 tools:
   - class_name: deepgym.integrations.verl_tool.DeepGymSessionTool
     config: {type: native, environment: signup_form, mode: daytona}
 ```
+
+Dataset rows set `agent_name: deepgym_agent`. The first tool call starts the
+episode and returns the starting screen, so prompt the model to begin with a
+screenshot. Written against verl v0.9.1 and tested against a stand-in for its loop.
 
 Pick the env and variant per dataset row with
 `extra_info.tools_kwargs.computer.create_kwargs: {environment: todo_list, variant: 3}`.
