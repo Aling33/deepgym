@@ -10,10 +10,13 @@ Use the Daytona backend for untrusted agents.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import logging
+import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -22,6 +25,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Protocol
+from uuid import uuid4
 
 from deepgym.exceptions import (
     ActionError,
@@ -109,6 +113,7 @@ class LocalBackend:
 
     def __init__(self) -> None:
         self._dir = Path(tempfile.mkdtemp(prefix='deepgym_session_'))
+        self._groups: set[int] = set()
 
     def exec(self, command: str, timeout: int, env: dict[str, str] | None = None) -> ExecResult:
         """Run *command* with bash in the temp directory.
@@ -117,20 +122,24 @@ class LocalBackend:
             TimeoutError: If the command exceeds *timeout* seconds.
         """
         proc_env = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin', **(env or {})}
-        try:
-            proc = subprocess.run(
-                ['bash', '-c', command],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                cwd=self._dir,
-                env=proc_env,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise TimeoutError(f'Command exceeded {timeout}s timeout') from exc
-        return ExecResult(
-            proc.returncode, proc.stdout + ('\n' + proc.stderr if proc.stderr else '')
+        # Own process group, so background children die with the command or the session.
+        proc = subprocess.Popen(
+            ['bash', '-c', command],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=self._dir,
+            env=proc_env,
+            start_new_session=True,
         )
+        self._groups.add(proc.pid)
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            _kill_group(proc.pid)
+            proc.communicate()
+            raise TimeoutError(f'Command exceeded {timeout}s timeout') from exc
+        return ExecResult(proc.returncode, stdout + ('\n' + stderr if stderr else ''))
 
     def write_file(self, path: str, content: bytes) -> None:
         """Write *content* to *path* inside the temp directory."""
@@ -151,7 +160,9 @@ class LocalBackend:
         raise DeepGymError('Screenshots need the Daytona backend')
 
     def close(self) -> None:
-        """Delete the temp directory."""
+        """Kill leftover background processes and delete the temp directory."""
+        for group in self._groups:
+            _kill_group(group)
         shutil.rmtree(self._dir, ignore_errors=True)
 
 
@@ -163,16 +174,22 @@ class DaytonaBackend:
     def __init__(self, daytona: Daytona, env: MultiTurnEnvironment) -> None:
         from daytona import CreateSandboxFromSnapshotParams
 
+        # A label lets us find and delete the sandbox if create() fails after allocating it.
+        label = {'deepgym_session': uuid4().hex}
         try:
             self._sandbox: Sandbox = daytona.create(
                 CreateSandboxFromSnapshotParams(
-                    snapshot=env.snapshot, ephemeral=True, network_block_all=True
-                )
+                    snapshot=env.snapshot, ephemeral=True, network_block_all=True, labels=label
+                ),
+                timeout=env.setup_timeout,
             )
         except Exception as exc:
+            _delete_labelled(daytona, label)
             raise SandboxError(f'Failed to create sandbox: {exc}') from exc
         self._daytona = daytona
         self._env: dict[str, str] = {}
+        self._step_timeout = env.timeout_per_step
+        self._setup_timeout = env.setup_timeout
         self.sandbox_id = str(getattr(self._sandbox, 'id', 'unknown'))
         try:
             self._sandbox.fs.create_folder(_DAYTONA_WORKDIR, '755')
@@ -210,7 +227,7 @@ class DaytonaBackend:
     def start_desktop(self) -> None:
         """Start Xvfb, xfce, and VNC in the sandbox."""
         try:
-            self._sandbox.computer_use.start()
+            self._sandbox.computer_use.start(request_timeout=self._setup_timeout)
         except Exception as exc:
             raise SandboxError(f'Failed to start desktop: {exc}') from exc
         self._env['DISPLAY'] = _DISPLAY
@@ -234,23 +251,26 @@ class DaytonaBackend:
     def _dispatch(self, action: Action) -> None:
         mouse = self._sandbox.computer_use.mouse
         keyboard = self._sandbox.computer_use.keyboard
+        deadline = self._step_timeout
         match action.action_type:
             case 'click':
-                mouse.click(action.x, action.y)
+                mouse.click(action.x, action.y, request_timeout=deadline)
             case 'double_click':
-                mouse.click(action.x, action.y, double=True)
+                mouse.click(action.x, action.y, double=True, request_timeout=deadline)
             case 'right_click':
-                mouse.click(action.x, action.y, button='right')
+                mouse.click(action.x, action.y, button='right', request_timeout=deadline)
             case 'move':
-                mouse.move(action.x, action.y)
+                mouse.move(action.x, action.y, request_timeout=deadline)
             case 'drag':
-                mouse.drag(action.x, action.y, action.to_x, action.to_y)
+                mouse.drag(action.x, action.y, action.to_x, action.to_y, request_timeout=deadline)
             case 'scroll':
-                mouse.scroll(action.x, action.y, action.content, action.amount)
+                mouse.scroll(
+                    action.x, action.y, action.content, action.amount, request_timeout=deadline
+                )
             case 'type':
-                keyboard.type(action.content)
+                keyboard.type(action.content, request_timeout=deadline)
             case 'key':
-                keyboard.hotkey(action.content)
+                keyboard.hotkey(action.content, request_timeout=deadline)
 
     def screenshot(self) -> str:
         """Return a full-resolution PNG so pixel coordinates match click targets."""
@@ -258,15 +278,15 @@ class DaytonaBackend:
 
         try:
             shot = self._sandbox.computer_use.screenshot.take_compressed(
-                ScreenshotOptions(fmt='png', scale=1.0)
+                ScreenshotOptions(fmt='png', scale=1.0), request_timeout=self._step_timeout
             )
         except Exception as exc:
             raise SandboxError(f'Failed to take screenshot: {exc}') from exc
         return shot.screenshot
 
     def close(self) -> None:
-        """Delete the sandbox."""
-        cleanup_sandbox(self._sandbox, self._daytona)
+        """Delete the sandbox and wait until Daytona confirms it is gone."""
+        cleanup_sandbox(self._sandbox, self._daytona, wait=True)
 
 
 class Session:
@@ -500,6 +520,24 @@ def run_episode(
         while not session.done:
             obs = session.step(agent(obs)).observation
         return session.trajectory, session.score()
+
+
+def _kill_group(group: int) -> None:
+    """SIGKILL a process group; it may already be gone."""
+    # ponytail: a group id could be reused within one session's lifetime; accepted, low risk.
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(group, signal.SIGKILL)
+
+
+def _delete_labelled(daytona: Daytona, label: dict[str, str]) -> None:
+    """Delete any sandbox carrying *label*, so a failed create doesn't leak one."""
+    from daytona import ListSandboxesQuery
+
+    try:
+        for sandbox in daytona.list(ListSandboxesQuery(labels=label)):
+            cleanup_sandbox(sandbox, daytona)
+    except Exception:
+        logger.warning('Could not check for leaked sandboxes labelled %s', label)
 
 
 def _checked(what: str, result: ExecResult) -> str:
