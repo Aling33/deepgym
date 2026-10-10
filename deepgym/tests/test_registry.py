@@ -43,10 +43,10 @@ class TestLoadEnvironment:
         assert env.verifier_path is not None
         assert env.verifier_path.exists()
 
-    def test_load_file_organizer_is_computer_use(self) -> None:
+    def test_load_file_organizer_is_coding(self) -> None:
         env = load_environment('file_organizer')
         assert isinstance(env, Environment)
-        assert env.type == 'computer-use'
+        assert env.type == 'coding'
 
     def test_load_nonexistent_raises_value_error(self) -> None:
         with pytest.raises(ValueError, match='not found'):
@@ -136,7 +136,8 @@ class TestLoadSuite:
 
     def test_load_computer_use_suite(self) -> None:
         envs = load_suite('computer-use')
-        assert len(envs) == 2
+        assert len(envs) == 5
+        assert all(env.type == 'computer-use' for env in envs)
 
     def test_load_tool_use_suite(self) -> None:
         envs = load_suite('tool-use')

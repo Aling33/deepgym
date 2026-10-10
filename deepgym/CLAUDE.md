@@ -10,6 +10,8 @@ src/deepgym/
 ├── core.py              # Sync DeepGym client (mode: auto/daytona/local)
 ├── async_core.py        # Async client with semaphore-based concurrency
 ├── sandbox.py           # Daytona sandbox lifecycle + LocalExecutor fallback
+├── session.py           # Live multi-turn sessions (Local/Daytona backends, GUI actions)
+├── computer_use.py      # ComputerUseEnvironment (desktop, GUI-only actions)
 ├── verifier.py          # Verifier model + protocol validation
 ├── verifier_template.py # Wrapper normalizing any verifier to JSON protocol
 ├── adversarial.py       # Reward-hack detection (5 attack strategies)
@@ -20,6 +22,7 @@ src/deepgym/
     ├── routes.py        # Sync + async job endpoints
     ├── schemas.py       # Request/response Pydantic models
     └── deps.py          # Dependency injection
+src/deepgym/envs/computer_use/  # Desktop tasks: app/ + setup.sh + verifier.py; _shared/ helpers
 examples/                # 3 example environments with verifiers + solutions
 ```
 

@@ -1,0 +1,10 @@
+[
+    {"internet": "75", "new_item": "Gym", "new_amount": "45"},
+    {"internet": "80", "new_item": "Phone", "new_amount": "30"},
+    {"internet": "55", "new_item": "Streaming", "new_amount": "15.99"},
+    {"internet": "90", "new_item": "Gas", "new_amount": "120"},
+    {"internet": "65.50", "new_item": "Insurance", "new_amount": "210"},
+    {"internet": "70", "new_item": "Childcare", "new_amount": "850"},
+    {"internet": "49.99", "new_item": "Parking", "new_amount": "60"},
+    {"internet": "100", "new_item": "Charity", "new_amount": "25"}
+]

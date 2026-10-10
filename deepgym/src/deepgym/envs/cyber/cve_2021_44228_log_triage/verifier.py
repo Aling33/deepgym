@@ -45,7 +45,7 @@ def verify(solution_path, test_cases_path=None):
     raw_lower = raw.lower()
     ips = _string_set(data.get('source_ips'))
     indicators = ' '.join(_string_set(data.get('payload_indicators'))).lower()
-    cve_text = f"{data.get('cve', '')} {data.get('vulnerability', '')}".lower()
+    cve_text = f'{data.get("cve", "")} {data.get("vulnerability", "")}'.lower()
     action_text = str(data.get('recommended_action', '')).lower()
 
     cases = []
@@ -58,9 +58,7 @@ def verify(solution_path, test_cases_path=None):
     cases.append({'id': 'source_ips', 'passed': ip_score == 1.0, 'score': ip_score})
 
     cve_score = (
-        1.0
-        if all(term in cve_text or term in raw_lower for term in REQUIRED_TERMS)
-        else 0.0
+        1.0 if all(term in cve_text or term in raw_lower for term in REQUIRED_TERMS) else 0.0
     )
     score += 0.2 * cve_score
     cases.append({'id': 'cve_identification', 'passed': cve_score == 1.0, 'score': cve_score})

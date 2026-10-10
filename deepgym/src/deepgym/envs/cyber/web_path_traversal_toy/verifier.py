@@ -58,13 +58,15 @@ def verify(solution_path, test_cases_path=None):
     resolved = _toy_resolve(candidate_file) if candidate_file else ''
     target_ok = resolved == SECRET_PATH
     score += 0.45 if target_ok else 0.0
-    cases.append({
-        'id': 'target_file',
-        'passed': target_ok,
-        'score': 1.0 if target_ok else 0.0,
-        'actual_summary': resolved,
-        'expected_summary': SECRET_PATH,
-    })
+    cases.append(
+        {
+            'id': 'target_file',
+            'passed': target_ok,
+            'score': 1.0 if target_ok else 0.0,
+            'actual_summary': resolved,
+            'expected_summary': SECRET_PATH,
+        }
+    )
 
     explains = 'travers' in evidence.lower() or '..' in evidence or 'sibling' in evidence.lower()
     score += 0.15 if explains else 0.0

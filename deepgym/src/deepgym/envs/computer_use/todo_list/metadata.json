@@ -1,0 +1,9 @@
+{
+    "id": "cu-102",
+    "name": "Browser Todo List",
+    "type": "computer-use",
+    "difficulty": "easy",
+    "domain": "browser",
+    "tags": ["browser", "crud", "gui"],
+    "max_steps": 25
+}

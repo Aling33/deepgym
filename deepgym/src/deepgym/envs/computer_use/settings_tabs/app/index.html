@@ -1,0 +1,88 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>DeepGym - Settings</title>
+<style>
+  body { margin: 0; font: 16px system-ui, sans-serif; background: #f3f4f6; color: #111827; }
+  main { width: 620px; margin: 40px auto; background: #fff; border-radius: 10px; overflow: hidden;
+         box-shadow: 0 2px 10px rgba(0,0,0,.08); }
+  header { padding: 20px 28px 0; }
+  h1 { font-size: 22px; margin: 0 0 16px; }
+  nav { display: flex; gap: 4px; border-bottom: 1px solid #e5e7eb; }
+  nav button { padding: 10px 18px; font-size: 15px; border: 0; background: none; cursor: pointer;
+               border-bottom: 3px solid transparent; }
+  nav button.active { border-bottom-color: #7c3aed; font-weight: 600; }
+  section { display: none; padding: 24px 28px; min-height: 220px; }
+  section.active { display: block; }
+  label { display: block; font-weight: 600; margin: 0 0 6px; }
+  input[type=text] { width: 100%; box-sizing: border-box; height: 38px; padding: 0 10px; font-size: 16px;
+                     border: 1px solid #d1d5db; border-radius: 6px; }
+  .row { display: flex; align-items: center; justify-content: space-between; height: 52px;
+         border-bottom: 1px solid #f3f4f6; }
+  .row input { width: 20px; height: 20px; }
+  .radio { display: flex; align-items: center; gap: 10px; height: 40px; font-weight: 400; }
+  .radio input { width: 18px; height: 18px; }
+  footer { display: flex; align-items: center; gap: 16px; padding: 16px 28px; background: #f9fafb; }
+  footer button { width: 120px; height: 40px; font-size: 16px; border: 0; border-radius: 6px;
+                  background: #7c3aed; color: #fff; cursor: pointer; }
+  #status { color: #059669; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Settings</h1>
+    <nav>
+      <button class="active" data-tab="profile">Profile</button>
+      <button data-tab="notifications">Notifications</button>
+      <button data-tab="appearance">Appearance</button>
+    </nav>
+  </header>
+  <section id="profile" class="active">
+    <label for="display_name">Display name</label>
+    <input id="display_name" type="text" value="ghopper" autocomplete="off">
+  </section>
+  <section id="notifications">
+    <div class="row"><span>Email notifications</span><input id="email_notifications" type="checkbox" checked></div>
+    <div class="row"><span>Push notifications</span><input id="push_notifications" type="checkbox" checked></div>
+    <div class="row"><span>Weekly digest</span><input id="weekly_digest" type="checkbox"></div>
+  </section>
+  <section id="appearance">
+    <label>Theme</label>
+    <label class="radio"><input type="radio" name="theme" value="light" checked> Light</label>
+    <label class="radio"><input type="radio" name="theme" value="dark"> Dark</label>
+    <label class="radio"><input type="radio" name="theme" value="system"> Match system</label>
+  </section>
+  <footer>
+    <button id="save">Save</button>
+    <span id="status"></span>
+  </footer>
+</main>
+<script>
+  document.querySelectorAll('nav button').forEach((tab) => {
+    tab.onclick = () => {
+      document.querySelectorAll('nav button, section').forEach((el) => el.classList.remove('active'));
+      tab.classList.add('active');
+      document.getElementById(tab.dataset.tab).classList.add('active');
+    };
+  });
+  const checked = (id) => document.getElementById(id).checked;
+  document.getElementById('save').onclick = async () => {
+    await fetch('/api/state', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        saved: true,
+        display_name: document.getElementById('display_name').value,
+        email_notifications: checked('email_notifications'),
+        push_notifications: checked('push_notifications'),
+        weekly_digest: checked('weekly_digest'),
+        theme: document.querySelector('input[name=theme]:checked').value,
+      }),
+    });
+    document.getElementById('status').textContent = 'Saved';
+  };
+</script>
+</body>
+</html>

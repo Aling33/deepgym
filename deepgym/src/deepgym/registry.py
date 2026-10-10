@@ -6,7 +6,9 @@ import importlib.resources
 import json
 import logging
 from pathlib import Path
+from string import Template
 
+from deepgym.computer_use import ComputerUseEnvironment
 from deepgym.models import Environment
 
 logger = logging.getLogger(__name__)
@@ -244,7 +246,65 @@ def _benchmark_entries(registry: list[dict], benchmark_name: str) -> list[dict]:
     return sorted(result, key=lambda entry: str(entry.get('path', '')))
 
 
-def _load_env_from_dir(env_dir: Path, metadata: dict | None = None) -> Environment:
+_COMPUTER_USE_SPEC_FILES = frozenset(
+    {'task.md', 'verifier.py', 'metadata.json', 'setup.sh', 'variants.json'}
+)
+
+
+def _read_text_files(root: Path, prefix: str = '') -> dict[str, str]:
+    """Map every text file under *root* (skipping __pycache__) to its contents."""
+    return {
+        f'{prefix}{path.relative_to(root).as_posix()}': path.read_text(encoding='utf-8')
+        for path in sorted(root.rglob('*'))
+        if path.is_file() and '__pycache__' not in path.parts
+    }
+
+
+def _load_computer_use_env(env_dir: Path, metadata: dict, variant: int) -> ComputerUseEnvironment:
+    """Build a ComputerUseEnvironment from task.md, verifier.py, setup.sh, and app files.
+
+    Every other file in the directory, plus the sibling ``_shared/`` runtime files,
+    is written into the session work directory before setup runs. The verifier gets
+    ``_checks.py`` and the variant's ``PARAMS`` prepended rather than importing
+    anything from disk, so nothing the agent can reach is executed at scoring time.
+    ``$name`` placeholders in task.md are filled from the same params.
+
+    Raises:
+        ValueError: If *variant* is out of range.
+    """
+    variants_path = env_dir / 'variants.json'
+    variants = (
+        json.loads(variants_path.read_text(encoding='utf-8')) if variants_path.exists() else [{}]
+    )
+    if not 0 <= variant < len(variants):
+        raise ValueError(f'{env_dir.name} has {len(variants)} variants, got variant={variant}')
+    params = variants[variant]
+    files = _read_text_files(env_dir.parent / '_shared', prefix='_shared/')
+    files |= {
+        rel: text
+        for rel, text in _read_text_files(env_dir).items()
+        if rel not in _COMPUTER_USE_SPEC_FILES
+    }
+    setup_path = env_dir / 'setup.sh'
+    return ComputerUseEnvironment(
+        name=env_dir.name,
+        task=Template((env_dir / 'task.md').read_text(encoding='utf-8')).substitute(params),
+        final_verifier_code=(env_dir.parent / '_checks.py').read_text(encoding='utf-8')
+        + f'\n\nPARAMS = {params!r}\n\n'
+        + (env_dir / 'verifier.py').read_text(encoding='utf-8'),
+        setup_script=setup_path.read_text(encoding='utf-8') if setup_path.exists() else '',
+        files=files,
+        **{
+            key: metadata[key]
+            for key in ('difficulty', 'domain', 'tags', 'max_steps', 'timeout_per_step')
+            if key in metadata
+        },
+    )
+
+
+def _load_env_from_dir(
+    env_dir: Path, metadata: dict | None = None, variant: int = 0
+) -> Environment | ComputerUseEnvironment:
     """Build an Environment from an environment directory.
 
     Args:
@@ -283,6 +343,12 @@ def _load_env_from_dir(env_dir: Path, metadata: dict | None = None) -> Environme
         tags = metadata.get('tags', tags)
         env_type = metadata.get('type', env_type)
 
+    if env_type == 'computer-use':
+        file_metadata = json.loads(metadata_path.read_text(encoding='utf-8'))
+        return _load_computer_use_env(env_dir, {**file_metadata, **(metadata or {})}, variant)
+    if variant:
+        raise ValueError(f'{env_dir.name} has no variants; only computer-use envs do')
+
     return Environment(
         name=env_dir.name,
         task=task,
@@ -294,7 +360,7 @@ def _load_env_from_dir(env_dir: Path, metadata: dict | None = None) -> Environme
     )
 
 
-def load_environment(name: str) -> Environment:
+def load_environment(name: str, variant: int = 0) -> Environment | ComputerUseEnvironment:
     """Load an environment by name from the built-in library.
 
     Search order: registry.json entries, then built-in envs, then cache.
@@ -302,6 +368,8 @@ def load_environment(name: str) -> Environment:
     Args:
         name: Registered environment name (e.g. 'coin_change', 'two_sum').
               Must not contain path separators or start with '.'.
+        variant: Which parameter set of a computer-use env to load (see the
+            'variants' count in list_environments()). Other envs only have 0.
 
     Returns:
         Configured Environment ready for dg.run().
@@ -351,26 +419,29 @@ def load_environment(name: str) -> Environment:
             entry = benchmark_entries[0]
             env_dir = _find_env_dir(entry['path'])
             if env_dir is not None:
-                return _load_env_from_dir(env_dir, metadata=entry)
+                return _load_env_from_dir(env_dir, metadata=entry, variant=variant)
 
     lookup_tokens = _name_tokens(normalized_name)
     for entry in registry:
         if lookup_tokens & _entry_tokens(entry):
             env_dir = _find_env_dir(entry['path'])
             if env_dir is not None:
-                return _load_env_from_dir(env_dir, metadata=entry)
+                return _load_env_from_dir(env_dir, metadata=entry, variant=variant)
 
     # 2. Direct directory lookup across all sources.
     env_dir = _find_env_dir(normalized_name)
     if env_dir is not None:
-        return _load_env_from_dir(env_dir)
+        return _load_env_from_dir(env_dir, variant=variant)
 
     available = [e.get('path', e.get('name')) for e in registry]
     raise ValueError(f"Environment '{name}' not found. Available: {available}")
 
 
-def load_suite(suite_name: str) -> list[Environment]:
+def load_suite(suite_name: str) -> list[Environment | ComputerUseEnvironment]:
     """Load a suite of environments by difficulty, type, family, or 'all'.
+
+    Computer-use environments need an agent rather than a single output, so
+    they only appear in the 'computer-use' suite.
 
     Args:
         suite_name: One of 'easy', 'medium', 'hard' (difficulty filter),
@@ -395,6 +466,9 @@ def load_suite(suite_name: str) -> list[Environment]:
         # Treat as family name.
         entries = [e for e in registry if e.get('family') == suite_name]
 
+    if suite_name != 'computer-use':
+        entries = [e for e in entries if e.get('type') != 'computer-use']
+
     if not entries:
         families = sorted({e.get('family', '') for e in registry if e.get('family')})
         raise ValueError(
@@ -403,7 +477,7 @@ def load_suite(suite_name: str) -> list[Environment]:
             f'or families: {families}'
         )
 
-    environments: list[Environment] = []
+    environments: list[Environment | ComputerUseEnvironment] = []
     for entry in entries:
         env_dir = _find_env_dir(entry['path'])
         if env_dir is not None:

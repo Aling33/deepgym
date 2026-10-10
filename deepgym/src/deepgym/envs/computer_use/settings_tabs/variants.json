@@ -1,0 +1,10 @@
+[
+    {"display_name": "Grace Hopper", "toggle": "email_notifications", "toggle_text": "Turn off email notifications", "theme": "dark", "theme_label": "Dark"},
+    {"display_name": "Ada Lovelace", "toggle": "weekly_digest", "toggle_text": "Turn on the weekly digest", "theme": "system", "theme_label": "Match system"},
+    {"display_name": "Alan Turing", "toggle": "push_notifications", "toggle_text": "Turn off push notifications", "theme": "dark", "theme_label": "Dark"},
+    {"display_name": "Hedy Lamarr", "toggle": "email_notifications", "toggle_text": "Turn off email notifications", "theme": "system", "theme_label": "Match system"},
+    {"display_name": "Claude Shannon", "toggle": "weekly_digest", "toggle_text": "Turn on the weekly digest", "theme": "dark", "theme_label": "Dark"},
+    {"display_name": "Radia Perlman", "toggle": "push_notifications", "toggle_text": "Turn off push notifications", "theme": "system", "theme_label": "Match system"},
+    {"display_name": "Donald Knuth", "toggle": "email_notifications", "toggle_text": "Turn off email notifications", "theme": "dark", "theme_label": "Dark"},
+    {"display_name": "Frances Allen", "toggle": "weekly_digest", "toggle_text": "Turn on the weekly digest", "theme": "system", "theme_label": "Match system"}
+]

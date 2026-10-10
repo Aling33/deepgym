@@ -1,0 +1,9 @@
+{
+    "id": "cu-104",
+    "name": "Browser Expense Sheet",
+    "type": "computer-use",
+    "difficulty": "medium",
+    "domain": "browser",
+    "tags": ["browser", "spreadsheet", "data-entry", "gui"],
+    "max_steps": 30
+}

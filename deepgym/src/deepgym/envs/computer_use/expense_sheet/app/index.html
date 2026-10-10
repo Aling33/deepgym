@@ -1,0 +1,82 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>DeepGym - Monthly expenses</title>
+<style>
+  body { margin: 0; font: 15px system-ui, sans-serif; background: #f8fafc; color: #0f172a; }
+  main { width: 600px; margin: 40px auto; }
+  h1 { font-size: 22px; margin: 0 0 16px; }
+  table { width: 100%; border-collapse: collapse; background: #fff; }
+  th, td { border: 1px solid #cbd5e1; height: 38px; padding: 0; }
+  th { background: #e2e8f0; text-align: left; padding: 0 10px; }
+  td input { width: 100%; height: 36px; box-sizing: border-box; border: 0; padding: 0 10px; font-size: 15px;
+             background: transparent; }
+  td input:focus { outline: 2px solid #0ea5e9; }
+  td.num input { text-align: right; }
+  tfoot td { padding: 0 10px; font-weight: 600; background: #f1f5f9; }
+  tfoot td.num { text-align: right; }
+  .actions { display: flex; gap: 10px; margin-top: 14px; align-items: center; }
+  .actions button { height: 38px; padding: 0 18px; font-size: 15px; border: 1px solid #94a3b8;
+                    border-radius: 6px; background: #fff; cursor: pointer; }
+  .actions #save { background: #0284c7; border-color: #0284c7; color: #fff; }
+  #status { color: #059669; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Monthly expenses</h1>
+  <table>
+    <thead><tr><th style="width:65%">Item</th><th>Amount ($)</th></tr></thead>
+    <tbody id="rows"></tbody>
+    <tfoot><tr><td>Total</td><td class="num" id="total"></td></tr></tfoot>
+  </table>
+  <div class="actions">
+    <button id="add">Add row</button>
+    <button id="save">Save</button>
+    <span id="status"></span>
+  </div>
+</main>
+<script>
+  const rows = [
+    { name: 'Rent', amount: '1200' },
+    { name: 'Grocries', amount: '300' },
+    { name: 'Internet', amount: '60' },
+  ];
+  const total = () => {
+    const sum = rows.reduce((acc, r) => acc + (parseFloat(r.amount) || 0), 0);
+    document.getElementById('total').textContent = sum.toFixed(2);
+  };
+  const cell = (row, key, cls) => {
+    const td = document.createElement('td');
+    if (cls) td.className = cls;
+    const input = Object.assign(document.createElement('input'), { value: row[key], autocomplete: 'off' });
+    input.oninput = () => { row[key] = input.value; total(); };
+    td.append(input);
+    return td;
+  };
+  const render = () => {
+    document.getElementById('rows').replaceChildren(...rows.map((row) => {
+      const tr = document.createElement('tr');
+      tr.append(cell(row, 'name'), cell(row, 'amount', 'num'));
+      return tr;
+    }));
+    total();
+  };
+  document.getElementById('add').onclick = () => {
+    rows.push({ name: '', amount: '' });
+    render();
+    document.querySelector('#rows tr:last-child input').focus();
+  };
+  document.getElementById('save').onclick = async () => {
+    await fetch('/api/state', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ saved: true, rows }),
+    });
+    document.getElementById('status').textContent = 'Saved';
+  };
+  render();
+</script>
+</body>
+</html>

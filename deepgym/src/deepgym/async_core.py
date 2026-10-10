@@ -1,8 +1,4 @@
-"""Asynchronous DeepGym client.
-
-NOTE: Daytona SDK import names may vary across versions. Verify the import
-paths against the installed daytona-sdk version.
-"""
+"""Asynchronous DeepGym client."""
 
 from __future__ import annotations
 
@@ -35,10 +31,7 @@ from deepgym.sandbox import (
 from deepgym.verifier_template import wrap_verifier
 
 if TYPE_CHECKING:
-    try:
-        from daytona import AsyncDaytona, Sandbox
-    except ImportError:
-        from daytona_sdk import AsyncDaytona, Sandbox
+    from daytona import AsyncDaytona, Sandbox
 
 logger = logging.getLogger(__name__)
 
@@ -508,13 +501,10 @@ class AsyncDeepGym:
         """Initialise the async Daytona SDK client."""
         try:
             from daytona import AsyncDaytona, DaytonaConfig
-        except ImportError:
-            try:
-                from daytona_sdk import AsyncDaytona, DaytonaConfig
-            except ImportError as exc:
-                raise SandboxError(
-                    "daytona-sdk is required. Install with: pip install 'deepgym[daytona]'"
-                ) from exc
+        except ImportError as exc:
+            raise SandboxError(
+                "daytona is required. Install it with: pip install 'deepgym[daytona]'"
+            ) from exc
 
         kwargs: dict[str, Any] = {}
         if api_key:
@@ -532,15 +522,10 @@ class AsyncDeepGym:
                 CreateSandboxFromSnapshotParams,
                 Image,
             )
-        except ImportError:
-            try:
-                from daytona_sdk import (
-                    CreateSandboxFromImageParams,
-                    CreateSandboxFromSnapshotParams,
-                    Image,
-                )
-            except ImportError as exc:
-                raise SandboxError('daytona-sdk is required but could not be imported.') from exc
+        except ImportError as exc:
+            raise SandboxError(
+                "daytona is required. Install it with: pip install 'deepgym[daytona]'"
+            ) from exc
 
         assert self._daytona is not None
 

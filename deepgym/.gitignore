@@ -54,3 +54,8 @@ scripts/parallel_sandbox_blast.py
 scripts/ticker_100.py
 scripts/ticker_blast.py
 scripts/ticker_local.py
+
+# CyberBench eval run output (chunked logs, per-chunk results, model cache)
+data/cyberbench/*.log
+data/cyberbench/top100_eval_*.jsonl
+data/cyberbench/glm_cache/

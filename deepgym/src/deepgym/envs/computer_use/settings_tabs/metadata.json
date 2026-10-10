@@ -1,0 +1,9 @@
+{
+    "id": "cu-103",
+    "name": "Browser Settings Across Tabs",
+    "type": "computer-use",
+    "difficulty": "medium",
+    "domain": "browser",
+    "tags": ["browser", "navigation", "forms", "gui"],
+    "max_steps": 25
+}

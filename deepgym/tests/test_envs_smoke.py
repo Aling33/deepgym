@@ -11,7 +11,6 @@ ENVS_DIR = Path(__file__).resolve().parent.parent / 'src' / 'deepgym' / 'envs'
 
 # Nested subdirectory mappings for locating reference solutions.
 _NESTED_SUBDIRS = {
-    'computer_use': ['file_organizer', 'cli_task'],
     'tool_use': ['api_request', 'data_pipeline'],
     'multi_turn': ['debug_fix'],
 }

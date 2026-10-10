@@ -185,20 +185,20 @@
             "id": "cu-002",
             "name": "File Organizer",
             "path": "file_organizer",
-            "type": "computer-use",
+            "type": "coding",
             "difficulty": "easy",
             "domain": "filesystem",
-            "family": "computer-use",
+            "family": "filesystem-cli",
             "tags": ["filesystem", "directories", "organization"]
         },
         {
             "id": "cu-003",
             "name": "CLI Task - Git Operations",
             "path": "cli_task",
-            "type": "computer-use",
+            "type": "coding",
             "difficulty": "easy",
             "domain": "cli",
-            "family": "computer-use",
+            "family": "filesystem-cli",
             "tags": ["git", "cli", "version-control"]
         },
         {
@@ -238,6 +238,61 @@
             "domain": "cyber",
             "family": "cyberbench",
             "tags": ["ctf-style", "web", "path-traversal", "local-only", "exploit-simulation"]
+        },
+        {
+            "id": "cu-101",
+            "name": "Browser Sign-up Form",
+            "path": "signup_form",
+            "type": "computer-use",
+            "variants": 8,
+            "difficulty": "easy",
+            "domain": "browser",
+            "family": "computer-use",
+            "tags": ["browser", "forms", "gui"]
+        },
+        {
+            "id": "cu-102",
+            "name": "Browser Todo List",
+            "path": "todo_list",
+            "type": "computer-use",
+            "variants": 8,
+            "difficulty": "easy",
+            "domain": "browser",
+            "family": "computer-use",
+            "tags": ["browser", "crud", "gui"]
+        },
+        {
+            "id": "cu-103",
+            "name": "Browser Settings Across Tabs",
+            "path": "settings_tabs",
+            "type": "computer-use",
+            "variants": 8,
+            "difficulty": "medium",
+            "domain": "browser",
+            "family": "computer-use",
+            "tags": ["browser", "navigation", "forms", "gui"]
+        },
+        {
+            "id": "cu-104",
+            "name": "Browser Expense Sheet",
+            "path": "expense_sheet",
+            "type": "computer-use",
+            "variants": 8,
+            "difficulty": "medium",
+            "domain": "browser",
+            "family": "computer-use",
+            "tags": ["browser", "spreadsheet", "data-entry", "gui"]
+        },
+        {
+            "id": "cu-105",
+            "name": "Desktop File Manager",
+            "path": "file_manager",
+            "type": "computer-use",
+            "variants": 8,
+            "difficulty": "medium",
+            "domain": "desktop",
+            "family": "computer-use",
+            "tags": ["desktop", "file-manager", "thunar", "gui"]
         }
     ]
 }

@@ -1,0 +1,9 @@
+{
+    "id": "cu-105",
+    "name": "Desktop File Manager",
+    "type": "computer-use",
+    "difficulty": "medium",
+    "domain": "desktop",
+    "tags": ["desktop", "file-manager", "thunar", "gui"],
+    "max_steps": 30
+}

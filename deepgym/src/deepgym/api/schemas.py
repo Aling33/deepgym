@@ -7,7 +7,8 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 
 from deepgym.benchmark_ops import BenchmarkAuditReport
-from deepgym.models import Environment
+from deepgym.computer_use import ComputerUseEnvironment
+from deepgym.models import Environment, MultiTurnEnvironment, Observation
 from deepgym.reward_qa import VerifierAuditReport
 
 # ---------------------------------------------------------------------------
@@ -226,6 +227,18 @@ class BenchmarkAuditRequest(BaseModel):
     ) = None
 
 
+class CreateSessionRequest(BaseModel):
+    """Request body for POST /v1/sessions."""
+
+    environment: str | MultiTurnEnvironment | ComputerUseEnvironment = Field(
+        union_mode='left_to_right'
+    )
+    """Registry name (e.g. 'signup_form') or an inline spec; no 'type' means multi-turn."""
+
+    variant: int = Field(default=0, ge=0)
+    """Parameter set to load for a registry computer-use env (ignored for inline specs)."""
+
+
 # ---------------------------------------------------------------------------
 # Response schemas
 # ---------------------------------------------------------------------------
@@ -256,6 +269,23 @@ class CapabilitiesResponse(BaseModel):
     named_environment_run: bool = True
     verifier_audit: bool = True
     benchmark_audit: bool = True
+    sessions: bool = True
+
+
+class SessionResponse(BaseModel):
+    """Response for POST /v1/sessions: the live session and its first observation."""
+
+    session_id: str
+    sandbox_id: str
+    observation: Observation
+
+
+class StepResponse(BaseModel):
+    """Response for POST /v1/sessions/{id}/step."""
+
+    observation: Observation
+    reward: float
+    done: bool
 
 
 class CreateSnapshotResponse(BaseModel):
@@ -283,6 +313,7 @@ __all__ = [  # noqa: F822
     'BatchRunRequest',
     'EvalRequest',
     'CreateEnvironmentRequest',
+    'CreateSessionRequest',
     'CreateSnapshotRequest',
     'VerifierAuditRequest',
     'RegisteredVerifierAuditRequest',
@@ -290,6 +321,8 @@ __all__ = [  # noqa: F822
     'CapabilitiesResponse',
     'CreateEnvironmentResponse',
     'CreateSnapshotResponse',
+    'SessionResponse',
+    'StepResponse',
     'VerifierAuditReport',
     'JobResponse',
     'BatchJobResponse',
