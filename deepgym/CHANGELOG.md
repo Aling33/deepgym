@@ -8,7 +8,7 @@
 - Added 8 seeded variants per computer-use env (`load_environment(name, variant=i)`), each with a scripted reference run verified live
 - Desktop lockdown during setup: Chromium devtools and `javascript:`/`chrome:`/`file:` URLs blocked, terminals and the run dialog disabled, file manager removed from browser tasks
 - Added `/v1/sessions` HTTP endpoints (create, step, score, delete) with a race-safe session cap and 30-minute idle eviction
-- Added `deepgym.integrations.verl_tool.DeepGymSessionTool` for verl multi-turn rollouts
+- Added verl multi-turn support: `DeepGymAgentLoop` (`agent_name: deepgym_agent`) keeps one sandbox per rollout, since verl's stock loop creates and releases tools per call, and sets `reward_score` from the final verifier; `DeepGymSessionTool` is its tool
 - Verifiers in sessions run with `python -I` and are passed inline, never written to the sandbox, so the agent can't swap them or hijack them with planted modules
 - Setup scripts that exit non-zero raise `SandboxError`; shell steps report `exit_code` in observation metadata; both backends run commands under bash
 - Step verifiers that print garbage now raise `VerifierError` instead of scoring 0
