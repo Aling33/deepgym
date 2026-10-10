@@ -433,6 +433,26 @@ class TestSessions:
         assert fresh.status_code == 201
         assert client.post(f'/v1/sessions/{stale["session_id"]}/score').status_code == 404
 
+    def test_slot_stays_held_until_sandbox_closes(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(routes, '_session_slots', threading.BoundedSemaphore(1))
+        monkeypatch.setattr(routes, '_EVICTION_WAIT_S', 0.2)
+        stale = client.post('/v1/sessions', json={'environment': FILE_CHECK_ENV}).json()
+        session = routes._sessions[stale['session_id']]
+        closed = threading.Event()
+        real_close = session.close
+        monkeypatch.setattr(session, 'close', lambda: (closed.wait(5), real_close()))
+        routes._last_used[stale['session_id']] -= routes._SESSION_IDLE_TTL_S + 1
+
+        blocked = client.post('/v1/sessions', json={'environment': FILE_CHECK_ENV})
+        assert blocked.status_code == 429
+
+        closed.set()
+        assert routes._session_slots.acquire(timeout=5)
+        routes._session_slots.release()
+        assert client.post('/v1/sessions', json={'environment': FILE_CHECK_ENV}).status_code == 201
+
     def test_bad_variant_is_404(self, client: TestClient) -> None:
         resp = client.post('/v1/sessions', json={'environment': 'todo_list', 'variant': 99})
         assert resp.status_code == 404

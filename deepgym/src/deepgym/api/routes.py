@@ -334,6 +334,7 @@ def create_snapshot(_body: CreateSnapshotRequest) -> None:
 
 _MAX_SESSIONS = 100
 _SESSION_IDLE_TTL_S = 30 * 60
+_EVICTION_WAIT_S = 30
 _sessions: dict[str, Session] = {}
 _last_used: dict[str, float] = {}
 # Counts live sessions plus ones still booting, so parallel creates can't overshoot the cap.
@@ -353,21 +354,29 @@ def _get_session(session_id: str) -> Session:
 
 
 def _drop_session(session_id: str) -> Session | None:
-    """Remove a session from the store and free its slot; the caller closes it."""
-    session = _sessions.pop(session_id, None)
+    """Remove a session from the store; the caller must pass it to _close_and_free."""
     _last_used.pop(session_id, None)
-    if session is not None:
+    return _sessions.pop(session_id, None)
+
+
+def _close_and_free(session: Session) -> None:
+    """Delete the sandbox, then free its slot, so live sandboxes never exceed the cap."""
+    try:
+        session.close()
+    finally:
         _session_slots.release()
-    return session
 
 
-def _evict_idle_sessions() -> None:
-    """Free slots held by sessions idle past the TTL; their sandboxes close in the background."""
+def _evict_idle_sessions() -> int:
+    """Close sessions idle past the TTL in the background; return how many were evicted."""
     cutoff = time.monotonic() - _SESSION_IDLE_TTL_S
+    evicted = 0
     for session_id in [sid for sid, used in list(_last_used.items()) if used < cutoff]:
         session = _drop_session(session_id)
         if session is not None:
-            threading.Thread(target=session.close, daemon=True).start()
+            threading.Thread(target=_close_and_free, args=(session,), daemon=True).start()
+            evicted += 1
+    return evicted
 
 
 @v1_router.post('/sessions', response_model=SessionResponse, status_code=status.HTTP_201_CREATED)
@@ -387,8 +396,12 @@ def create_session(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail='Sessions need a multi-turn environment; use /v1/run for single-turn ones.',
         )
-    _evict_idle_sessions()
-    if not _session_slots.acquire(blocking=False):
+    if _evict_idle_sessions():
+        # Wait for the evicted sandboxes to finish closing and free their slots.
+        acquired = _session_slots.acquire(timeout=_EVICTION_WAIT_S)
+    else:
+        acquired = _session_slots.acquire(blocking=False)
+    if not acquired:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail='Session limit reached'
         )
@@ -436,7 +449,7 @@ def close_session(session_id: str) -> None:
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session '{session_id}' not found.",
         )
-    session.close()
+    _close_and_free(session)
 
 
 # ---------------------------------------------------------------------------
