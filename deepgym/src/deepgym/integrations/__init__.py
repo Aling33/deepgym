@@ -5,6 +5,7 @@ Available integrations:
 - dapo: Thin DAPO reward/config helpers for verl-style training recipes
 - trl: HuggingFace TRL GRPOTrainer reward functions
 - verl: ByteDance verl compute_score and batch reward functions
+- verl_tool: verl multi-turn tool backed by a live DeepGym session
 - openrlhf: OpenRLHF reward server FastAPI router
 - reward: Universal RewardFunction and AsyncRewardFunction
 - hf: HuggingFace Hub push/pull for environments and results

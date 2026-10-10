@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Annotated
 
@@ -23,6 +25,7 @@ from deepgym.api.schemas import (
     CapabilitiesResponse,
     CreateEnvironmentRequest,
     CreateEnvironmentResponse,
+    CreateSessionRequest,
     CreateSnapshotRequest,
     EvalRequest,
     HealthResponse,
@@ -30,6 +33,8 @@ from deepgym.api.schemas import (
     RegisteredRunRequest,
     RegisteredVerifierAuditRequest,
     RunRequest,
+    SessionResponse,
+    StepResponse,
     VerifierAuditReport,
     VerifierAuditRequest,
 )
@@ -37,15 +42,19 @@ from deepgym.benchmark_ops import build_benchmark_audit
 from deepgym.core import DeepGym
 from deepgym.exceptions import DeepGymError, SandboxError, VerifierError
 from deepgym.models import (
+    Action,
     BatchJob,
     BatchResult,
     Environment,
     EvalResult,
     Job,
     JobStatus,
+    MultiTurnEnvironment,
     RunResult,
 )
+from deepgym.registry import load_environment
 from deepgym.reward_qa import RewardAuditor
+from deepgym.session import Session
 
 # ---------------------------------------------------------------------------
 # Health router
@@ -104,10 +113,13 @@ def run_registered_environment(
     return _run_environment(dg, env, body.model_output)
 
 
-def _run_environment(dg: DeepGym, environment: Environment, model_output: str) -> RunResult:
-    """Execute a run and normalize backend errors into HTTP exceptions."""
+@contextmanager
+def _http_errors(
+    fallback_status: int = status.HTTP_500_INTERNAL_SERVER_ERROR,
+) -> Iterator[None]:
+    """Translate DeepGym errors into HTTP exceptions."""
     try:
-        return dg.run(environment, model_output)
+        yield
     except VerifierError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -119,10 +131,13 @@ def _run_environment(dg: DeepGym, environment: Environment, model_output: str) -
             detail=f'Sandbox error: {exc}',
         ) from exc
     except DeepGymError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f'DeepGym error: {exc}',
-        ) from exc
+        raise HTTPException(status_code=fallback_status, detail=f'DeepGym error: {exc}') from exc
+
+
+def _run_environment(dg: DeepGym, environment: Environment, model_output: str) -> RunResult:
+    """Execute a run and normalize backend errors into HTTP exceptions."""
+    with _http_errors():
+        return dg.run(environment, model_output)
 
 
 @v1_router.post('/audit/verifier', response_model=VerifierAuditReport)
@@ -308,6 +323,85 @@ def create_snapshot(_body: CreateSnapshotRequest) -> None:
         status_code=status.HTTP_501_NOT_IMPLEMENTED,
         detail='Snapshot creation not yet implemented',
     )
+
+
+# ---------------------------------------------------------------------------
+# Live multi-turn sessions
+# ---------------------------------------------------------------------------
+# ponytail: in-memory, no idle eviction. Abandoned Daytona sandboxes are
+# ephemeral and auto-stop on Daytona's side; add a TTL sweep if the cap bites.
+
+_MAX_SESSIONS = 100
+_sessions: dict[str, Session] = {}
+
+
+def _get_session(session_id: str) -> Session:
+    """Resolve a live session or raise 404."""
+    session = _sessions.get(session_id)
+    if session is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{session_id}' not found.",
+        )
+    return session
+
+
+@v1_router.post('/sessions', response_model=SessionResponse, status_code=status.HTTP_201_CREATED)
+def create_session(
+    body: CreateSessionRequest,
+    dg: Annotated[DeepGym, Depends(get_deepgym)],
+) -> SessionResponse:
+    """Open a live sandbox for one episode and return the first observation."""
+    if len(_sessions) >= _MAX_SESSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail='Session limit reached'
+        )
+    env = body.environment
+    if isinstance(env, str):
+        try:
+            env = load_environment(env)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    if not isinstance(env, MultiTurnEnvironment):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Sessions need a multi-turn environment; use /v1/run for single-turn ones.',
+        )
+    with _http_errors(fallback_status=status.HTTP_400_BAD_REQUEST):
+        session = dg.session(env)
+        try:
+            observation = session.start()
+        except BaseException:
+            session.close()
+            raise
+    session_id = uuid.uuid4().hex
+    _sessions[session_id] = session
+    return SessionResponse(
+        session_id=session_id, sandbox_id=session.sandbox_id, observation=observation
+    )
+
+
+@v1_router.post('/sessions/{session_id}/step', response_model=StepResponse)
+def step_session(session_id: str, action: Action) -> StepResponse:
+    """Apply one action and return the new observation, step reward, and done flag."""
+    session = _get_session(session_id)
+    with _http_errors(fallback_status=status.HTTP_409_CONFLICT):
+        observation, reward, done = session.step(action)
+    return StepResponse(observation=observation, reward=reward, done=done)
+
+
+@v1_router.post('/sessions/{session_id}/score', response_model=RunResult)
+def score_session(session_id: str) -> RunResult:
+    """Run the final verifier against the session's current state."""
+    with _http_errors():
+        return _get_session(session_id).score()
+
+
+@v1_router.delete('/sessions/{session_id}', status_code=status.HTTP_204_NO_CONTENT)
+def close_session(session_id: str) -> None:
+    """Close the session and delete its sandbox."""
+    _get_session(session_id)
+    _sessions.pop(session_id).close()
 
 
 # ---------------------------------------------------------------------------
