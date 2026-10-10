@@ -17,21 +17,33 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
-from deepgym.exceptions import DeepGymError, SandboxError, TimeoutError, VerifierError
+from deepgym.exceptions import (
+    ActionError,
+    DeepGymError,
+    SandboxError,
+    TimeoutError,
+    VerifierError,
+)
 from deepgym.models import (
     Action,
     MultiTurnEnvironment,
     Observation,
     RunResult,
     Trajectory,
-    VerifierResult,
 )
-from deepgym.sandbox import _extract_json_line, build_run_result, cleanup_sandbox
+from deepgym.sandbox import (
+    _extract_json_line,
+    build_run_result,
+    cleanup_sandbox,
+    is_command_timeout,
+    parse_verifier_output,
+)
 
 if TYPE_CHECKING:
     from daytona import Daytona, Sandbox
@@ -162,6 +174,11 @@ class DaytonaBackend:
         self._daytona = daytona
         self._env: dict[str, str] = {}
         self.sandbox_id = str(getattr(self._sandbox, 'id', 'unknown'))
+        try:
+            self._sandbox.fs.create_folder(_DAYTONA_WORKDIR, '755')
+        except Exception as exc:
+            self.close()
+            raise SandboxError(f'Failed to create work dir: {exc}') from exc
 
     def exec(self, command: str, timeout: int, env: dict[str, str] | None = None) -> ExecResult:
         """Run *command* with bash in the sandbox work directory.
@@ -178,7 +195,7 @@ class DaytonaBackend:
                 timeout=timeout,
             )
         except Exception as exc:
-            if 'timeout' in str(exc).lower() or 'timed out' in str(exc).lower():
+            if is_command_timeout(exc):
                 raise TimeoutError(f'Command exceeded {timeout}s timeout') from exc
             raise SandboxError(f'Sandbox exec failed: {exc}') from exc
         return ExecResult(response.exit_code, response.result)
@@ -202,11 +219,16 @@ class DaytonaBackend:
         """Apply a GUI action through Daytona computer use.
 
         Raises:
-            SandboxError: If the Daytona computer-use call fails.
+            ActionError: If the desktop rejects the input (e.g. an unknown key name).
+            SandboxError: If the Daytona computer-use call fails for any other reason.
         """
         try:
             self._dispatch(action)
         except Exception as exc:
+            # ponytail: Daytona reports bad input as a generic daemon 500, so match its wording.
+            message = str(exc).lower()
+            if 'invalid' in message or 'unsupported' in message:
+                raise ActionError(f'{action.action_type} rejected: {exc}') from exc
             raise SandboxError(f'{action.action_type} failed: {exc}') from exc
 
     def _dispatch(self, action: Action) -> None:
@@ -266,6 +288,8 @@ class Session:
         self._obs: Observation | None = None
         self._step = 0
         self._done = False
+        # One sandbox, one actor at a time: concurrent step/score/close calls queue up.
+        self._lock = threading.Lock()
 
     @property
     def done(self) -> bool:
@@ -288,56 +312,58 @@ class Session:
         Raises:
             DeepGymError: If the session was already started.
             SandboxError: If setup exits non-zero.
-            TimeoutError: If setup exceeds the per-step timeout.
+            TimeoutError: If setup exceeds ``setup_timeout``.
         """
-        if self._obs is not None:
-            raise DeepGymError('Session already started; open a new session per episode')
-        env = self._env
-        for path, content in env.files.items():
-            self._backend.write_file(path, content.encode('utf-8'))
-        if env.desktop:
-            self._backend.start_desktop()
-        output = ''
-        if env.setup_script:
-            output = _checked(
-                'Setup script', self._backend.exec(env.setup_script, env.timeout_per_step)
-            )
-        if env.setup_code:
-            output = _checked('Setup code', self._run_python('_setup.py', env.setup_code))
-        self._obs = self._observe(output, done=False)
-        return self._obs
+        with self._lock:
+            if self._obs is not None:
+                raise DeepGymError('Session already started; open a new session per episode')
+            env = self._env
+            for path, content in env.files.items():
+                self._backend.write_file(path, content.encode('utf-8'))
+            if env.desktop:
+                self._backend.start_desktop()
+            output = ''
+            if env.setup_script:
+                output = _checked(
+                    'Setup script', self._backend.exec(env.setup_script, env.setup_timeout)
+                )
+            if env.setup_code:
+                output = _checked(
+                    'Setup code', self._run_python('_setup.py', env.setup_code, env.setup_timeout)
+                )
+            self._obs = self._observe(output, done=False)
+            return self._obs
 
     def step(self, action: Action) -> StepResult:
         """Apply one action and return the new observation, step reward, and done flag.
 
         Raises:
-            DeepGymError: If the session is not running or the action is not allowed.
+            DeepGymError: If the session is not running.
+            ActionError: If the action is not allowed here or the desktop rejects it.
+            VerifierError: If the step verifier fails; the episode is then over.
         """
-        if self._obs is None or self._done:
-            raise DeepGymError('Session is not running; call start() or open a new session')
-        if action.action_type not in self._env.allowed_actions:
-            raise DeepGymError(
-                f'Action {action.action_type!r} not allowed here. '
-                f'Allowed: {sorted(self._env.allowed_actions)}'
+        with self._lock:
+            if self._obs is None or self._done:
+                raise DeepGymError('Session is not running; call start() or open a new session')
+            if action.action_type not in self._env.allowed_actions:
+                raise ActionError(
+                    f'Action {action.action_type!r} not allowed here. '
+                    f'Allowed: {sorted(self._env.allowed_actions)}'
+                )
+
+            self._step += 1
+            output, exit_code = self._apply(action)
+            try:
+                reward = self._step_reward(output) if self._env.step_verifier_code else 0.0
+            except VerifierError:
+                self._record(action, output, exit_code, reward=0.0, done=True)
+                raise
+            done = (
+                action.action_type == 'done'
+                or _signals_done(output)
+                or self._step >= self._env.max_steps
             )
-
-        self._step += 1
-        output, exit_code = self._apply(action)
-        reward = self._step_reward(output) if self._env.step_verifier_code else 0.0
-        done = (
-            action.action_type == 'done'
-            or _signals_done(output)
-            or self._step >= self._env.max_steps
-        )
-
-        self._trajectory.steps.append((self._obs, action))
-        self._trajectory.step_rewards.append(reward)
-        self._trajectory.total_reward += reward
-        self._done = done
-        self._obs = self._observe(output, done=done, exit_code=exit_code)
-        if done:
-            self._trajectory.final_observation = self._obs
-        return StepResult(self._obs, reward, done)
+            return self._record(action, output, exit_code, reward=reward, done=done)
 
     def score(self) -> RunResult:
         """Run the final verifier against the current state.
@@ -356,24 +382,20 @@ class Session:
                 execution_time_ms=0.0,
                 sandbox_id=self.sandbox_id,
             )
-        start = time.perf_counter()
-        exit_code, stdout = self._backend.exec(
-            _inline_python(self._backend.python, self._env.final_verifier_code),
-            self._env.timeout_per_step,
-        )
-        json_str = _extract_json_line(stdout)
-        if json_str is None:
-            raise VerifierError(f'Final verifier did not produce valid JSON. output: {stdout!r}')
-        try:
-            result = VerifierResult.model_validate_json(json_str)
-        except ValueError as exc:
-            raise VerifierError(f'Failed to parse final verifier JSON: {exc}') from exc
-        elapsed_ms = (time.perf_counter() - start) * 1000
-        return build_run_result(result, elapsed_ms, self.sandbox_id, exit_code=exit_code)
+        with self._lock:
+            start = time.perf_counter()
+            exit_code, stdout = self._backend.exec(
+                _inline_python(self._backend.python, self._env.final_verifier_code),
+                self._env.timeout_per_step,
+            )
+            result = parse_verifier_output(stdout, f'exit_code={exit_code}')
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            return build_run_result(result, elapsed_ms, self.sandbox_id, exit_code=exit_code)
 
     def close(self) -> None:
-        """Release the backend."""
-        self._backend.close()
+        """Release the backend, waiting for any in-flight step to finish."""
+        with self._lock:
+            self._backend.close()
 
     def __enter__(self) -> Session:
         return self
@@ -405,9 +427,24 @@ class Session:
         self._backend.act(action)
         return '', None
 
-    def _run_python(self, filename: str, code: str) -> ExecResult:
+    def _run_python(self, filename: str, code: str, timeout: int | None = None) -> ExecResult:
         self._backend.write_file(filename, code.encode('utf-8'))
-        return self._backend.exec(f'{self._backend.python} {filename}', self._env.timeout_per_step)
+        return self._backend.exec(
+            f'{self._backend.python} {filename}', timeout or self._env.timeout_per_step
+        )
+
+    def _record(
+        self, action: Action, output: str, exit_code: int | None, *, reward: float, done: bool
+    ) -> StepResult:
+        """Append the step to the trajectory and advance the current observation."""
+        self._trajectory.steps.append((self._obs, action))
+        self._trajectory.step_rewards.append(reward)
+        self._trajectory.total_reward += reward
+        self._done = done
+        self._obs = self._observe(output, done=done, exit_code=exit_code)
+        if done:
+            self._trajectory.final_observation = self._obs
+        return StepResult(self._obs, reward, done)
 
     def _observe(self, output: str, *, done: bool, exit_code: int | None = None) -> Observation:
         return Observation(
@@ -421,16 +458,21 @@ class Session:
     def _step_reward(self, output: str) -> float:
         """Run the step verifier and return its score, clamped to [0, 1].
 
+        Stderr is discarded so warnings can't break the plain-float form.
+
         Raises:
-            VerifierError: If the step verifier prints neither a float nor JSON with a score.
-            TimeoutError: If the step verifier exceeds the per-step timeout.
+            VerifierError: If the step verifier times out or prints neither a float
+                nor JSON with a score.
         """
         self._backend.write_file(_STEP_OUTPUT, output.encode('utf-8'))
-        stdout = self._backend.exec(
-            _inline_python(self._backend.python, self._env.step_verifier_code),
-            self._env.timeout_per_step,
-            env={'STEP_OUTPUT_PATH': _STEP_OUTPUT, 'STEP_NUMBER': str(self._step)},
-        ).output.strip()
+        try:
+            stdout = self._backend.exec(
+                _inline_python(self._backend.python, self._env.step_verifier_code) + ' 2>/dev/null',
+                self._env.timeout_per_step,
+                env={'STEP_OUTPUT_PATH': _STEP_OUTPUT, 'STEP_NUMBER': str(self._step)},
+            ).output.strip()
+        except TimeoutError as exc:
+            raise VerifierError(f'Step verifier timed out at step {self._step}') from exc
         json_str = _extract_json_line(stdout)
         try:
             value = json.loads(json_str)['score'] if json_str else float(stdout)

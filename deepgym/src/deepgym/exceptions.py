@@ -15,3 +15,7 @@ class SandboxError(DeepGymError):
 
 class TimeoutError(DeepGymError):
     """Raise when execution exceeds the configured timeout."""
+
+
+class ActionError(DeepGymError):
+    """Raise when the environment rejects an agent's action (not allowed, unknown key)."""
