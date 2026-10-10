@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Added live multi-turn sessions (`dg.session()`, `dg.run_episode()`, `Session`): one sandbox per episode, actions applied step by step, final verifier run against the resulting state. Local and Daytona backends.
+- Added real computer-use support on Daytona's desktop: typed GUI actions (click, type, key, scroll, drag, ...), full-resolution screenshots in observations, GUI-only action sets by default
+- Added 5 computer-use environments (`signup_form`, `todo_list`, `settings_tabs`, `expense_sheet`, `file_manager`) with progress/guard verifiers and scripted reference runs checked live on Daytona
+- Added `/v1/sessions` HTTP endpoints (create, step, score, delete)
+- Added `deepgym.integrations.verl_tool.DeepGymSessionTool` for verl multi-turn rollouts
+- Verifiers in sessions run with `python -I`, so files the agent plants in the work dir (e.g. a fake `json.py`) can't hijack them
+- Breaking: removed `MultiTurnRunner` (use `dg.run_episode()`), `ScreenshotVerifier`, and `ToolUseEnvironment`; `ComputerUseEnvironment` is now a desktop `MultiTurnEnvironment`
+- Breaking: `file_organizer` and `cli_task` are now type `coding` (they were single-shot scripts, not computer use); computer-use envs only appear in the `computer-use` suite
+- Switched the Daytona dependency from the deprecated `daytona-sdk` to `daytona`; Daytona session sandboxes block outbound network
+
 ## 0.3.0 (2026-04-02)
 
 - Added a thin native DAPO adapter with reward/config helpers for verl-style training recipes

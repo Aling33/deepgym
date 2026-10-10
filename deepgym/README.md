@@ -1,10 +1,13 @@
 # DeepGym
 
-RL training environments with verifiable rewards for coding agents.
+RL training environments with verifiable rewards for coding and computer-use agents.
 
 You give it model-generated code. It runs the code in a sandbox, checks it against
 a verifier, and hands back a score. That score plugs straight into TRL, verl,
 OpenRLHF, or whatever you're using for GRPO/DAPO/PPO.
+
+For agents, it keeps one sandbox alive for the whole episode (a shell or a full
+desktop), applies actions step by step, then scores the state the agent left behind.
 
 ## Quick Start
 
@@ -46,7 +49,9 @@ and per-test-case breakdown showing exactly which tests passed and which didn't.
 
 ## What's in the box
 
-- 24 built-in coding environments (ship with pip install)
+- 31 built-in environments (ship with pip install), including 5 computer-use tasks
+- Computer-use episodes on a real Daytona desktop: screenshots in, mouse/keyboard out
+- Live multi-turn sessions from Python (`dg.session()`) or HTTP (`/v1/sessions`)
 - 2,350+ importable benchmarks (HumanEval, MBPP, BigCodeBench, EvalPlus)
 - SWE-bench Pro support for repo-level patch RL tasks
 - Terminal-Bench 2.0 support for shell/terminal RL tasks
@@ -55,7 +60,7 @@ and per-test-case breakdown showing exactly which tests passed and which didn't.
 - Per-test-case reward traces (not just pass/fail -- you see which tests broke)
 - Deterministic seeding (same input, same score, every time)
 - Three runtime modes: local subprocess, self-hosted Daytona, cloud Daytona
-- Drop-in reward functions for TRL, verl, OpenRLHF
+- Drop-in reward functions for TRL, verl, OpenRLHF, plus a verl multi-turn tool
 - lm-evaluation-harness task adapter (evaluate with `lm_eval --tasks deepgym_*`)
 - HuggingFace Hub integration (share environments as HF datasets)
 - Batch scoring for GRPO (score N completions in parallel)
@@ -247,6 +252,50 @@ mixed = MixedEnvironment([
 reward_fn = make_trl_reward_fn(mixed)
 ```
 
+### Train computer-use agents
+
+Computer-use environments boot Daytona's desktop (xfce + Chromium), run a setup
+script, and hand the agent a screenshot. Actions are clicks, typing, keys, scrolls
+and drags in screenshot pixels. The verifier runs in the same sandbox and checks
+what the agent changed (saved app state, files), never pixels. Needs `DAYTONA_API_KEY`.
+
+```python
+from deepgym import Action, DeepGym, load_environment
+
+dg = DeepGym(mode='daytona')
+env = load_environment('settings_tabs')
+
+with dg.session(env) as session:
+    obs = session.start()                     # obs.screenshot is a base64 PNG
+    while not session.done:
+        action = my_agent(obs)                # e.g. Action(action_type='click', x=376, y=121)
+        obs, reward, done = session.step(action)
+    result = session.score()
+print(result.score, result.output)            # "3/3 changes made"
+```
+
+Or in one call: `trajectory, result = dg.run_episode(env, my_agent)`.
+
+Verifiers split checks into *progress* (the changes the task asked for) and
+*guards* (work was saved, nothing else broke). Any failed guard scores 0, so
+neither doing nothing nor clicking Save on untouched state earns reward.
+
+The same session API runs shell-based multi-turn tasks (`MultiTurnEnvironment`),
+and the local backend works for those without Daytona.
+
+### Drive episodes over HTTP
+
+`deepgym serve` exposes sessions to trainers in any language:
+
+```
+POST   /v1/sessions                {"environment": "todo_list"}  -> session_id, observation
+POST   /v1/sessions/{id}/step      {"action_type": "type", "content": "Pay rent"}
+POST   /v1/sessions/{id}/score     -> RunResult
+DELETE /v1/sessions/{id}
+```
+
+`environment` can also be an inline `MultiTurnEnvironment` spec.
+
 ### Drop into verl
 
 ```python
@@ -254,6 +303,15 @@ from deepgym.integrations.verl import make_verl_compute_score
 
 compute_score = make_verl_compute_score(env)
 # In verl config: custom_reward_function.path = "your_reward_module.py"
+```
+
+For multi-turn agent RL, register the session tool in your verl tool config.
+Each rollout gets its own sandbox, and screenshots come back as images:
+
+```yaml
+tools:
+  - class_name: deepgym.integrations.verl_tool.DeepGymSessionTool
+    config: {type: native, environment: signup_form, mode: daytona}
 ```
 
 ### Drop into OpenRLHF
@@ -315,18 +373,21 @@ The wrapper handles the rest.
 
 ## Environments
 
-### Built-in (24, ship with pip install)
+### Built-in (31, ship with pip install)
 
-**Coding (20):**
+**Coding (22):**
 - Array/String: reverse_string, palindrome_check, anagram_check, max_subarray, rotate_array, remove_duplicates, valid_parentheses
 - Hash Map: group_anagrams, longest_consecutive, top_k_frequent
 - DP: climbing_stairs, coin_change, longest_common_subsequence, house_robber
 - Graph/Tree: binary_search, merge_intervals, level_order_traversal
 - Practical: fizzbuzz, roman_to_integer, matrix_spiral
+- Filesystem/CLI scripting: file_organizer, cli_task
 
-**Computer-use (2):** file_organizer, cli_task
+**Computer-use (5, multi-turn, Daytona desktop):** signup_form, todo_list, settings_tabs, expense_sheet, file_manager
 
 **Tool-use (2):** api_request, data_pipeline
+
+**Cyber (2):** cyber/cve_2021_44228_log_triage, cyber/web_path_traversal_toy
 
 Load by name:
 
