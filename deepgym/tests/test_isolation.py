@@ -591,3 +591,24 @@ except Exception:
         )
         solution = 'import subprocess\nsubprocess.run(["true"], check=True)\n'
         assert dg.run(Environment(task='t', verifier_code=verifier), solution).passed
+
+
+def test_sharing_a_workdir_never_follows_symlinks(tmp_path) -> None:
+    from deepgym.solution_runtime import _share_with_solution
+
+    judge_file = tmp_path / 'judge_secret.txt'
+    judge_file.write_text('EXPECTED')
+    judge_file.chmod(0o600)
+    work = tmp_path / 'work'
+    (work / 'sub').mkdir(parents=True)
+    (work / 'input.csv').write_text('a,b\n')
+    (work / 'input.csv').chmod(0o600)
+    (work / 'link').symlink_to(judge_file)
+    (work / 'sub' / 'dirlink').symlink_to(tmp_path)
+
+    _share_with_solution(str(work))
+
+    assert judge_file.stat().st_mode & 0o777 == 0o600
+    assert tmp_path.stat().st_mode & 0o777 != 0o777
+    assert (work / 'input.csv').stat().st_mode & 0o044 == 0o044
+    assert (work / 'sub').stat().st_mode & 0o777 == 0o777

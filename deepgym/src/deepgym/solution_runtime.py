@@ -174,18 +174,28 @@ def _macos_profile(spec: dict, writable: Sequence[str], allow_fork: bool) -> str
 def _share_with_solution(workdir: str) -> None:
     """Let the solution user write in *workdir* and read what the judge put there.
 
-    Symlinks are skipped: chmod would follow them to judge-owned files.
+    Works through file descriptors opened with O_NOFOLLOW, so a symlink swapped
+    in mid-walk is refused instead of followed to a judge-owned file.
     """
-    os.chmod(workdir, 0o777)
-    for parent, dirs, files in os.walk(workdir):
-        for name in dirs:
-            path = os.path.join(parent, name)
-            if not os.path.islink(path):
-                os.chmod(path, 0o777)
-        for name in files:
-            path = os.path.join(parent, name)
-            if not os.path.islink(path):
-                os.chmod(path, os.stat(path).st_mode | 0o644)
+    no_follow = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    top = os.open(workdir, no_follow | os.O_DIRECTORY)
+    try:
+        os.fchmod(top, 0o777)
+    finally:
+        os.close(top)
+    for _, dirs, files, dir_fd in os.fwalk(workdir, follow_symlinks=False):
+        for name, flags, mode in [
+            *((d, no_follow | os.O_DIRECTORY, 0o777) for d in dirs),
+            *((f, no_follow, None) for f in files),
+        ]:
+            try:
+                fd = os.open(name, flags, dir_fd=dir_fd)
+            except OSError:
+                continue
+            try:
+                os.fchmod(fd, mode if mode is not None else os.fstat(fd).st_mode | 0o644)
+            finally:
+                os.close(fd)
 
 
 def _launch_argv(
