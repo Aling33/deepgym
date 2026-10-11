@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from deepgym.benchmark_ops import BenchmarkAuditReport
 from deepgym.computer_use import ComputerUseEnvironment
-from deepgym.models import Environment, MultiTurnEnvironment, Observation
+from deepgym.models import Environment, MultiTurnEnvironment, Observation, VerifierMode
 from deepgym.reward_qa import VerifierAuditReport
 
 # ---------------------------------------------------------------------------
@@ -28,6 +28,9 @@ class APIEnvironment(BaseModel):
     verifier_code: str = Field(..., max_length=500_000)
     language: str = Field(default='python', max_length=50)
     timeout: int = Field(default=30, ge=1, le=3600)
+    case_timeout: int = Field(default=10, ge=1, le=3600)
+    verifier_mode: VerifierMode = 'auto'
+    support_files: dict[str, str] = Field(default_factory=dict, max_length=50)
     difficulty: Literal['easy', 'medium', 'hard'] = 'medium'
     domain: str = Field(default='coding', max_length=100)
     tags: list[str] = Field(default_factory=list, max_length=20)
@@ -58,6 +61,9 @@ class APIEnvironment(BaseModel):
             verifier_code=self.verifier_code,
             language=self.language,
             timeout=self.timeout,
+            case_timeout=self.case_timeout,
+            verifier_mode=self.verifier_mode,
+            support_files=self.support_files,
             difficulty=self.difficulty,
             domain=self.domain,
             tags=self.tags,

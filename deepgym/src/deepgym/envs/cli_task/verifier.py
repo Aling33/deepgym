@@ -2,26 +2,20 @@
 
 import json
 import os
-import shutil
 import subprocess
 import sys
+import tempfile
+
+from deepgym_solution import run_solution
 
 
 def verify(solution_path, test_cases_path=None):
     """Verify the solution creates a git repo with the correct state."""
-    repo_dir = '/tmp/my_repo'
-
-    # Clean up any previous run.
-    if os.path.exists(repo_dir):
-        shutil.rmtree(repo_dir)
+    work_dir = tempfile.mkdtemp(prefix='deepgym_cli_task_')
+    repo_dir = os.path.join(work_dir, 'my_repo')
 
     try:
-        proc = subprocess.run(
-            [sys.executable, solution_path],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
+        proc = run_solution(solution_path, cwd=work_dir, timeout=15)
     except subprocess.TimeoutExpired:
         return {
             'schema_version': '1.0',

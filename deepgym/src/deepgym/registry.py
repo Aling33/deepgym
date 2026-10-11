@@ -349,6 +349,10 @@ def _load_env_from_dir(
     if variant:
         raise ValueError(f'{env_dir.name} has no variants; only computer-use envs do')
 
+    file_metadata = (
+        json.loads(metadata_path.read_text(encoding='utf-8')) if metadata_path.exists() else {}
+    )
+    settings = {**file_metadata, **(metadata or {})}
     return Environment(
         name=env_dir.name,
         task=task,
@@ -357,7 +361,35 @@ def _load_env_from_dir(
         difficulty=difficulty,
         domain=domain,
         tags=tags,
+        support_files=_read_support_files(env_dir, settings.get('support_files', [])),
+        **{
+            key: settings[key]
+            for key in ('verifier_mode', 'timeout', 'case_timeout')
+            if key in settings
+        },
     )
+
+
+def _read_support_files(env_dir: Path, paths: list[str]) -> dict[str, str]:
+    """Load helper modules listed in metadata, keyed by file name.
+
+    Paths are relative to the env directory and may point at shared code
+    elsewhere in the same environments root (e.g. ``../_shared/scoring.py``).
+
+    Raises:
+        ValueError: If a path escapes the environments root or two names collide.
+    """
+    roots = [_get_builtin_envs_path().resolve(), _get_cache_dir().resolve()]
+    root = next((r for r in roots if env_dir.resolve().is_relative_to(r)), env_dir.resolve())
+    files: dict[str, str] = {}
+    for rel in paths:
+        path = (env_dir / rel).resolve()
+        if not path.is_relative_to(root) or not path.is_file():
+            raise ValueError(f'support file {rel!r} for {env_dir.name} is not a file under {root}')
+        if path.name in files:
+            raise ValueError(f'two support files for {env_dir.name} are named {path.name!r}')
+        files[path.name] = path.read_text(encoding='utf-8')
+    return files
 
 
 def load_environment(name: str, variant: int = 0) -> Environment | ComputerUseEnvironment:

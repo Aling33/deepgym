@@ -5,12 +5,12 @@ Solutions that simply call sorted(), list.sort(), or similar built-ins
 receive a heavy penalty since the task requires implementing the algorithm.
 """
 
-import importlib.util
-import inspect
 import json
 import random
 import sys
 import time
+
+from deepgym_solution import load_solution, solution_source
 
 _BANNED_PATTERNS = ['sorted(', '.sort(', 'heapq.nsmallest', 'heapq.nlargest', 'heapq.merge']
 
@@ -41,9 +41,7 @@ def _check_implementation(source: str) -> tuple[bool, str]:
 def verify(solution_path, test_cases_path=None):
     """Verify a sorting solution for correctness and implementation quality."""
     # Load the solution module
-    spec = importlib.util.spec_from_file_location('solution', solution_path)
-    solution = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(solution)
+    solution = load_solution(solution_path)
 
     if not hasattr(solution, 'sort_list'):
         return {
@@ -57,7 +55,7 @@ def verify(solution_path, test_cases_path=None):
     # --- Implementation analysis ---
     # Inspect the entire module source so helper functions (e.g. _merge) are
     # included in the analysis, not just the entry-point function.
-    source = inspect.getsource(solution)
+    source = solution_source(solution_path)
     is_genuine, impl_reason = _check_implementation(source)
 
     # Test cases

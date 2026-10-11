@@ -7,6 +7,8 @@ import subprocess
 import sys
 import tempfile
 
+from deepgym_solution import run_solution
+
 INPUT_CSV = """name,age,city
 Alice,25,New York
 Bob,35,San Francisco
@@ -32,13 +34,7 @@ def verify(solution_path, test_cases_path=None):
         f.write(INPUT_CSV.strip() + '\n')
 
     try:
-        proc = subprocess.run(
-            [sys.executable, solution_path],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            cwd=work_dir,
-        )
+        proc = run_solution(solution_path, cwd=work_dir, timeout=15)
     except subprocess.TimeoutExpired:
         return {
             'schema_version': '1.0',

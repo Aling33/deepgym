@@ -5,12 +5,12 @@ Solutions that return hardcoded values, lack function logic, or use
 brute-force O(n^2) nested loops are penalised.
 """
 
-import importlib.util
-import inspect
 import json
 import random
 import sys
 import time
+
+from deepgym_solution import load_solution, solution_source
 
 
 def _check_implementation(source: str) -> tuple[bool, str]:
@@ -65,9 +65,7 @@ def verify(solution_path, test_cases_path=None):
     """Verify a two_sum solution for correctness and implementation quality."""
     # Load the solution module
     try:
-        spec = importlib.util.spec_from_file_location('solution', solution_path)
-        solution = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(solution)
+        solution = load_solution(solution_path)
     except Exception as e:
         return {
             'schema_version': '1.0',
@@ -87,7 +85,7 @@ def verify(solution_path, test_cases_path=None):
         }
 
     # --- Implementation analysis ---
-    source = inspect.getsource(solution.two_sum)
+    source = solution_source(solution_path, 'two_sum')
     is_genuine, impl_reason = _check_implementation(source)
 
     # Static test cases: (nums, target, expected_indices)

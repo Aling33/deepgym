@@ -10,6 +10,11 @@ from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, Field, model_validator
 
+VerifierMode = Literal['auto', 'script', 'verify_function', 'body']
+
+# Files the judge directory always contains; support files can't shadow them.
+RESERVED_JUDGE_FILES = frozenset({'verifier.py', 'deepgym_solution.py', 'test_cases.json'})
+
 
 class Environment(BaseModel):
     """Define a task environment for RL evaluation.
@@ -35,16 +40,39 @@ class Environment(BaseModel):
 
     @model_validator(mode='after')
     def check_verifier_source(self) -> Environment:
-        """Ensure at least one of verifier_code or verifier_path is provided."""
+        """Ensure a verifier is given and support file names are safe."""
         if not self.verifier_code and self.verifier_path is None:
             raise ValueError('Either verifier_code or verifier_path must be provided')
+        for name in self.support_files:
+            rel = PurePosixPath(name)
+            if not rel.parts or rel.is_absolute() or '..' in rel.parts:
+                raise ValueError(f'support file {name!r} must be a relative path without ".."')
+            if name in RESERVED_JUDGE_FILES:
+                raise ValueError(f'support file {name!r} would replace a judge file')
         return self
+
+    @property
+    def verifier_source(self) -> str:
+        """The verifier's source code, from verifier_path or verifier_code."""
+        if self.verifier_path is not None:
+            return self.verifier_path.read_text(encoding='utf-8')
+        return self.verifier_code
 
     language: str = 'python'
     """Programming language for the solution."""
 
     timeout: int = Field(default=30, ge=1)
-    """Maximum execution time in seconds."""
+    """Total time budget for the verifier run, in seconds."""
+
+    case_timeout: int = Field(default=10, ge=1)
+    """Seconds one call into the solution may take; a slow case fails on its own."""
+
+    verifier_mode: VerifierMode = 'auto'
+    """How to run the verifier: 'script' (has a main block), 'verify_function'
+    (defines verify()), 'body' (function body), or 'auto' to detect by parsing."""
+
+    support_files: dict[str, str] = Field(default_factory=dict)
+    """Extra files placed next to the verifier and importable by it (name -> content)."""
 
     difficulty: Literal['easy', 'medium', 'hard'] = 'medium'
     """Task difficulty level."""

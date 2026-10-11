@@ -7,11 +7,14 @@ response.
 """
 
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
 from pathlib import Path
+
+from deepgym_solution import run_solution
 
 
 def verify(solution_path, test_cases_path=None):
@@ -95,23 +98,16 @@ def verify(solution_path, test_cases_path=None):
         exec(open({solution_path!r}).read())
     """)
 
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as tmp:
-        tmp.write(wrapper)
-        tmp_path = tmp.name
-
+    work_dir = tempfile.mkdtemp(prefix='deepgym_api_request_')
+    wrapper_path = Path(work_dir, 'run_with_mocks.py')
+    wrapper_path.write_text(wrapper, encoding='utf-8')
     try:
-        proc = subprocess.run(
-            [sys.executable, tmp_path],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        stdout = proc.stdout.strip()
-        checks['correct_output'] = 'Sample Slide Show' in stdout
+        proc = run_solution(str(wrapper_path), cwd=work_dir, timeout=15)
+        checks['correct_output'] = 'Sample Slide Show' in proc.stdout
     except subprocess.TimeoutExpired:
         checks['correct_output'] = False
     finally:
-        Path(tmp_path).unlink(missing_ok=True)
+        shutil.rmtree(work_dir, ignore_errors=True)
 
     passed_count = sum(checks.values())
     total = len(checks)

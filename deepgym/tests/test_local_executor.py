@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from deepgym.exceptions import SandboxError, TimeoutError, VerifierError
+from deepgym.judge import JudgeJob
 from deepgym.models import VerifierResult
 from deepgym.sandbox import ExecutionResult, LocalExecutor
 
@@ -54,9 +55,11 @@ class TestLocalExecutorRun:
     def test_passing_solution(self, executor: LocalExecutor) -> None:
         verifier_code = _standalone_verifier('return 1.0')
         result = executor.run(
-            verifier_code=verifier_code,
-            solution_code='# anything\n',
-            timeout=10,
+            JudgeJob(
+                verifier=verifier_code,
+                solution='# anything\n',
+                timeout=10,
+            )
         )
         assert isinstance(result, ExecutionResult)
         assert isinstance(result.verifier_result, VerifierResult)
@@ -68,9 +71,11 @@ class TestLocalExecutorRun:
     def test_failing_solution(self, executor: LocalExecutor) -> None:
         verifier_code = _standalone_verifier('return 0.0')
         result = executor.run(
-            verifier_code=verifier_code,
-            solution_code='# anything\n',
-            timeout=10,
+            JudgeJob(
+                verifier=verifier_code,
+                solution='# anything\n',
+                timeout=10,
+            )
         )
         assert isinstance(result, ExecutionResult)
         assert result.verifier_result.score == 0.0
@@ -85,9 +90,11 @@ class TestLocalExecutorRun:
         )
         with pytest.raises(TimeoutError):
             executor.run(
-                verifier_code=slow_verifier,
-                solution_code='# slow\n',
-                timeout=1,
+                JudgeJob(
+                    verifier=slow_verifier,
+                    solution='# slow\n',
+                    timeout=1,
+                )
             )
 
     def test_invalid_verifier_no_json_output(self, executor: LocalExecutor) -> None:
@@ -96,9 +103,11 @@ class TestLocalExecutorRun:
         )
         with pytest.raises(VerifierError):
             executor.run(
-                verifier_code=bad_verifier,
-                solution_code='# anything\n',
-                timeout=10,
+                JudgeJob(
+                    verifier=bad_verifier,
+                    solution='# anything\n',
+                    timeout=10,
+                )
             )
 
     def test_result_is_execution_result_instance(self, executor: LocalExecutor) -> None:
@@ -106,9 +115,11 @@ class TestLocalExecutorRun:
             'return {"score": 0.7, "passed": True, "details": "ok"}'
         )
         result = executor.run(
-            verifier_code=verifier_code,
-            solution_code='# x\n',
-            timeout=10,
+            JudgeJob(
+                verifier=verifier_code,
+                solution='# x\n',
+                timeout=10,
+            )
         )
         assert isinstance(result, ExecutionResult)
         assert isinstance(result.verifier_result, VerifierResult)
@@ -118,10 +129,12 @@ class TestLocalExecutorRun:
         verifier_code = _standalone_verifier('return 1.0')
         with pytest.raises(SandboxError, match='Invalid environment variable name'):
             executor.run(
-                verifier_code=verifier_code,
-                solution_code='# x\n',
-                timeout=10,
-                env_vars={'; rm -rf /': 'bad'},
+                JudgeJob(
+                    verifier=verifier_code,
+                    solution='# x\n',
+                    timeout=10,
+                    env_vars={'; rm -rf /': 'bad'},
+                )
             )
 
 
@@ -134,9 +147,11 @@ class TestExampleEnvironments:
             encoding='utf-8'
         )
         result = executor.run(
-            verifier_code=verifier_code,
-            solution_code=solution_code,
-            timeout=30,
+            JudgeJob(
+                verifier=verifier_code,
+                solution=solution_code,
+                timeout=30,
+            )
         )
         assert result.verifier_result.passed is True
         assert result.verifier_result.score == 1.0
@@ -145,9 +160,11 @@ class TestExampleEnvironments:
         verifier_code = _make_ready_verifier(ENVS_DIR / 'two_sum' / 'verifier.py')
         solution_code = (ENVS_DIR / 'two_sum' / 'reference_solution.py').read_text(encoding='utf-8')
         result = executor.run(
-            verifier_code=verifier_code,
-            solution_code=solution_code,
-            timeout=30,
+            JudgeJob(
+                verifier=verifier_code,
+                solution=solution_code,
+                timeout=30,
+            )
         )
         assert result.verifier_result.passed is True
         assert result.verifier_result.score == 1.0
@@ -158,9 +175,11 @@ class TestExampleEnvironments:
             encoding='utf-8'
         )
         result = executor.run(
-            verifier_code=verifier_code,
-            solution_code=solution_code,
-            timeout=30,
+            JudgeJob(
+                verifier=verifier_code,
+                solution=solution_code,
+                timeout=30,
+            )
         )
         assert result.verifier_result.passed is True
         assert result.verifier_result.score == 1.0

@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
+import shlex
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from typing import TYPE_CHECKING, Any, Literal
@@ -13,33 +13,27 @@ from typing import TYPE_CHECKING, Any, Literal
 import httpx
 
 from deepgym.exceptions import DeepGymError, SandboxError, TimeoutError, VerifierError
+from deepgym.judge import DAYTONA_SETUP, DEADLINE_GRACE_S, JudgeJob, daytona_judge, daytona_uploads
 from deepgym.models import (
     BatchResult,
     Environment,
     EvalResult,
     MultiTurnEnvironment,
     RunResult,
-    VerifierResult,
 )
 from deepgym.sandbox import (
     AsyncLocalExecutor,
-    _shell_escape,
+    ExecutionResult,
     _validate_env_vars,
     build_run_result,
     is_command_timeout,
-    is_standalone_verifier,
     parse_verifier_output,
 )
-from deepgym.verifier_template import wrap_verifier
 
 if TYPE_CHECKING:
     from daytona import AsyncDaytona, Sandbox
 
 logger = logging.getLogger(__name__)
-
-_VERIFIER_PATH = '/home/user/verifier.py'
-_SOLUTION_PATH = '/home/user/solution.py'
-_TEST_CASES_PATH = '/home/user/test_cases.json'
 
 
 class AsyncDeepGym:
@@ -129,21 +123,15 @@ class AsyncDeepGym:
 
         try:
             sandbox = await self._create_sandbox(env)
-            sandbox_id = getattr(sandbox, 'id', 'unknown')
-
-            await self._setup_sandbox(sandbox, env, model_output)
-
-            timeout = env.timeout or self._default_timeout
-            verifier_result = await self._execute_verifier(
-                sandbox,
-                timeout,
-                has_test_cases=env.test_cases is not None,
-                env_vars=env.env_vars,
+            exec_result = await self._run_judge(
+                sandbox, JudgeJob.for_environment(env, model_output)
             )
-
-            elapsed_ms = (time.perf_counter() - start) * 1000.0
-
-            return build_run_result(verifier_result, elapsed_ms, str(sandbox_id))
+            return build_run_result(
+                exec_result.verifier_result,
+                (time.perf_counter() - start) * 1000.0,
+                str(getattr(sandbox, 'id', 'unknown')),
+                exit_code=exec_result.exit_code,
+            )
 
         except DeepGymError:
             raise
@@ -470,32 +458,11 @@ class AsyncDeepGym:
     async def _run_local(self, env: Environment, model_output: str) -> RunResult:
         """Execute using the async local subprocess executor."""
         assert self._local_executor is not None
-
-        if env.verifier_path is not None:
-            verifier_source = env.verifier_path.read_text(encoding='utf-8')
-        else:
-            verifier_source = env.verifier_code
-
-        # Standalone scripts run directly; simple function bodies get wrapped.
-        if is_standalone_verifier(verifier_source):
-            wrapped = verifier_source
-        else:
-            wrapped = wrap_verifier(verifier_source)
-
-        timeout = env.timeout or self._default_timeout
         start = time.perf_counter()
-        exec_result = await self._local_executor.run(
-            verifier_code=wrapped,
-            solution_code=model_output,
-            test_cases=env.test_cases,
-            timeout=timeout,
-            env_vars=env.env_vars,
-        )
-        elapsed_ms = (time.perf_counter() - start) * 1000.0
-
+        exec_result = await self._local_executor.run(JudgeJob.for_environment(env, model_output))
         return build_run_result(
             exec_result.verifier_result,
-            elapsed_ms,
+            (time.perf_counter() - start) * 1000.0,
             'local',
             stderr=exec_result.stderr,
             exit_code=exec_result.exit_code,
@@ -550,77 +517,38 @@ class AsyncDeepGym:
         except Exception as exc:
             raise SandboxError(f'Failed to create async sandbox: {exc}') from exc
 
-    async def _setup_sandbox(
-        self,
-        sandbox: Sandbox,
-        env: Environment,
-        model_output: str,
-    ) -> None:
-        """Upload verifier, solution, and test cases."""
-        try:
-            verifier_source = (
-                env.verifier_path.read_text(encoding='utf-8')
-                if env.verifier_path is not None
-                else env.verifier_code
-            )
-
-            # Wrap simple verifiers that don't already produce JSON protocol output.
-            if is_standalone_verifier(verifier_source):
-                ready_code = verifier_source
-            else:
-                ready_code = wrap_verifier(verifier_source)
-
-            await sandbox.fs.upload_file(ready_code.encode('utf-8'), _VERIFIER_PATH)
-            await sandbox.fs.upload_file(model_output.encode('utf-8'), _SOLUTION_PATH)
-
-            if env.test_cases is not None:
-                payload = json.dumps(env.test_cases, ensure_ascii=False)
-                await sandbox.fs.upload_file(payload.encode('utf-8'), _TEST_CASES_PATH)
-
-        except Exception as exc:
-            raise SandboxError(f'Failed to set up async sandbox: {exc}') from exc
-
-    async def _execute_verifier(
-        self,
-        sandbox: Sandbox,
-        timeout: int,
-        has_test_cases: bool = False,
-        env_vars: dict[str, str] | None = None,
-    ) -> VerifierResult:
-        """Run the verifier and parse its JSON output.
-
-        Args:
-            sandbox: A sandbox with verifier and solution already uploaded.
-            timeout: Maximum execution time in seconds.
-            has_test_cases: Whether test_cases.json was uploaded.
-            env_vars: Optional env vars to inject into the verifier command.
-
-        Returns:
-            Parsed VerifierResult.
+    async def _run_judge(self, sandbox: Sandbox, job: JudgeJob) -> ExecutionResult:
+        """Async twin of :func:`deepgym.sandbox.run_judge_daytona`.
 
         Raises:
-            VerifierError: If verifier output is not valid JSON.
-            TimeoutError: If execution exceeds timeout.
+            SandboxError: If setting up users or uploading files fails.
+            TimeoutError: If the verifier outruns its time budget.
+            VerifierError: If the verifier fails to run or prints no protocol JSON.
         """
-        _validate_env_vars(env_vars)
-
-        env_prefix = ''
-        if env_vars:
-            env_prefix = ' '.join(f'{k}={_shell_escape(v)}' for k, v in env_vars.items()) + ' '
-
-        cmd = f'{env_prefix}python {_VERIFIER_PATH} {_SOLUTION_PATH}'
-        if has_test_cases:
-            cmd += f' {_TEST_CASES_PATH}'
-
+        _validate_env_vars(job.env_vars)
         try:
-            response = await sandbox.process.exec(cmd, timeout=timeout)
+            setup = await sandbox.process.exec(f'bash -c {shlex.quote(DAYTONA_SETUP)}', timeout=60)
+            if setup.exit_code != 0:
+                raise SandboxError(f'Judge setup failed: {setup.result[-2000:]}')
+            for content, path in daytona_uploads(job):
+                await sandbox.fs.upload_file(content, path)
+        except SandboxError:
+            raise
+        except Exception as exc:
+            raise SandboxError(f'Failed to set up the judge: {exc}') from exc
+        command, env = daytona_judge(job, setup.result)
+        try:
+            response = await sandbox.process.exec(
+                command, env=env, timeout=job.timeout + DEADLINE_GRACE_S
+            )
         except Exception as exc:
             if is_command_timeout(exc):
-                raise TimeoutError(f'Verifier execution exceeded {timeout}s timeout') from exc
+                raise TimeoutError(f'Verifier exceeded {job.timeout}s') from exc
             raise VerifierError(f'Verifier execution failed: {exc}') from exc
-
-        # Exit codes 0 (passed) and 1 (failed) are normal verifier outcomes, so parse regardless.
-        return parse_verifier_output(response.result.strip(), f'exit_code={response.exit_code}')
+        return ExecutionResult(
+            parse_verifier_output(response.result.strip(), f'exit_code={response.exit_code}'),
+            exit_code=response.exit_code,
+        )
 
     async def _cleanup_sandbox(self, sandbox: Sandbox) -> None:
         """Safely destroy a sandbox, swallowing errors."""
