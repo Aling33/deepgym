@@ -1272,3 +1272,13 @@ class MixedEnvironment(Environment):
             child_requests = build_run_requests(routed_env, [output], per_item_kwargs[index])
             resolved.extend(child_requests)
         return resolved
+
+
+def route_single_run(env: Environment, kwargs: dict[str, Any]) -> Environment:
+    """Return the environment that should score one output.
+
+    A MixedEnvironment has only a placeholder verifier, so it must hand the
+    output to the child that the routing kwargs select; other envs score it
+    themselves.
+    """
+    return env._route_env(kwargs) if isinstance(env, MixedEnvironment) else env
