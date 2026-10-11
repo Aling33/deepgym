@@ -8,13 +8,14 @@ the judge in both cases.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import shlex
 import subprocess
 from typing import TYPE_CHECKING
 
-from deepgym.exceptions import SandboxError, TimeoutError, VerifierError
+from deepgym.exceptions import InvalidScoreError, SandboxError, TimeoutError, VerifierError
 from deepgym.judge import (
     DAYTONA_SETUP,
     DEADLINE_GRACE_S,
@@ -23,7 +24,7 @@ from deepgym.judge import (
     daytona_uploads,
     local_judge,
 )
-from deepgym.models import Environment, RunResult, VerifierResult
+from deepgym.models import Environment, RunResult, VerifierResult, checked_score
 
 if TYPE_CHECKING:
     from daytona import Daytona, Sandbox
@@ -216,13 +217,24 @@ def parse_verifier_output(stdout: str, context: str = '') -> VerifierResult:
         context: Extra diagnostics (exit code, stderr) for the error message.
 
     Raises:
+        InvalidScoreError: If the score is NaN, infinite, or outside [0, 1].
         VerifierError: If there is no JSON line or it does not match the protocol.
     """
     json_str = _extract_json_line(stdout)
     if json_str is None:
         raise VerifierError(f'Verifier did not produce valid JSON. stdout: {stdout!r} {context}')
     try:
-        return VerifierResult.model_validate_json(json_str)
+        data = json.loads(json_str)  # accepts NaN/Infinity, so they're caught below
+    except ValueError as exc:
+        raise VerifierError(f'Failed to parse verifier JSON: {exc}. Raw: {json_str!r}') from exc
+    if not isinstance(data, dict):
+        raise VerifierError(f'Verifier JSON is not an object. Raw: {json_str!r}')
+    if data.get('error_type') == 'invalid_score':
+        raise InvalidScoreError(data.get('details') or 'Verifier returned an invalid score')
+    if 'score' in data:
+        data['score'] = checked_score(data['score'])
+    try:
+        return VerifierResult.model_validate(data)
     except ValueError as exc:
         raise VerifierError(f'Failed to parse verifier JSON: {exc}. Raw: {json_str!r}') from exc
 

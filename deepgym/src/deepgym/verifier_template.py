@@ -30,6 +30,10 @@ _REPORT = textwrap.dedent('''\
     import traceback as _dg_traceback
 
 
+    class _DgInvalidScore(ValueError):
+        """The verifier returned NaN, inf, or a score outside [0, 1]."""
+
+
     def _dg_report(run):
         """Run the verifier, normalize its result to the protocol, print it, and exit."""
         solution_path = _dg_sys.argv[1] if len(_dg_sys.argv) > 1 else "solution.py"
@@ -65,6 +69,9 @@ _REPORT = textwrap.dedent('''\
                     "details": f"Unexpected return type: {type(result).__name__}",
                 }
             output["schema_version"] = "1.0"
+            # Clamp only float noise. NaN fails this check too; never turn it into reward.
+            if not -1e-6 <= output["score"] <= 1 + 1e-6:
+                raise _DgInvalidScore(f"invalid score {output['score']!r}; must be in [0, 1]")
             output["score"] = max(0.0, min(1.0, output["score"]))
             output["truncated"] = False
             print(_dg_json.dumps(output))
@@ -76,12 +83,16 @@ _REPORT = textwrap.dedent('''\
                         "schema_version": "1.0",
                         "score": 0.0,
                         "passed": False,
-                        "details": (
+                        "details": f"Verifier error: {e}"
+                        if isinstance(e, _DgInvalidScore)
+                        else (
                             f"Verifier error: {type(e).__name__}: {e}"
                             f"\\n{_dg_traceback.format_exc()}"
                         ),
                         "truncated": False,
-                        "error_type": "import_error"
+                        "error_type": "invalid_score"
+                        if isinstance(e, _DgInvalidScore)
+                        else "import_error"
                         if isinstance(e, ImportError)
                         else "timeout"
                         if isinstance(e, TimeoutError)

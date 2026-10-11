@@ -10,7 +10,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Literal
 
 from deepgym.benchmark_envs import build_run_requests
-from deepgym.exceptions import DeepGymError, SandboxError, TimeoutError, VerifierError
+from deepgym.exceptions import (
+    DeepGymError,
+    SandboxError,
+    TimeoutError,
+    VerifierError,
+    error_type_for,
+)
 from deepgym.judge import JudgeJob
 from deepgym.models import (
     Action,
@@ -218,7 +224,7 @@ class DeepGym:
                     results[idx] = future.result()
                 except (VerifierError, TimeoutError) as exc:
                     # Model's code caused verifier failure or timeout.
-                    error_type = 'timeout' if isinstance(exc, TimeoutError) else 'verifier_error'
+                    error_type = error_type_for(exc)
                     logger.warning('Run %d failed (%s): %s', idx, error_type, exc)
                     results[idx] = RunResult(
                         score=0.0,

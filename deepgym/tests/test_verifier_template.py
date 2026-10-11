@@ -151,13 +151,14 @@ class TestTruncatedField:
         assert output['truncated'] is False
 
 
-class TestScoreClamping:
-    """Verify score is clamped to [0, 1]."""
+class TestScoreValidation:
+    """Out-of-range or non-finite scores are verifier errors, never clamped into reward."""
 
-    def test_score_clamped_above_one(self) -> None:
-        output, _ = _run_wrapped('return 5.0\n', '# e\n')
+    @pytest.mark.parametrize('body', ['return 5.0\n', 'return -2.0\n', 'return float("nan")\n'])
+    def test_invalid_score_is_an_error(self, body: str) -> None:
+        output, code = _run_wrapped(body, '# e\n')
+        assert (output['score'], output['error_type'], code) == (0.0, 'invalid_score', 2)
+
+    def test_float_noise_is_clamped(self) -> None:
+        output, _ = _run_wrapped('return 1.0000000001\n', '# e\n')
         assert output['score'] == 1.0
-
-    def test_score_clamped_below_zero(self) -> None:
-        output, _ = _run_wrapped('return -2.0\n', '# e\n')
-        assert output['score'] == 0.0

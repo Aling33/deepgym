@@ -40,6 +40,7 @@ from deepgym.models import (
     Observation,
     RunResult,
     Trajectory,
+    checked_score,
 )
 from deepgym.sandbox import (
     _extract_json_line,
@@ -476,11 +477,12 @@ class Session:
         )
 
     def _step_reward(self, output: str) -> float:
-        """Run the step verifier and return its score, clamped to [0, 1].
+        """Run the step verifier and return its score in [0, 1].
 
         Stderr is discarded so warnings can't break the plain-float form.
 
         Raises:
+            InvalidScoreError: If the score is NaN, infinite, or outside [0, 1].
             VerifierError: If the step verifier times out or prints neither a float
                 nor JSON with a score.
         """
@@ -496,11 +498,11 @@ class Session:
         json_str = _extract_json_line(stdout)
         try:
             value = json.loads(json_str)['score'] if json_str else float(stdout)
-            return max(0.0, min(1.0, float(value)))
         except (ValueError, TypeError, KeyError) as exc:
             raise VerifierError(
                 f'Step verifier output unparseable at step {self._step}: {stdout!r}'
             ) from exc
+        return checked_score(value)
 
 
 def run_episode(
