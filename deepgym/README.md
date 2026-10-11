@@ -391,7 +391,9 @@ result = dg.run(env, model_output='def add(a, b):\n    return a + b\n')
 Never import or run the solution yourself. `load_solution(path)` starts it in a
 separate, isolated process and returns a proxy: `sol.add(2, 3)` runs there and
 returns plain data. `run_solution(path, cwd=..., env=...)` runs it as a script,
-writing only inside `cwd`. `solution_source(path, name=None)` reads the source
+writing only inside `cwd`; read its files back with `read_output(path, cwd)`,
+which refuses symlinks. Pass `allow_subprocess=True` if the script needs to
+start other programs (macOS blocks forking otherwise). `solution_source(path, name=None)` reads the source
 for static checks without running it.
 
 How the solution is isolated:

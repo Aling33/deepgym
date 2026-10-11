@@ -556,3 +556,38 @@ class TestSecurityFollowups:
             assert dg.run(env, solution).passed
         finally:
             secret.unlink()
+
+
+macos_only = pytest.mark.skipif(
+    local_isolation_kind() != 'macos', reason='fork limits apply to the macOS sandbox'
+)
+
+
+class TestForkLimits:
+    """On macOS, a detached child could outlive the solution, so forking is opt-in."""
+
+    @macos_only
+    def test_functions_cannot_fork(self, dg: DeepGym) -> None:
+        env = _env(
+            """
+try:
+    sol.spawn()
+    return 0.0
+except Exception:
+    return 1.0
+"""
+        )
+        solution = 'import subprocess\ndef spawn():\n    subprocess.run(["true"], check=True)\n'
+        assert dg.run(env, solution).passed
+
+    @macos_only
+    def test_scripts_fork_only_when_allowed(self, dg: DeepGym) -> None:
+        verifier = (
+            'from deepgym_solution import run_solution\n\n'
+            'def verify(solution_path):\n'
+            '    blocked = run_solution(solution_path).returncode != 0\n'
+            '    allowed = run_solution(solution_path, allow_subprocess=True).returncode == 0\n'
+            '    return blocked and allowed\n'
+        )
+        solution = 'import subprocess\nsubprocess.run(["true"], check=True)\n'
+        assert dg.run(Environment(task='t', verifier_code=verifier), solution).passed

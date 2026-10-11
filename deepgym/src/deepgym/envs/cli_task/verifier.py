@@ -67,7 +67,7 @@ def verify(solution_path, test_cases_path=None):
     repo_dir = os.path.join(work_dir, 'my_repo')
 
     try:
-        proc = run_solution(solution_path, cwd=work_dir, timeout=15)
+        proc = run_solution(solution_path, cwd=work_dir, timeout=15, allow_subprocess=True)
     except subprocess.TimeoutExpired:
         return {
             'schema_version': '1.0',

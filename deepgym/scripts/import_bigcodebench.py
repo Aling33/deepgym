@@ -113,6 +113,7 @@ def verify(solution_path):
                 [str(Path(work, "tests.json")), solution_path],
                 cwd=work,
                 timeout=120,
+                allow_subprocess=True,
             )
         except subprocess.TimeoutExpired:
             return {{"score": 0.0, "passed": False, "details": "Tests timed out"}}
