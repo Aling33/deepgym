@@ -147,9 +147,13 @@ def _python() -> str:
     return os.environ.get('DEEPGYM_PYTHON', sys.executable)
 
 
-def _macos_profile(hide: Sequence[str], expose: Sequence[str], writable: Sequence[str]) -> str:
+def _macos_profile(spec: dict, writable: Sequence[str]) -> str:
     def paths(items: Sequence[str]) -> str:
-        return ' '.join(f'(subpath {json.dumps(os.path.realpath(p))})' for p in items)
+        return ' '.join(f'(subpath {json.dumps(os.path.realpath(p))})' for p in items) or (
+            '(literal "/nonexistent")'
+        )
+
+    hide, expose, rehide = spec['hide'], spec.get('expose', []), spec.get('rehide', [])
 
     # Later rules win: hide whole trees, then re-expose this run's own directories.
     # Hiding denies reading contents and listings, not stat, so tools that resolve
@@ -159,6 +163,7 @@ def _macos_profile(hide: Sequence[str], expose: Sequence[str], writable: Sequenc
         '(version 1)(allow default)(deny network*)(deny mach-lookup)(deny appleevent-send)'
         f'(deny file-read-data {paths(hide)})'
         f'(allow file-read-data {paths([*expose, *writable])})'
+        f'(deny file-read-data {paths(rehide)})'
         f'(deny file-write*)(allow file-write* {paths(writable)} (literal "/dev/null"))'
     )
 
@@ -177,7 +182,7 @@ def _launch_argv(
             os.chmod(path, 0o777)
         return [*spec['prefix'], *clean, *command]
     if kind == 'macos':
-        profile = _macos_profile(spec['hide'], spec.get('expose', []), writable)
+        profile = _macos_profile(spec, writable)
         return ['sandbox-exec', '-p', profile, *clean, *command]
     if kind == 'bwrap':
         argv = ['bwrap', '--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc']
@@ -185,6 +190,8 @@ def _launch_argv(
             argv += ['--tmpfs', path]
         for path in spec.get('expose', []):
             argv += ['--ro-bind', path, path]
+        for path in spec.get('rehide', []):
+            argv += ['--tmpfs', path]
         for path in writable:
             argv += ['--bind', path, path]
         argv += ['--unshare-all', '--die-with-parent', '--new-session', '--chdir', workdir]
@@ -201,9 +208,12 @@ def _kill(proc: subprocess.Popen) -> None:
     """Kill an isolated process and everything in its process group."""
     spec = _isolation()
     if spec['kind'] == 'user':
-        # The solution runs as another user, so signal its group as that user.
-        group_kill = [*spec['prefix'], 'bash', '-c', f'kill -9 -- -{proc.pid}']
-        subprocess.run(group_kill, capture_output=True, check=False)
+        # Kill every process of the solution user, not just this group: children
+        # that call setsid() would otherwise outlive the call and could tamper with
+        # files the judge reads next. A concurrent load_solution server restarts on
+        # its next call.
+        kill_all = [*spec['prefix'], 'bash', '-c', 'kill -9 -1']
+        subprocess.run(kill_all, capture_output=True, check=False)
     with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(proc.pid, signal.SIGKILL)
     with contextlib.suppress(Exception):
@@ -246,41 +256,66 @@ def run_solution(
     workdir = os.path.abspath(cwd or _scratch_dir())
     command = [_python(), '-B', path, *args]
     limit = _call_timeout() if timeout is None else min(timeout, _remaining())
-    proc = subprocess.Popen(
-        _launch_argv(command, workdir, env),
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        cwd=workdir,
-        start_new_session=True,
-    )
+    # Output goes to files, not pipes: a forked child holding a pipe open would
+    # keep us waiting (and alive to tamper) after the script itself exits.
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(
+            _launch_argv(command, workdir, env),
+            stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+            stdout=out,
+            stderr=err,
+            cwd=workdir,
+            start_new_session=True,
+        )
+        try:
+            proc.communicate(None if input is None else input.encode(), timeout=limit)
+        finally:
+            _kill(proc)
+        out.seek(0)
+        err.seek(0)
+        stdout = out.read(_MAX_MESSAGE).decode('utf-8', 'replace')
+        stderr = err.read(_MAX_MESSAGE).decode('utf-8', 'replace')
+    return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+
+
+def _open_inside(path: str, root: str) -> int:
+    """Open *path* for reading, walking from *root* one component at a time.
+
+    No component may be a symlink, so a solution can't redirect the judge to its
+    own files, even by swapping a directory between a check and the open.
+    """
+    rel = os.path.relpath(os.path.abspath(path), os.path.abspath(root))
+    parts = rel.split(os.sep)
+    if rel in ('.', '') or parts[0] == '..' or os.path.isabs(rel):
+        raise PermissionError(f'{path} is not inside {root}')
+    fd = os.open(os.path.realpath(root), os.O_RDONLY | os.O_DIRECTORY)
     try:
-        stdout, stderr = proc.communicate(input, timeout=limit)
-    except subprocess.TimeoutExpired:
-        _kill(proc)
-        raise
-    returncode = proc.returncode
-    _kill(proc)
-    return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+        for part in parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+    finally:
+        os.close(fd)
 
 
 def read_output(path: str, root: str) -> str:
-    """Read a file the solution produced, refusing symlinks and paths outside *root*.
+    """Read a text file the solution produced, refusing symlinks and paths outside *root*.
 
     A solution could otherwise point its "output" at a judge file and have the
     judge read, say, expected answers back as if it had produced them.
 
     Raises:
-        OSError: If the file is missing, a symlink, or outside *root*.
+        OSError: If the file is missing, reached through a symlink, or outside *root*.
     """
-    real_root = os.path.realpath(root)
-    parent = os.path.realpath(os.path.dirname(os.path.abspath(path)))
-    if os.path.commonpath([real_root, parent]) != real_root:
-        raise PermissionError(f'{path} is outside {root}')
-    fd = os.open(os.path.join(parent, os.path.basename(path)), os.O_RDONLY | os.O_NOFOLLOW)
-    with os.fdopen(fd, encoding='utf-8') as handle:
+    with os.fdopen(_open_inside(path, root), encoding='utf-8') as handle:
         return handle.read()
+
+
+def read_output_bytes(path: str, root: str, limit: int = _MAX_MESSAGE) -> bytes:
+    """Binary twin of :func:`read_output`, reading at most *limit* bytes."""
+    with os.fdopen(_open_inside(path, root), 'rb') as handle:
+        return handle.read(limit)
 
 
 def solution_source(solution_path: str, name: str | None = None) -> str:

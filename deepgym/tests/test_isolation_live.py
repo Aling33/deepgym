@@ -100,3 +100,25 @@ def test_script_env_and_support_files(dg: DeepGym) -> None:
         support_files={'scoring.py': 'def half():\n    return 0.5\n'},
     )
     assert dg.run(helper, '').score == 0.5
+
+
+def test_setsid_daemon_dies_with_its_script(dg: DeepGym) -> None:
+    verifier = (
+        'import tempfile, time\n'
+        'from pathlib import Path\n'
+        'from deepgym_solution import run_solution\n\n'
+        'def verify(solution_path):\n'
+        '    work = tempfile.mkdtemp()\n'
+        '    run_solution(solution_path, cwd=work, env={"OUT": work})\n'
+        '    time.sleep(3)\n'
+        '    return 0.0 if Path(work, "late.txt").exists() else 1.0\n'
+    )
+    solution = (
+        'import os, time\n'
+        'if os.fork() == 0:\n'
+        '    os.setsid()\n'
+        '    time.sleep(1.5)\n'
+        '    open(os.path.join(os.environ["OUT"], "late.txt"), "w").write("tampered")\n'
+        '    os._exit(0)\n'
+    )
+    assert dg.run(Environment(task='t', verifier_code=verifier), solution).passed

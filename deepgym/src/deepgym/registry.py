@@ -235,6 +235,19 @@ def _entry_tokens(entry: dict) -> set[str]:
     return tokens
 
 
+def _entry_label(entry: dict) -> str:
+    """Registry path without the 'environments/' prefix, e.g. 'humaneval_plus/HumanEval_0'."""
+    return str(entry.get('path', '')).removeprefix('environments/')
+
+
+def _entry_keys(entry: dict) -> set[str]:
+    """Fully qualified names that pick exactly this entry (slash/underscore-insensitive)."""
+    names = {str(entry.get('path', '')), _entry_label(entry)}
+    if entry.get('benchmark') and entry.get('id'):
+        names.add(f'{entry["benchmark"]}/{entry["id"]}')
+    return {name.replace('/', '_').lower() for name in names if name}
+
+
 def _benchmark_entries(registry: list[dict], benchmark_name: str) -> list[dict]:
     """Return registry entries belonging to a benchmark alias."""
     result = [
@@ -445,7 +458,8 @@ def load_environment(name: str, variant: int = 0) -> Environment | ComputerUseEn
         registry = []
 
     benchmark_name = normalized_name.lower()
-    if benchmark_name in _BENCHMARK_NAMES:
+    known_benchmarks = _BENCHMARK_NAMES | {str(e.get('benchmark', '')).lower() for e in registry}
+    if benchmark_name in known_benchmarks:
         benchmark_entries = _benchmark_entries(registry, benchmark_name)
         if benchmark_entries:
             entry = benchmark_entries[0]
@@ -453,12 +467,24 @@ def load_environment(name: str, variant: int = 0) -> Environment | ComputerUseEn
             if env_dir is not None:
                 return _load_env_from_dir(env_dir, metadata=entry, variant=variant)
 
+    # Benchmarks share task ids (humaneval vs humaneval_plus both have HumanEval_0),
+    # so a fully qualified name beats loose token matches, and a name that still
+    # fits several environments is an error rather than a silent first pick.
     lookup_tokens = _name_tokens(normalized_name)
-    for entry in registry:
-        if lookup_tokens & _entry_tokens(entry):
-            env_dir = _find_env_dir(entry['path'])
-            if env_dir is not None:
-                return _load_env_from_dir(env_dir, metadata=entry, variant=variant)
+    matches = [entry for entry in registry if lookup_tokens & _entry_tokens(entry)]
+    qualified = normalized_name.replace('/', '_').lower()
+    exact = [entry for entry in matches if qualified in _entry_keys(entry)]
+    candidates: dict[Path, tuple[Path, dict]] = {}
+    for entry in exact or matches:
+        env_dir = _find_env_dir(entry['path'])
+        if env_dir is not None:
+            candidates.setdefault(env_dir.resolve(), (env_dir, entry))
+    if len(candidates) > 1:
+        options = sorted(_entry_label(entry) for _, entry in candidates.values())
+        raise ValueError(f'Environment name {name!r} is ambiguous; use one of: {options}')
+    if candidates:
+        env_dir, entry = next(iter(candidates.values()))
+        return _load_env_from_dir(env_dir, metadata=entry, variant=variant)
 
     # 2. Direct directory lookup across all sources.
     env_dir = _find_env_dir(normalized_name)
