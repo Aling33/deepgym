@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import httpx
 
+from deepgym.benchmark_envs import ResolvedRun, build_run_requests, route_single_run
 from deepgym.exceptions import DeepGymError, SandboxError, TimeoutError, VerifierError
 from deepgym.judge import DAYTONA_SETUP, DEADLINE_GRACE_S, JudgeJob, daytona_judge, daytona_uploads
 from deepgym.models import (
@@ -32,6 +33,8 @@ from deepgym.sandbox import (
 
 if TYPE_CHECKING:
     from daytona import AsyncDaytona, Sandbox
+
+    from deepgym.core import DeepGym
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +63,7 @@ class AsyncDeepGym:
         self._default_timeout = default_timeout
         self._daytona: AsyncDaytona | None = None
         self._local_executor: AsyncLocalExecutor | None = None
+        self._sync: DeepGym | None = None
 
         # Read env vars for configuration.
         daytona_api_key = api_key or os.getenv('DAYTONA_API_KEY')
@@ -89,7 +93,7 @@ class AsyncDeepGym:
     # Public API
     # ------------------------------------------------------------------
 
-    async def run(self, env: Environment, model_output: str) -> RunResult:
+    async def run(self, env: Environment, model_output: str, **kwargs: Any) -> RunResult:
         """Execute a model's output against an environment asynchronously.
 
         Lifecycle mirrors :meth:`DeepGym.run` but uses async Daytona calls.
@@ -97,6 +101,8 @@ class AsyncDeepGym:
         Args:
             env: The environment specification.
             model_output: The model-generated solution source code.
+            **kwargs: Per-sample routing/task metadata for benchmark-backed and
+                mixed environments (same as :meth:`DeepGym.run`).
 
         Returns:
             A RunResult with score, timing, and execution details.
@@ -105,10 +111,22 @@ class AsyncDeepGym:
             SandboxError: If sandbox operations fail.
             VerifierError: If verifier output is invalid.
             TimeoutError: If execution exceeds the timeout.
-            DeepGymError: If *env* is multi-turn (it needs an agent, not one output).
+            DeepGymError: If *env* is multi-turn (it needs an agent, not one output),
+                or benchmark-backed while using the HTTP API.
         """
         if isinstance(env, MultiTurnEnvironment):
             raise DeepGymError('Multi-turn environments need an agent: use dg.run_episode()')
+        env = route_single_run(env, kwargs)
+        if hasattr(env, 'run_with_deepgym'):
+            if self._api_url is not None:
+                raise DeepGymError(
+                    'Benchmark-backed environments run their own scoring and cannot go '
+                    'through the HTTP API; use a local or Daytona client.'
+                )
+            # Their runners are sync-only, so run them on a sync client in a thread.
+            return await asyncio.to_thread(
+                env.run_with_deepgym, self._sync_client(), model_output, **kwargs
+            )
         if self._api_url is not None:
             return await self._run_http(env, model_output)
 
@@ -148,6 +166,7 @@ class AsyncDeepGym:
         env: Environment,
         outputs: Sequence[str],
         max_parallel: int = 10,
+        **kwargs: Any,
     ) -> BatchResult:
         """Run multiple solutions concurrently with a semaphore-based limit.
 
@@ -155,6 +174,8 @@ class AsyncDeepGym:
             env: The environment specification.
             outputs: List of model-generated solutions.
             max_parallel: Maximum number of concurrent sandbox executions.
+            **kwargs: Per-sample metadata (scalars or one value per output), routed
+                like :meth:`DeepGym.run_batch`.
 
         Returns:
             Aggregated BatchResult.
@@ -167,11 +188,12 @@ class AsyncDeepGym:
         start = time.perf_counter()
         semaphore = asyncio.Semaphore(max_parallel)
 
-        async def _guarded_run(output: str) -> RunResult:
+        async def _guarded_run(request: ResolvedRun) -> RunResult:
             async with semaphore:
-                return await self.run(env, output)
+                return await self.run(request.env, request.output, **request.kwargs)
 
-        tasks = [asyncio.ensure_future(_guarded_run(out)) for out in outputs]
+        requests = build_run_requests(env, outputs, dict(kwargs))
+        tasks = [asyncio.ensure_future(_guarded_run(request)) for request in requests]
         settled = await asyncio.gather(*tasks, return_exceptions=True)
 
         results: list[RunResult] = []
@@ -467,6 +489,15 @@ class AsyncDeepGym:
             stderr=exec_result.stderr,
             exit_code=exec_result.exit_code,
         )
+
+    def _sync_client(self) -> DeepGym:
+        """A sync client on the same backend, for runners that are sync-only."""
+        if self._sync is None:
+            from deepgym.core import DeepGym
+
+            mode = 'local' if self._local_executor is not None else 'daytona'
+            self._sync = DeepGym(api_key=self._api_key, mode=mode)
+        return self._sync
 
     @staticmethod
     def _init_daytona(api_key: str | None, api_url: str | None = None) -> AsyncDaytona:
