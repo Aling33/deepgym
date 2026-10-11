@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Security: the solution no longer runs inside the judge.**
+  - Before, single-turn verifiers imported the model's code into their own process, and in both local and Daytona mode it shared a folder with the verifier and test cases. It could print a fake score line, patch the verifier, read the expected answers, import the reference solution from the installed package, or return an object that equals everything.
+  - Now verifiers call `load_solution()` / `run_solution()` from `deepgym_solution`, which run the solution in a separate isolated process:
+    - Daytona: a dedicated Linux user.
+    - Local: `sandbox-exec` (macOS) or `bwrap` (Linux), with the judge, the deepgym package and `~/.deepgym` hidden.
+  - Only plain data crosses the boundary. All built-in verifiers and the HumanEval, MBPP and EvalPlus importers are migrated; re-run the import scripts for cached benchmarks.
+  - BigCodeBench tests run with the solution inside the sandbox, because they need rich objects. That result is still forgeable by a determined model.
+- Per-call `case_timeout` (default 10s), capped by the run's `timeout`: a slow case fails alone and the run returns partial credit instead of timing out.
+- Verifier shape is detected by parsing the source (`script`, `verify_function`, `body`) or set with `verifier_mode`, replacing a text search that misclassified verifiers. `from __future__` imports are hoisted when wrapping.
+- `support_files` on `Environment` (and `metadata.json`) for multi-file verifiers and shared helpers across environments.
+- `cli_task` now works in its own directory (`my_repo` in the working dir) instead of a shared `/tmp/my_repo`.
+- Breaking: `LocalExecutor.run()` / `AsyncLocalExecutor.run()` take a `JudgeJob`. `is_standalone_verifier`, `setup_sandbox` and `execute_verifier` are replaced by `prepare_verifier` and `run_judge_daytona`.
+
 - Added live multi-turn sessions (`dg.session()`, `dg.run_episode()`, `Session`): one sandbox per episode, actions applied step by step, final verifier run against the resulting state. Local and Daytona backends.
 - Added real computer-use support on Daytona's desktop: typed GUI actions (click, type, key, scroll, drag, ...), full-resolution screenshots in observations, GUI-only action sets by default
 - Added 5 computer-use environments (`signup_form`, `todo_list`, `settings_tabs`, `expense_sheet`, `file_manager`) with progress/guard verifiers and scripted reference runs checked live on Daytona

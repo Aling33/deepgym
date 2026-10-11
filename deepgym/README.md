@@ -379,20 +379,52 @@ dg = DeepGym(mode='local')
 env = Environment(
     task='Write a function `add(a, b)` that returns the sum of two numbers.',
     verifier_code=(
-        'import importlib.util, sys\n'
-        'spec = importlib.util.spec_from_file_location("sol", solution_path)\n'
-        'mod = importlib.util.module_from_spec(spec)\n'
-        'spec.loader.exec_module(mod)\n'
-        'return 1.0 if hasattr(mod, "add") and mod.add(2, 3) == 5 else 0.0\n'
+        'from deepgym_solution import load_solution\n'
+        'sol = load_solution(solution_path)\n'
+        'return 1.0 if hasattr(sol, "add") and sol.add(2, 3) == 5 else 0.0\n'
     ),
 )
 
 result = dg.run(env, model_output='def add(a, b):\n    return a + b\n')
 ```
 
-The `verifier_code` string becomes the body of a function that gets
-`(solution_path, test_cases_path=None)`. Return a float, bool, or dict.
-The wrapper handles the rest.
+Never import or run the solution yourself. `load_solution(path)` starts it in a
+separate, isolated process and returns a proxy: `sol.add(2, 3)` runs there and
+returns plain data. `run_solution(path, cwd=..., env=...)` runs it as a script,
+writing only inside `cwd`. `solution_source(path, name=None)` reads the source
+for static checks without running it.
+
+How the solution is isolated:
+
+- **Daytona:** it runs as a separate Linux user that can't read the judge's
+  files, touch the judge's process, or write to its output.
+- **Locally:** it runs under `sandbox-exec` on macOS or `bwrap` on Linux, with
+  the judge directory and the deepgym package hidden. If neither is available,
+  you still get process separation and a warning.
+
+What this blocks:
+
+- Only plain data crosses the boundary, so an object that claims to equal
+  everything can't fake a pass.
+- A fake score line printed by the solution never reaches the judge's output.
+- Patching the verifier at runtime has no effect.
+
+Each call is bounded by `case_timeout` (default 10s) and by the run's `timeout`,
+so a slow case fails on its own and the run still returns partial credit.
+
+Verifier shape is detected by parsing, or set explicitly with `verifier_mode`:
+
+- `script`: has a `__main__` block that prints protocol JSON.
+- `verify_function`: defines `verify(solution_path, test_cases_path=None)`.
+- `body` (the example above): the body of that function.
+
+Return a float, bool, or dict; the wrapper normalizes it. `from __future__`
+imports are fine in any mode.
+
+Shared helper code goes in `support_files` (name to content). These files sit
+next to the verifier, are importable by it, and are hidden from the solution. In
+a registry env, list paths in `metadata.json`, for example
+`"support_files": ["../_shared/scoring.py"]`.
 
 ## Environments
 
