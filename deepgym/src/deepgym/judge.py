@@ -160,16 +160,24 @@ def _local_runs_root() -> str:
 
 
 def local_isolation(expose: list[str]) -> dict:
-    """Isolation spec hiding all runs, the deepgym package, and cached benchmarks,
-    except this run's own *expose* directories."""
+    """Isolation spec for a local run.
+
+    Hides the home directory (repo clones, other worktrees, ~/.deepgym), all
+    runs, and the deepgym package. Re-exposes the Python installation and this
+    run's own *expose* directories; the package is hidden again even if it sits
+    inside the Python installation.
+    """
     kind = local_isolation_kind()
     if kind == 'none':
         return {'kind': 'none'}
-    hide = [_local_runs_root(), str(Path(__file__).resolve().parent), str(Path.home() / '.deepgym')]
+    package = os.path.realpath(Path(__file__).resolve().parent)
+    hide = [str(Path.home()), _local_runs_root()]
+    pythons = {os.path.realpath(p) for p in (sys.prefix, sys.base_prefix, sys.exec_prefix)}
     return {
         'kind': kind,
         'hide': [os.path.realpath(p) for p in hide if os.path.exists(p)],
-        'expose': expose,
+        'expose': [*sorted(pythons), *expose],
+        'rehide': [package],
     }
 
 
