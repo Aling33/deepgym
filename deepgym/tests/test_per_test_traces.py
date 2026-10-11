@@ -8,15 +8,14 @@ RewardFunction.per_test_rewards works for fine-grained reward shaping.
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
 
 from deepgym.core import DeepGym
 from deepgym.gym import DeepGymEnv, GymInfo
 from deepgym.integrations.reward import RewardFunction
 from deepgym.models import (
+    CaseResult,
     Environment,
     RunResult,
-    CaseResult,
     VerifierResult,
 )
 
@@ -61,15 +60,11 @@ class TestCaseResultModel:
         assert tc.score == 0.0
         assert tc.input_summary == 'coins=[1,5], amount=11'
 
-    def test_score_bounds_low(self) -> None:
-        """Score below 0.0 is rejected."""
-        with pytest.raises(ValidationError):
-            CaseResult(passed=False, score=-0.1)
-
-    def test_score_bounds_high(self) -> None:
-        """Score above 1.0 is rejected."""
-        with pytest.raises(ValidationError):
-            CaseResult(passed=True, score=1.1)
+    @pytest.mark.parametrize('score', [-0.1, 1.1, float('nan')])
+    def test_invalid_score_fails_the_case(self, score: float) -> None:
+        """An invalid case score marks the case failed with score 0 instead of crashing."""
+        case = CaseResult(passed=True, score=score)
+        assert (case.score, case.passed) == (0.0, False)
 
     def test_with_error(self) -> None:
         """Create with error message."""

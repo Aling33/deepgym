@@ -2,13 +2,52 @@
 
 from __future__ import annotations
 
+import logging
+import math
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, get_args
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from deepgym.exceptions import InvalidScoreError
+
+logger = logging.getLogger(__name__)
+
+# Float noise this far outside [0, 1] is clamped; anything further is a verifier bug.
+SCORE_TOLERANCE = 1e-6
+
+
+def checked_score(value: object) -> float:
+    """Return *value* as a reward in [0, 1], clamping only float noise.
+
+    NaN, infinities, and scores clearly outside [0, 1] are verifier bugs; letting
+    them through (or clamping them) would hand the policy free reward.
+
+    Raises:
+        InvalidScoreError: If *value* isn't a finite number within [0, 1].
+    """
+    try:
+        score = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise InvalidScoreError(f'Verifier returned a non-numeric score: {value!r}') from exc
+    if not -SCORE_TOLERANCE <= score <= 1 + SCORE_TOLERANCE:  # also False for NaN
+        logger.warning('Verifier returned invalid score %r; scoring 0', score)
+        raise InvalidScoreError(f'Verifier returned invalid score {score!r}; must be in [0, 1]')
+    return min(1.0, max(0.0, score))
+
+
+def finite_components(components: dict[str, float] | None) -> dict[str, float] | None:
+    """Replace non-finite reward components with 0.0 so they never reach a trainer."""
+    if components is None:
+        return None
+    bad = [key for key, value in components.items() if not math.isfinite(value)]
+    if bad:
+        logger.warning('Non-finite reward components %s set to 0.0', bad)
+    return {key: (0.0 if key in bad else value) for key, value in components.items()}
+
 
 VerifierMode = Literal['auto', 'script', 'verify_function', 'body']
 
@@ -124,6 +163,17 @@ class CaseResult(BaseModel):
     execution_time_ms: float = 0.0
     """Execution time for this specific test case in milliseconds."""
 
+    @model_validator(mode='before')
+    @classmethod
+    def zero_invalid_score(cls, data: object) -> object:
+        """Fail a case whose score is NaN, infinite, or out of range instead of crashing."""
+        if isinstance(data, dict) and 'score' in data:
+            try:
+                return {**data, 'score': checked_score(data['score'])}
+            except InvalidScoreError:
+                return {**data, 'score': 0.0, 'passed': False, 'error': 'invalid score'}
+        return data
+
 
 class VerifierResult(BaseModel):
     """Represent structured output from a verifier script.
@@ -145,6 +195,12 @@ class VerifierResult(BaseModel):
 
     reward_components: dict[str, float] | None = None
     """Breakdown of shaped rewards (e.g. correctness, style, efficiency)."""
+
+    @field_validator('reward_components')
+    @classmethod
+    def zero_non_finite_components(cls, value: dict[str, float] | None) -> dict[str, float] | None:
+        """Replace NaN/inf components with 0.0 before they reach a trainer."""
+        return finite_components(value)
 
     metrics: dict[str, Any] | None = None
     """Execution metrics (e.g. execution_time, memory_used)."""
@@ -188,6 +244,12 @@ class RunResult(BaseModel):
 
     reward_components: dict[str, float] | None = None
     """Shaped reward breakdown passed through from the verifier."""
+
+    @field_validator('reward_components')
+    @classmethod
+    def zero_non_finite_components(cls, value: dict[str, float] | None) -> dict[str, float] | None:
+        """Replace NaN/inf components with 0.0 before they reach a trainer."""
+        return finite_components(value)
 
     metrics: dict[str, Any] | None = None
     """Execution metrics passed through from the verifier."""

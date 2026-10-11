@@ -69,10 +69,10 @@ def make_verl_compute_score(
             extra_info: Optional context (unused).
 
         Returns:
-            Score between 0.0 and 1.0.
+            Score between 0.0 and 1.0; 0.0 if the verifier failed or gave an invalid score.
         """
-        result = _dg.run(env, model_output=solution_str)
-        return result.score
+        # run_batch turns verifier errors into a zero score instead of crashing training.
+        return _dg.run_batch(env, [solution_str], max_parallel=1).results[0].score
 
     return compute_score
 

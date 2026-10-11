@@ -13,7 +13,13 @@ from typing import TYPE_CHECKING, Any, Literal
 import httpx
 
 from deepgym.benchmark_envs import ResolvedRun, build_run_requests, route_single_run
-from deepgym.exceptions import DeepGymError, SandboxError, TimeoutError, VerifierError
+from deepgym.exceptions import (
+    DeepGymError,
+    SandboxError,
+    TimeoutError,
+    VerifierError,
+    error_type_for,
+)
 from deepgym.judge import DAYTONA_SETUP, DEADLINE_GRACE_S, JudgeJob, daytona_judge, daytona_uploads
 from deepgym.models import (
     BatchResult,
@@ -200,7 +206,7 @@ class AsyncDeepGym:
         for i, item in enumerate(settled):
             if isinstance(item, VerifierError | TimeoutError):
                 # Model's code caused verifier failure or timeout.
-                error_type = 'timeout' if isinstance(item, TimeoutError) else 'verifier_error'
+                error_type = error_type_for(item)
                 logger.warning('Async run %d failed (%s): %s', i, error_type, item)
                 results.append(
                     RunResult(
@@ -396,7 +402,7 @@ class AsyncDeepGym:
         for i, item in enumerate(settled):
             if isinstance(item, VerifierError | TimeoutError):
                 # Model's code caused verifier failure or timeout.
-                error_type = 'timeout' if isinstance(item, TimeoutError) else 'verifier_error'
+                error_type = error_type_for(item)
                 logger.warning('Eval task %d failed (%s): %s', i, error_type, item)
                 results.append(
                     RunResult(
