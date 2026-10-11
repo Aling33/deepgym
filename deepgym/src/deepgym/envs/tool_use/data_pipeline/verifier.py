@@ -1,13 +1,14 @@
 """Verifier for the Data Pipeline task."""
 
 import csv
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 
-from deepgym_solution import run_solution
+from deepgym_solution import read_output, run_solution
 
 INPUT_CSV = """name,age,city
 Alice,25,New York
@@ -50,12 +51,14 @@ def verify(solution_path, test_cases_path=None):
     checks['no_error'] = proc.returncode == 0
 
     # Check output.csv exists.
-    checks['output_exists'] = os.path.isfile(output_path)
+    try:
+        output_text = read_output(output_path, work_dir)
+        checks['output_exists'] = True
+    except OSError:
+        checks['output_exists'] = False
 
     if checks['output_exists']:
-        with open(output_path) as f:
-            reader = csv.DictReader(f)
-            rows = list(reader)
+        rows = list(csv.DictReader(io.StringIO(output_text)))
 
         # Expected: Bob(35), Charlie(40), Eve(45), Grace(33), Henry(50), Jack(38)
         expected_names = {'Bob', 'Charlie', 'Eve', 'Grace', 'Henry', 'Jack'}

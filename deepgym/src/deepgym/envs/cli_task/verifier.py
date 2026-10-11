@@ -6,7 +6,31 @@ import subprocess
 import sys
 import tempfile
 
-from deepgym_solution import run_solution
+from deepgym_solution import read_output, run_solution
+
+
+def _git(repo_dir, *args):
+    """Run git on the solution's repo without letting its .git/config run commands."""
+    overrides = [
+        '-c', 'core.fsmonitor=false',
+        '-c', 'core.hooksPath=/dev/null',
+        '-c', 'log.showSignature=false',
+        '-c', 'safe.directory=*',
+    ]  # fmt: skip
+    return subprocess.run(
+        ['git', '--no-pager', *overrides, *args],
+        capture_output=True,
+        text=True,
+        cwd=repo_dir,
+        env={
+            'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
+            'GIT_CONFIG_NOSYSTEM': '1',
+            'GIT_CONFIG_GLOBAL': os.devnull,
+            'GIT_OPTIONAL_LOCKS': '0',
+            'GIT_TERMINAL_PROMPT': '0',
+        },
+        timeout=15,
+    )
 
 
 def verify(solution_path, test_cases_path=None):
@@ -36,35 +60,23 @@ def verify(solution_path, test_cases_path=None):
 
     # Check 'feature' branch exists.
     if checks['is_git_repo']:
-        branch_result = subprocess.run(
-            ['git', 'branch', '--list', 'feature'],
-            capture_output=True,
-            text=True,
-            cwd=repo_dir,
-        )
+        branch_result = _git(repo_dir, 'branch', '--list', 'feature')
         checks['feature_branch_exists'] = 'feature' in branch_result.stdout
     else:
         checks['feature_branch_exists'] = False
 
     # Check hello.txt exists with correct content.
-    hello_path = os.path.join(repo_dir, 'hello.txt')
-    if os.path.isfile(hello_path):
-        with open(hello_path) as f:
-            content = f.read().strip()
+    try:
+        content = read_output(os.path.join(repo_dir, 'hello.txt'), work_dir).strip()
         checks['hello_file_exists'] = True
         checks['hello_content_correct'] = content == 'Hello, DeepGym!'
-    else:
+    except OSError:
         checks['hello_file_exists'] = False
         checks['hello_content_correct'] = False
 
     # Check git log has a commit with expected message.
     if checks['is_git_repo']:
-        log_result = subprocess.run(
-            ['git', 'log', '--oneline', '--all'],
-            capture_output=True,
-            text=True,
-            cwd=repo_dir,
-        )
+        log_result = _git(repo_dir, 'log', '--oneline', '--all')
         checks['has_commit'] = 'Add hello.txt' in log_result.stdout
     else:
         checks['has_commit'] = False

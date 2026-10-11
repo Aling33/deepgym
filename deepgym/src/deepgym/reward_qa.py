@@ -170,15 +170,6 @@ def build_exploit_record(
     )
 
 
-def resolve_verifier_source(env: Environment) -> str:
-    """Return the verifier source code for an environment."""
-    if env.verifier_code:
-        return env.verifier_code
-    if env.verifier_path is not None:
-        return env.verifier_path.read_text(encoding='utf-8')
-    return ''
-
-
 class RewardAuditor:
     """Run white-box verifier audits and optionally persist the results."""
 
@@ -204,7 +195,7 @@ class RewardAuditor:
     ) -> VerifierAuditReport:
         """Run a verifier audit and return a structured QA report."""
         report = self._tester.test(env, strategies=strategies)
-        verifier_source = resolve_verifier_source(env)
+        verifier_source = env.verifier_source
         resolved_verifier_id = verifier_id or env.task[:80]
         verifier_hash = fingerprint_verifier(verifier_source)
         patterns = classify_patterns(verifier_source, report)

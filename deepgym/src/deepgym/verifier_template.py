@@ -152,6 +152,8 @@ def detect_verifier_mode(source: str) -> ResolvedMode:
         return 'body'
     if any(_is_main_guard(node) for node in tree.body):
         return 'script'
+    if any(isinstance(node, ast.Return) for node in tree.body):
+        return 'body'
     if any(isinstance(node, ast.FunctionDef) and node.name == 'verify' for node in tree.body):
         return 'verify_function'
     return 'body'

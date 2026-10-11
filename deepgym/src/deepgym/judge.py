@@ -15,6 +15,7 @@ package, or the judge's memory, and can't write to the judge's stdout.
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import functools
 import json
@@ -25,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -55,7 +57,7 @@ $SUDO mkdir -p {_DAYTONA_ROOT}/judge {_DAYTONA_ROOT}/runtime {_DAYTONA_ROOT}/sol
 $SUDO chown -R "$(id -u):$(id -g)" {_DAYTONA_ROOT}
 chmod 755 {_DAYTONA_ROOT} {_DAYTONA_ROOT}/runtime
 chmod 700 {_DAYTONA_ROOT}/judge
-chmod 777 {_DAYTONA_ROOT}/solution
+chmod 755 {_DAYTONA_ROOT}/solution
 echo "$(id -u) $(id -u {_SOLVER_USER}) $(id -g {_SOLVER_USER}) $(command -v python3)"
 """
 
@@ -140,20 +142,50 @@ def local_isolation_kind() -> Literal['macos', 'bwrap', 'none']:
     return 'none'
 
 
-def local_isolation(judge_dir: str) -> dict:
-    """Isolation spec hiding the judge, the deepgym package, and cached benchmarks."""
+_runs_root_lock = threading.Lock()
+_runs_root: list[str] = []
+
+
+def _local_runs_root() -> str:
+    """One parent for every local run in this process, hidden from all solutions.
+
+    Locked: parallel batch runs must share it, or each would hide only its own.
+    """
+    with _runs_root_lock:
+        if not _runs_root:
+            root = os.path.realpath(tempfile.mkdtemp(prefix='deepgym_runs_'))
+            atexit.register(shutil.rmtree, root, ignore_errors=True)
+            _runs_root.append(root)
+        return _runs_root[0]
+
+
+def local_isolation(expose: list[str]) -> dict:
+    """Isolation spec hiding all runs, the deepgym package, and cached benchmarks,
+    except this run's own *expose* directories."""
     kind = local_isolation_kind()
     if kind == 'none':
         return {'kind': 'none'}
-    hide = [judge_dir, str(Path(__file__).resolve().parent), str(Path.home() / '.deepgym')]
-    return {'kind': kind, 'hide': [os.path.realpath(p) for p in hide if os.path.exists(p)]}
+    hide = [_local_runs_root(), str(Path(__file__).resolve().parent), str(Path.home() / '.deepgym')]
+    return {
+        'kind': kind,
+        'hide': [os.path.realpath(p) for p in hide if os.path.exists(p)],
+        'expose': expose,
+    }
 
 
 @contextlib.contextmanager
 def local_judge(job: JudgeJob) -> Iterator[tuple[list[str], dict[str, str], str]]:
-    """Materialize *job* in temp dirs; yield (argv, env, cwd) for the judge process."""
-    dirs = [tempfile.mkdtemp(prefix=f'deepgym_{part}_') for part in ('judge', 'run', 'sol')]
-    judge_dir, runtime_dir, solution_dir = (os.path.realpath(d) for d in dirs)
+    """Materialize *job* under the hidden runs root; yield (argv, env, cwd) for the judge.
+
+    Sibling runs (e.g. other rollouts in a GRPO batch) can't read each other's
+    judge files, solutions, or scratch: they all live under the hidden root.
+    """
+    run_dir = tempfile.mkdtemp(dir=_local_runs_root())
+    judge_dir, runtime_dir, solution_dir, tmp_dir = (
+        f'{run_dir}/{part}' for part in ('judge', 'runtime', 'solution', 'tmp')
+    )
+    for path in (judge_dir, runtime_dir, solution_dir, tmp_dir):
+        os.mkdir(path)
     try:
         for rel, content in job.judge_files().items():
             target = Path(judge_dir, rel)
@@ -163,15 +195,17 @@ def local_judge(job: JudgeJob) -> Iterator[tuple[list[str], dict[str, str], str]
         Path(runtime_path).write_text(RUNTIME_SOURCE, encoding='utf-8')
         solution_path = f'{solution_dir}/solution.py'
         Path(solution_path).write_text(job.solution, encoding='utf-8')
+        isolation = local_isolation([runtime_dir, solution_dir])
         env = {
             **os.environ,
-            **job.runtime_env(local_isolation(judge_dir), runtime_path, sys.executable),
+            **job.runtime_env(isolation, runtime_path, sys.executable),
             'DEEPGYM_DEADLINE': str(time.time() + job.timeout),
+            # Verifier temp files (and solution scratch dirs) stay inside this run.
+            'TMPDIR': tmp_dir,
         }
         yield [sys.executable, *job.verifier_args(judge_dir, solution_path)], env, judge_dir
     finally:
-        for path in dirs:
-            shutil.rmtree(path, ignore_errors=True)
+        shutil.rmtree(run_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -186,8 +220,7 @@ def daytona_isolation(setup_output: str) -> tuple[dict, str]:
         prefix = ['setpriv', f'--reuid={uid}', f'--regid={gid}', '--clear-groups', '--']
     else:
         prefix = ['sudo', '-n', '-u', _SOLVER_USER, '--']
-    kill = [*prefix, 'bash', '-c', 'kill -9 -1']
-    return {'kind': 'user', 'prefix': prefix, 'kill': kill}, python
+    return {'kind': 'user', 'prefix': prefix}, python
 
 
 def daytona_uploads(job: JudgeJob) -> list[tuple[bytes, str]]:

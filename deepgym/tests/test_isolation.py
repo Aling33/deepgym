@@ -353,3 +353,147 @@ class TestRegistrySupportFiles:
         self._bench(tmp_path / 'cache' / 'bench', ['../../../outside.py'])
         with pytest.raises(ValueError, match='not a file under'):
             load_environment('bench/env1')
+
+
+class TestJudgeSideHardening:
+    """Things the judge reads or runs after the solution are safe from tampering."""
+
+    @needs_sandbox
+    def test_solution_cannot_swap_its_own_source(self, dg: DeepGym) -> None:
+        env = _env(
+            """
+from deepgym_solution import solution_source
+return 'cheat' in solution_source(solution_path)
+"""
+        )
+        solution = (
+            'try:\n'
+            '    open(__file__, "w").write("def f():\\n    return 1  # innocent\\n")\n'
+            'except OSError:\n'
+            '    pass\n'
+            'def f():\n'
+            '    return 2  # cheat\n'
+        )
+        assert dg.run(env, solution).passed
+
+    def test_symlinked_output_is_refused(self, dg: DeepGym) -> None:
+        verifier = (
+            'import tempfile\n'
+            'from pathlib import Path\n'
+            'from deepgym_solution import read_output, run_solution\n\n'
+            'def verify(solution_path):\n'
+            '    secret = Path(__file__).with_name("answers.txt")\n'
+            '    secret.write_text("EXPECTED")\n'
+            '    work = tempfile.mkdtemp()\n'
+            '    run_solution(solution_path, cwd=work, env={"OUT": work, "TARGET": str(secret)})\n'
+            '    try:\n'
+            '        read_output(str(Path(work, "out.txt")), work)\n'
+            '        return 0.0\n'
+            '    except OSError:\n'
+            '        return 1.0\n'
+        )
+        solution = (
+            'import os\n'
+            'os.symlink(os.environ["TARGET"], os.path.join(os.environ["OUT"], "out.txt"))\n'
+        )
+        assert dg.run(Environment(task='t', verifier_code=verifier), solution).passed
+
+    def test_planted_git_config_does_not_run_in_judge(self, dg: DeepGym, tmp_path) -> None:
+        marker = tmp_path / 'pwned'
+        solution = (
+            'import os, subprocess\n'
+            'os.makedirs("my_repo")\n'
+            'run = lambda *a: subprocess.run(a, cwd="my_repo", capture_output=True)\n'
+            'run("git", "init", "-q")\n'
+            f'run("git", "config", "core.fsmonitor", "touch {marker}")\n'
+            'print("done")\n'
+        )
+        dg.run(load_environment('cli_task'), solution)
+        assert not marker.exists()
+
+
+class TestReviewFixes:
+    """Regressions found in review of the isolation change."""
+
+    @needs_sandbox
+    def test_parallel_runs_cannot_read_each_other(self, dg: DeepGym) -> None:
+        env = _env(
+            """
+import time
+from pathlib import Path
+Path(__file__).with_name('secret.txt').write_text('mine')
+time.sleep(1)
+found = sol.scan()
+return {'score': 0.0 if found else 1.0, 'passed': not found, 'details': str(found)}
+"""
+        )
+        solution = (
+            'from pathlib import Path\n'
+            'def scan():\n'
+            '    root = Path(__file__).resolve().parents[2]\n'
+            '    found = []\n'
+            '    try:\n'
+            '        for p in root.glob("*/*/*"):\n'
+            '            try:\n'
+            '                p.read_text()\n'
+            '                found.append(str(p))\n'
+            '            except OSError:\n'
+            '                pass\n'
+            '    except OSError:\n'
+            '        pass\n'
+            '    own = str(Path(__file__).resolve().parents[1])\n'
+            '    return [f for f in found if not f.startswith(own)]\n'
+        )
+        batch = dg.run_batch(env, [solution] * 4, max_parallel=4)
+        assert all(r.passed for r in batch.results), [r.output for r in batch.results]
+
+    def test_builtin_subclasses_arrive_as_plain_values(self, dg: DeepGym) -> None:
+        env = _env(
+            """
+counts, color, table = sol.values()
+return counts == {'a': 2} and color == 1 and table == {'k': [1]}
+"""
+        )
+        solution = (
+            'import collections, enum\n'
+            'class Color(enum.IntEnum):\n'
+            '    RED = 1\n'
+            'def values():\n'
+            '    table = collections.defaultdict(list)\n'
+            '    table["k"].append(1)\n'
+            '    return collections.Counter("aa"), Color.RED, table\n'
+        )
+        assert dg.run(env, solution).passed
+
+    def test_solution_source_falls_back_to_whole_file(self, dg: DeepGym) -> None:
+        env = _env(
+            """
+from deepgym_solution import solution_source
+return 'lambda' in solution_source(solution_path, 'two_sum')
+"""
+        )
+        assert dg.run(env, 'two_sum = lambda nums, target: [0, 1]\n').passed
+
+    def test_body_with_local_verify_helper(self, dg: DeepGym) -> None:
+        body = 'def verify(path):\n    return 0.75\nreturn verify(solution_path)\n'
+        assert dg.run(Environment(task='t', verifier_code=body), '').score == 0.75
+
+    def test_namespace_skips_values_it_cannot_send(self, dg: DeepGym) -> None:
+        env = _env(
+            """
+from deepgym_solution import solution_namespace
+ns = solution_namespace(sol)
+exec('result = f(2)', ns)
+return ns['result'] == 4 and 'DEEP' not in ns
+"""
+        )
+        solution = (
+            'DEEP = []\n'
+            'node = DEEP\n'
+            'for _ in range(300):\n'
+            '    node.append([])\n'
+            '    node = node[0]\n'
+            'def f(x):\n'
+            '    return x * x\n'
+        )
+        assert dg.run(env, solution).passed

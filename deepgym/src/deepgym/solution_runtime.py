@@ -38,6 +38,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -61,10 +62,27 @@ class SolutionError(Exception):
 # ---------------------------------------------------------------------------
 
 
+_PLAIN = (bool, int, float, str, bytes, list, tuple, set, frozenset, dict)
+
+
+def _plain(obj: Any) -> Any:
+    """Turn builtin subclasses (Counter, IntEnum, np.float64...) and numpy scalars into
+    their plain base type, so overridden methods like __eq__ never reach the judge."""
+    if type(obj) in _PLAIN or obj is None:
+        return obj
+    for base in _PLAIN:
+        if isinstance(obj, base):
+            return base(obj)
+    if type(obj).__module__ == 'numpy' and getattr(obj, 'ndim', None) == 0:
+        return obj.item()
+    return obj
+
+
 def _encode(obj: Any, handles: dict[int, Any] | None, depth: int = 0) -> Any:
     """Encode *obj* as JSON-safe tagged data; unknown objects become handles or errors."""
     if depth > _MAX_DEPTH:
         raise ValueError('value is nested too deeply to send across the solution boundary')
+    obj = _plain(obj)
     kind = type(obj)
     if obj is None or kind in (bool, int, str):
         return obj
@@ -129,16 +147,19 @@ def _python() -> str:
     return os.environ.get('DEEPGYM_PYTHON', sys.executable)
 
 
-def _macos_profile(hide: Sequence[str], writable: Sequence[str]) -> str:
-    def quote(path: str) -> str:
-        return json.dumps(os.path.realpath(path))
+def _macos_profile(hide: Sequence[str], expose: Sequence[str], writable: Sequence[str]) -> str:
+    def paths(items: Sequence[str]) -> str:
+        return ' '.join(f'(subpath {json.dumps(os.path.realpath(p))})' for p in items)
 
-    hidden = ' '.join(f'(subpath {quote(p)})' for p in hide)
-    allowed = ' '.join(f'(subpath {quote(p)})' for p in writable)
+    # Later rules win: hide whole trees, then re-expose this run's own directories.
+    # Hiding denies reading contents and listings, not stat, so tools that resolve
+    # their working path (git) still work. No Mach IPC or AppleEvents: they let a
+    # process ask launchd or another app to start something outside the sandbox.
     return (
-        '(version 1)(allow default)(deny network*)'
-        f'(deny file-read* {hidden})(deny file-write*)'
-        f'(allow file-write* {allowed} (literal "/dev/null"))'
+        '(version 1)(allow default)(deny network*)(deny mach-lookup)(deny appleevent-send)'
+        f'(deny file-read-data {paths(hide)})'
+        f'(allow file-read-data {paths([*expose, *writable])})'
+        f'(deny file-write*)(allow file-write* {paths(writable)} (literal "/dev/null"))'
     )
 
 
@@ -156,12 +177,14 @@ def _launch_argv(
             os.chmod(path, 0o777)
         return [*spec['prefix'], *clean, *command]
     if kind == 'macos':
-        profile = _macos_profile(spec['hide'], writable)
+        profile = _macos_profile(spec['hide'], spec.get('expose', []), writable)
         return ['sandbox-exec', '-p', profile, *clean, *command]
     if kind == 'bwrap':
         argv = ['bwrap', '--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc']
         for path in spec['hide']:
             argv += ['--tmpfs', path]
+        for path in spec.get('expose', []):
+            argv += ['--ro-bind', path, path]
         for path in writable:
             argv += ['--bind', path, path]
         argv += ['--unshare-all', '--die-with-parent', '--new-session', '--chdir', workdir]
@@ -169,11 +192,18 @@ def _launch_argv(
     return [*clean, *command]
 
 
+def _scratch_dir() -> str:
+    """A fresh directory the solution may write in, separate from its own (read-only) file."""
+    return tempfile.mkdtemp(prefix='deepgym_run_')
+
+
 def _kill(proc: subprocess.Popen) -> None:
-    """Kill an isolated process and everything it spawned."""
-    kill = _isolation().get('kill')
-    if kill:
-        subprocess.run(kill, capture_output=True, check=False)
+    """Kill an isolated process and everything in its process group."""
+    spec = _isolation()
+    if spec['kind'] == 'user':
+        # The solution runs as another user, so signal its group as that user.
+        group_kill = [*spec['prefix'], 'bash', '-c', f'kill -9 -- -{proc.pid}']
+        subprocess.run(group_kill, capture_output=True, check=False)
     with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(proc.pid, signal.SIGKILL)
     with contextlib.suppress(Exception):
@@ -204,15 +234,16 @@ def run_solution(
 ) -> subprocess.CompletedProcess:
     """Run the solution as a script in the isolated domain.
 
-    *cwd* (default: the solution's directory) is the only place it may write;
-    pass any output location inside it. *env* adds variables to an otherwise
-    empty environment.
+    *cwd* (default: a fresh scratch directory) is the only place it may write;
+    pass any output location inside it and read results back with
+    :func:`read_output`. *env* adds variables to an otherwise empty environment.
+    Anything the script leaves running is killed when it exits.
 
     Raises:
         subprocess.TimeoutExpired: If it runs past *timeout* (default: the case timeout).
     """
     path = os.path.abspath(solution_path)
-    workdir = os.path.abspath(cwd or os.path.dirname(path))
+    workdir = os.path.abspath(cwd or _scratch_dir())
     command = [_python(), '-B', path, *args]
     limit = _call_timeout() if timeout is None else min(timeout, _remaining())
     proc = subprocess.Popen(
@@ -229,16 +260,35 @@ def run_solution(
     except subprocess.TimeoutExpired:
         _kill(proc)
         raise
-    return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
+    returncode = proc.returncode
+    _kill(proc)
+    return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+
+
+def read_output(path: str, root: str) -> str:
+    """Read a file the solution produced, refusing symlinks and paths outside *root*.
+
+    A solution could otherwise point its "output" at a judge file and have the
+    judge read, say, expected answers back as if it had produced them.
+
+    Raises:
+        OSError: If the file is missing, a symlink, or outside *root*.
+    """
+    real_root = os.path.realpath(root)
+    parent = os.path.realpath(os.path.dirname(os.path.abspath(path)))
+    if os.path.commonpath([real_root, parent]) != real_root:
+        raise PermissionError(f'{path} is outside {root}')
+    fd = os.open(os.path.join(parent, os.path.basename(path)), os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, encoding='utf-8') as handle:
+        return handle.read()
 
 
 def solution_source(solution_path: str, name: str | None = None) -> str:
     """Return the solution's source text, or one top-level def/class by *name*.
 
     Reads the file without running it, for static checks such as hardcoding.
-
-    Raises:
-        ValueError: If *name* isn't a top-level function or class in the file.
+    If *name* isn't a top-level def or class (a lambda, an alias, a conditional
+    def), the whole file is returned so the check still sees the code.
     """
     with open(solution_path, encoding='utf-8') as handle:
         source = handle.read()
@@ -246,11 +296,15 @@ def solution_source(solution_path: str, name: str | None = None) -> str:
         return source
     import ast
 
-    for node in ast.parse(source).body:
-        defs = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+    defs = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    for node in tree.body:
         if isinstance(node, defs) and node.name == name:
-            return ast.get_source_segment(source, node) or ''
-    raise ValueError(f'solution defines no top-level {name!r}')
+            return ast.get_source_segment(source, node) or source
+    return source
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +325,7 @@ class _Runner:
         atexit.register(self.close)
 
     def _start(self) -> None:
-        workdir = os.path.dirname(self._path)
+        workdir = _scratch_dir()
         runtime = os.environ.get('DEEPGYM_RUNTIME', os.path.abspath(__file__))
         command = [_python(), '-I', '-B', runtime, '--serve', self._path]
         self._proc = subprocess.Popen(
@@ -327,6 +381,7 @@ class _Runner:
                     break
                 return _decode(reply['value'], lambda tag: _RemoteObject(self, int(tag['$h'])))
             except Exception as exc:  # noqa: BLE001 - anything malformed is the solution's fault
+                self._dead()
                 raise SolutionError(f'malformed reply from the solution: {exc}') from exc
         raise _remote_exception(str(reply.get('type', '')), str(reply.get('message', '')))
 
@@ -408,6 +463,19 @@ class _RemoteModule:
 
     def __dir__(self) -> list[str]:
         return sorted(self._runner.exports)
+
+
+def solution_namespace(module: _RemoteModule) -> dict[str, Any]:
+    """Names for exec-style test code: every function as a proxy, plus module-level
+    values that can be sent cheaply (others are skipped instead of failing the run)."""
+    namespace: dict[str, Any] = {}
+    for name, kind in module._runner.exports.items():
+        if kind == 'callable':
+            namespace[name] = _RemoteCallable(module._runner, {'name': name}, name)
+            continue
+        with contextlib.suppress(Exception):
+            namespace[name] = getattr(module, name)
+    return namespace
 
 
 def load_solution(solution_path: str) -> _RemoteModule:

@@ -20,8 +20,8 @@ from datasets import load_dataset
 
 def extract_entry_point(code: str) -> str:
     """Extract the first function name from the reference code."""
-    match = re.search(r"def\s+(\w+)\s*\(", code)
-    return match.group(1) if match else "solution"
+    match = re.search(r'def\s+(\w+)\s*\(', code)
+    return match.group(1) if match else 'solution'
 
 
 def generate_verifier(
@@ -49,7 +49,7 @@ def generate_verifier(
 """DeepGym verifier for MBPP_{task_id}."""
 import sys
 import json
-from deepgym_solution import load_solution
+from deepgym_solution import load_solution, solution_namespace
 
 
 # MBPP test assertions
@@ -70,7 +70,7 @@ def verify(solution_path):
         return {{"score": 0.0, "passed": False, "details": "Missing function: {entry_point}"}}
 
     # Build namespace from the solution module
-    ns = {{name: getattr(mod, name) for name in dir(mod)}}
+    ns = solution_namespace(mod)
 
     # Run optional test setup code
     if _TEST_SETUP:
@@ -115,62 +115,62 @@ if __name__ == "__main__":
 
 
 def main():
-    output_dir = Path.home() / ".deepgym" / "environments" / "mbpp"
+    output_dir = Path.home() / '.deepgym' / 'environments' / 'mbpp'
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("Loading MBPP dataset from HuggingFace...")
-    ds = load_dataset("google-research-datasets/mbpp", "full", split="test")
-    print(f"Loaded {len(ds)} problems.")
+    print('Loading MBPP dataset from HuggingFace...')
+    ds = load_dataset('google-research-datasets/mbpp', 'full', split='test')
+    print(f'Loaded {len(ds)} problems.')
 
     registry = []
 
     for row in ds:
-        task_id = row["task_id"]
-        text = row["text"]
-        code = row["code"]
-        test_list = row["test_list"]
-        test_setup_code = row.get("test_setup_code", "")
-        challenge_test_list = row.get("challenge_test_list", [])
+        task_id = row['task_id']
+        text = row['text']
+        code = row['code']
+        test_list = row['test_list']
+        test_setup_code = row.get('test_setup_code', '')
+        challenge_test_list = row.get('challenge_test_list', [])
 
         entry_point = extract_entry_point(code)
-        dir_name = f"MBPP_{task_id}"
+        dir_name = f'MBPP_{task_id}'
 
         env_dir = output_dir / dir_name
         env_dir.mkdir(exist_ok=True)
 
         # task.md -- the problem description
-        (env_dir / "task.md").write_text(text + "\n", encoding="utf-8")
+        (env_dir / 'task.md').write_text(text + '\n', encoding='utf-8')
 
         # reference_solution.py -- the canonical code
-        (env_dir / "reference_solution.py").write_text(code, encoding="utf-8")
+        (env_dir / 'reference_solution.py').write_text(code, encoding='utf-8')
 
         # verifier.py
         verifier_src = generate_verifier(
             task_id, entry_point, test_list, challenge_test_list, test_setup_code
         )
-        (env_dir / "verifier.py").write_text(verifier_src, encoding="utf-8")
+        (env_dir / 'verifier.py').write_text(verifier_src, encoding='utf-8')
 
         # metadata.json
         metadata = {
-            "id": dir_name,
-            "name": entry_point,
-            "difficulty": "medium",
-            "domain": "coding",
-            "benchmark": "mbpp",
-            "tags": ["mbpp", "function-completion"],
+            'id': dir_name,
+            'name': entry_point,
+            'difficulty': 'medium',
+            'domain': 'coding',
+            'benchmark': 'mbpp',
+            'tags': ['mbpp', 'function-completion'],
         }
-        (env_dir / "metadata.json").write_text(
-            json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+        (env_dir / 'metadata.json').write_text(
+            json.dumps(metadata, indent=2) + '\n', encoding='utf-8'
         )
 
-        registry.append({**metadata, "path": f"environments/mbpp/{dir_name}"})
+        registry.append({**metadata, 'path': f'environments/mbpp/{dir_name}'})
 
     # registry.json
-    (output_dir / "registry.json").write_text(
-        json.dumps(registry, indent=2) + "\n", encoding="utf-8"
+    (output_dir / 'registry.json').write_text(
+        json.dumps(registry, indent=2) + '\n', encoding='utf-8'
     )
-    print(f"Generated {len(registry)} MBPP environments in {output_dir}")
+    print(f'Generated {len(registry)} MBPP environments in {output_dir}')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
