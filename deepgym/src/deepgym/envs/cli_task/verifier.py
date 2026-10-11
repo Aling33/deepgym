@@ -2,35 +2,63 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import zlib
 
-from deepgym_solution import read_output, run_solution
+from deepgym_solution import read_output, read_output_bytes, run_solution
 
 
-def _git(repo_dir, *args):
-    """Run git on the solution's repo without letting its .git/config run commands."""
-    overrides = [
-        '-c', 'core.fsmonitor=false',
-        '-c', 'core.hooksPath=/dev/null',
-        '-c', 'log.showSignature=false',
-        '-c', 'safe.directory=*',
-    ]  # fmt: skip
-    return subprocess.run(
-        ['git', '--no-pager', *overrides, *args],
-        capture_output=True,
-        text=True,
-        cwd=repo_dir,
-        env={
-            'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
-            'GIT_CONFIG_NOSYSTEM': '1',
-            'GIT_CONFIG_GLOBAL': os.devnull,
-            'GIT_OPTIONAL_LOCKS': '0',
-            'GIT_TERMINAL_PROMPT': '0',
-        },
-        timeout=15,
-    )
+def _read_repo(repo_dir, root):
+    """Return (branch names, commit messages) read straight from .git.
+
+    Never runs git: a repo the solution built can set .git/config options that
+    make git execute commands. Reads only loose objects, through read_output_bytes
+    (no symlinks, nothing outside *root*).
+    """
+    git_dir = os.path.join(repo_dir, '.git')
+
+    def read(rel):
+        try:
+            return read_output_bytes(os.path.join(git_dir, rel), root, limit=10_000_000)
+        except OSError:
+            return None
+
+    branches = {}
+    packed = read('packed-refs') or b''
+    for line in packed.decode('utf-8', 'replace').splitlines():
+        sha, _, name = line.partition(' ')
+        if name.startswith('refs/heads/'):
+            branches[name[len('refs/heads/') :]] = sha.strip()
+    heads = os.path.join(git_dir, 'refs', 'heads')
+    if os.path.isdir(heads) and not os.path.islink(heads):
+        for name in os.listdir(heads):
+            sha = read(os.path.join('refs', 'heads', name))
+            if sha is not None:
+                branches[name] = sha.decode('ascii', 'replace').strip()
+
+    messages, seen, todo = [], set(), list(branches.values())
+    while todo and len(seen) < 1000:
+        sha = todo.pop()
+        if sha in seen or not re.fullmatch(r'[0-9a-f]{40}', sha):
+            continue
+        seen.add(sha)
+        compressed = read(os.path.join('objects', sha[:2], sha[2:]))
+        if compressed is None:
+            continue
+        try:
+            raw = zlib.decompressobj().decompress(compressed, 1_000_000)
+        except zlib.error:
+            continue
+        header, _, body = raw.partition(b'\0')
+        if not header.startswith(b'commit '):
+            continue
+        meta, _, message = body.decode('utf-8', 'replace').partition('\n\n')
+        messages.append(message.strip())
+        todo += [line[len('parent ') :] for line in meta.splitlines() if line.startswith('parent ')]
+    return set(branches), messages
 
 
 def verify(solution_path, test_cases_path=None):
@@ -54,16 +82,13 @@ def verify(solution_path, test_cases_path=None):
     # Check repo directory exists.
     checks['repo_exists'] = os.path.isdir(repo_dir)
 
-    # Check it is a git repo.
+    # Check it is a git repo, and read its branches and commits without running git.
     git_dir = os.path.join(repo_dir, '.git')
-    checks['is_git_repo'] = os.path.isdir(git_dir)
+    checks['is_git_repo'] = os.path.isdir(git_dir) and not os.path.islink(git_dir)
+    branches, messages = _read_repo(repo_dir, work_dir) if checks['is_git_repo'] else (set(), [])
 
     # Check 'feature' branch exists.
-    if checks['is_git_repo']:
-        branch_result = _git(repo_dir, 'branch', '--list', 'feature')
-        checks['feature_branch_exists'] = 'feature' in branch_result.stdout
-    else:
-        checks['feature_branch_exists'] = False
+    checks['feature_branch_exists'] = 'feature' in branches
 
     # Check hello.txt exists with correct content.
     try:
@@ -74,12 +99,8 @@ def verify(solution_path, test_cases_path=None):
         checks['hello_file_exists'] = False
         checks['hello_content_correct'] = False
 
-    # Check git log has a commit with expected message.
-    if checks['is_git_repo']:
-        log_result = _git(repo_dir, 'log', '--oneline', '--all')
-        checks['has_commit'] = 'Add hello.txt' in log_result.stdout
-    else:
-        checks['has_commit'] = False
+    # Check a commit has the expected message.
+    checks['has_commit'] = any(m.startswith('Add hello.txt') for m in messages)
 
     # Check solution prints 'done'.
     checks['prints_done'] = 'done' in proc.stdout.strip().lower()
