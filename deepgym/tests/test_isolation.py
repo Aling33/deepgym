@@ -497,3 +497,62 @@ return ns['result'] == 4 and 'DEEP' not in ns
             '    return x * x\n'
         )
         assert dg.run(env, solution).passed
+
+
+class TestSecurityFollowups:
+    """Follow-ups from the security review of the isolation change."""
+
+    def test_symlinked_parent_directory_is_refused(self, dg: DeepGym) -> None:
+        verifier = (
+            'import tempfile\n'
+            'from pathlib import Path\n'
+            'from deepgym_solution import read_output, run_solution\n\n'
+            'def verify(solution_path):\n'
+            '    Path(__file__).with_name("answers.txt").write_text("EXPECTED")\n'
+            '    work = tempfile.mkdtemp()\n'
+            '    target = str(Path(__file__).parent)\n'
+            '    run_solution(solution_path, cwd=work, env={"OUT": work, "TARGET": target})\n'
+            '    try:\n'
+            '        read_output(str(Path(work, "out", "answers.txt")), work)\n'
+            '        return 0.0\n'
+            '    except OSError:\n'
+            '        return 1.0\n'
+        )
+        solution = (
+            'import os\nos.symlink(os.environ["TARGET"], os.path.join(os.environ["OUT"], "out"))\n'
+        )
+        assert dg.run(Environment(task='t', verifier_code=verifier), solution).passed
+
+    def test_cli_task_never_runs_git_in_judge(self, dg: DeepGym, tmp_path) -> None:
+        marker = tmp_path / 'pwned'
+        solution = (
+            'import os, subprocess\n'
+            'os.makedirs("my_repo")\n'
+            'run = lambda *a: subprocess.run(a, cwd="my_repo", capture_output=True)\n'
+            'run("git", "init", "-q")\n'
+            f'for key in ("core.fsmonitor", "core.pager", "core.alternateRefsCommand"):\n'
+            f'    run("git", "config", key, "touch {marker}")\n'
+            'print("done")\n'
+        )
+        dg.run(load_environment('cli_task'), solution)
+        assert not marker.exists()
+
+    @needs_sandbox
+    def test_home_directory_is_hidden(self, dg: DeepGym) -> None:
+        import uuid
+        from pathlib import Path
+
+        secret = Path.home() / f'.deepgym_test_secret_{uuid.uuid4().hex}'
+        secret.write_text('home secret')
+        try:
+            env = _env(f'return not sol.read({str(secret)!r})')
+            solution = (
+                'def read(path):\n'
+                '    try:\n'
+                '        return open(path).read()\n'
+                '    except OSError:\n'
+                '        return None\n'
+            )
+            assert dg.run(env, solution).passed
+        finally:
+            secret.unlink()

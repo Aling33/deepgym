@@ -162,3 +162,45 @@ class TestReadRegistry:
         data = _read_registry()
         assert isinstance(data, list)
         assert all(isinstance(e, dict) for e in data)
+
+
+class TestBenchmarkRouting:
+    """humaneval and humaneval_plus share task ids; the requested benchmark must win."""
+
+    @pytest.fixture()
+    def caches(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        cache_dir = tmp_path / 'environments'
+        for benchmark in ('humaneval', 'humaneval_plus'):
+            env_dir = cache_dir / benchmark / 'HumanEval_0'
+            env_dir.mkdir(parents=True)
+            (env_dir / 'task.md').write_text(f'{benchmark} task\n', encoding='utf-8')
+            (env_dir / 'verifier.py').write_text('return 1.0\n', encoding='utf-8')
+            (cache_dir / benchmark / 'registry.json').write_text(
+                f'[{{"id":"HumanEval_0","name":"solve","benchmark":"{benchmark}",'
+                f'"path":"environments/{benchmark}/HumanEval_0"}}]\n',
+                encoding='utf-8',
+            )
+        monkeypatch.setattr(registry_module, '_get_cache_dir', lambda: cache_dir)
+        return cache_dir
+
+    @pytest.mark.parametrize(
+        ('name', 'benchmark'),
+        [
+            ('humaneval_plus', 'humaneval_plus'),
+            ('humaneval_plus/HumanEval_0', 'humaneval_plus'),
+            ('humaneval_plus/HumanEval/0', 'humaneval_plus'),
+            ('environments/humaneval_plus/HumanEval_0', 'humaneval_plus'),
+            ('humaneval', 'humaneval'),
+            ('humaneval/HumanEval_0', 'humaneval'),
+            ('humaneval/HumanEval/0', 'humaneval'),
+            ('environments/humaneval/HumanEval_0', 'humaneval'),
+        ],
+    )
+    def test_requested_benchmark_wins(self, caches: Path, name: str, benchmark: str) -> None:
+        assert load_environment(name).task == f'{benchmark} task\n'
+
+    @pytest.mark.parametrize('name', ['HumanEval_0', 'HumanEval/0', 'solve'])
+    def test_ambiguous_name_lists_candidates(self, caches: Path, name: str) -> None:
+        with pytest.raises(ValueError, match='ambiguous') as exc:
+            load_environment(name)
+        assert 'humaneval_plus/HumanEval_0' in str(exc.value)

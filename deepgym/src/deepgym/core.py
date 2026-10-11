@@ -9,7 +9,7 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Literal
 
-from deepgym.benchmark_envs import build_run_requests
+from deepgym.benchmark_envs import build_run_requests, route_single_run
 from deepgym.exceptions import (
     DeepGymError,
     SandboxError,
@@ -112,6 +112,7 @@ class DeepGym:
         """
         if isinstance(env, MultiTurnEnvironment):
             raise DeepGymError('Multi-turn environments need an agent: use dg.run_episode()')
+        env = route_single_run(env, kwargs)
         if hasattr(env, 'run_with_deepgym'):
             return env.run_with_deepgym(self, model_output, **kwargs)  # type: ignore[return-value]
 
