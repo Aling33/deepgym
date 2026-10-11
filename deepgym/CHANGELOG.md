@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **Rewards:** NaN, inf and out-of-range scores are verifier errors, never reward. A single run raises `InvalidScoreError`; batches and trainer reward functions score that sample 0 with `error_type='invalid_score'`. Non-finite reward components are zeroed. Before, NaN scored 1.0.
+- **Benchmark-backed envs:** SWE-bench Pro, Terminal-Bench and `MixedEnvironment` now score correctly in `AsyncDeepGym` and in single sync runs. Before, both silently scored a 0.0 placeholder.
+- **Benchmark names:** a fully qualified name such as `humaneval_plus/HumanEval_0` beats loose matches, and an ambiguous name raises instead of loading the wrong benchmark. Before, HumanEval+ requests could load HumanEval.
+- **Isolation hardening:**
+  - Local runs hide the home directory and every other run; only the Python install and the run's own directories are visible.
+  - On Daytona the judge's temp files are private.
+  - On macOS solutions can't fork unless `run_solution(..., allow_subprocess=True)`.
+  - Scripts' leftover processes are killed when the script exits.
+  - `cli_task` reads `.git` without running git.
+  - `read_output` refuses symlinked paths.
+
 - **Security: the solution no longer runs inside the judge.**
   - Before, single-turn verifiers imported the model's code into their own process, and in both local and Daytona mode it shared a folder with the verifier and test cases. It could print a fake score line, patch the verifier, read the expected answers, import the reference solution from the installed package, or return an object that equals everything.
   - Now verifiers call `load_solution()` / `run_solution()` from `deepgym_solution`, which run the solution in a separate isolated process:

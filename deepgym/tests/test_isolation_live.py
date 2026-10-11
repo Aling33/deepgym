@@ -122,3 +122,26 @@ def test_setsid_daemon_dies_with_its_script(dg: DeepGym) -> None:
         '    os._exit(0)\n'
     )
     assert dg.run(Environment(task='t', verifier_code=verifier), solution).passed
+
+
+def test_judge_temp_files_are_private(dg: DeepGym) -> None:
+    env = _env(
+        """
+import tempfile
+from pathlib import Path
+private = [Path(tempfile.gettempdir(), 'expected.json'), Path('/tmp/expected2.json')]
+for path in private:
+    path.write_text('EXPECTED')
+leaked = [str(p) for p in private if sol.read(str(p))]
+return {'score': 0.0 if leaked else 1.0, 'passed': not leaked, 'details': str(leaked)}
+"""
+    )
+    solution = (
+        'def read(path):\n'
+        '    try:\n'
+        '        return open(path).read()\n'
+        '    except OSError:\n'
+        '        return None\n'
+    )
+    result = dg.run(env, solution)
+    assert result.passed, result.output

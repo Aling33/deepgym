@@ -53,11 +53,14 @@ set -e
 if [ "$(id -u)" = 0 ]; then SUDO=; else SUDO="sudo -n"; fi
 id {_SOLVER_USER} >/dev/null 2>&1 || \\
   $SUDO useradd --system --no-create-home --shell /usr/sbin/nologin {_SOLVER_USER}
-$SUDO mkdir -p {_DAYTONA_ROOT}/judge {_DAYTONA_ROOT}/runtime {_DAYTONA_ROOT}/solution
+$SUDO mkdir -p {_DAYTONA_ROOT}/judge {_DAYTONA_ROOT}/runtime {_DAYTONA_ROOT}/solution \\
+  {_DAYTONA_ROOT}/tmp
 $SUDO chown -R "$(id -u):$(id -g)" {_DAYTONA_ROOT}
 chmod 755 {_DAYTONA_ROOT} {_DAYTONA_ROOT}/runtime
 chmod 700 {_DAYTONA_ROOT}/judge
 chmod 755 {_DAYTONA_ROOT}/solution
+# Judge temp files: the solution user may enter known subdirectories, never list.
+chmod 711 {_DAYTONA_ROOT}/tmp
 echo "$(id -u) $(id -u {_SOLVER_USER}) $(id -g {_SOLVER_USER}) $(command -v python3)"
 """
 
@@ -248,8 +251,11 @@ def daytona_judge(job: JudgeJob, setup_output: str) -> tuple[str, dict[str, str]
     judge_dir = f'{_DAYTONA_ROOT}/judge'
     args = job.verifier_args(judge_dir, f'{_DAYTONA_ROOT}/solution/solution.py')
     command = (
-        f'cd {judge_dir} && DEEPGYM_DEADLINE=$(( $(date +%s) + {job.timeout} )) '
+        f'umask 077 && cd {judge_dir} && DEEPGYM_DEADLINE=$(( $(date +%s) + {job.timeout} )) '
         f'exec {shlex.quote(python)} {shlex.join(args)}'
     )
     env = job.runtime_env(isolation, f'{_DAYTONA_ROOT}/runtime/{RUNTIME_FILE}', python)
+    # Private temp dir + umask 077: the judge's own temp files stay unreadable to the
+    # solution; run_solution shares only the directories it hands over.
+    env['TMPDIR'] = f'{_DAYTONA_ROOT}/tmp'
     return f'bash -c {shlex.quote(command)}', env

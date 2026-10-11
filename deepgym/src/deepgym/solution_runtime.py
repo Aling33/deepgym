@@ -147,7 +147,7 @@ def _python() -> str:
     return os.environ.get('DEEPGYM_PYTHON', sys.executable)
 
 
-def _macos_profile(spec: dict, writable: Sequence[str]) -> str:
+def _macos_profile(spec: dict, writable: Sequence[str], allow_fork: bool) -> str:
     def paths(items: Sequence[str]) -> str:
         return ' '.join(f'(subpath {json.dumps(os.path.realpath(p))})' for p in items) or (
             '(literal "/nonexistent")'
@@ -165,11 +165,34 @@ def _macos_profile(spec: dict, writable: Sequence[str]) -> str:
         f'(allow file-read-data {paths([*expose, *writable])})'
         f'(deny file-read-data {paths(rehide)})'
         f'(deny file-write*)(allow file-write* {paths(writable)} (literal "/dev/null"))'
+        # Without a separate user there is no reliable way to kill a child that
+        # calls setsid(), so no forking unless the caller needs subprocesses.
+        + ('' if allow_fork else '(deny process-fork)')
     )
 
 
+def _share_with_solution(workdir: str) -> None:
+    """Let the solution user write in *workdir* and read what the judge put there.
+
+    Symlinks are skipped: chmod would follow them to judge-owned files.
+    """
+    os.chmod(workdir, 0o777)
+    for parent, dirs, files in os.walk(workdir):
+        for name in dirs:
+            path = os.path.join(parent, name)
+            if not os.path.islink(path):
+                os.chmod(path, 0o777)
+        for name in files:
+            path = os.path.join(parent, name)
+            if not os.path.islink(path):
+                os.chmod(path, os.stat(path).st_mode | 0o644)
+
+
 def _launch_argv(
-    command: Sequence[str], workdir: str, extra_env: dict[str, str] | None = None
+    command: Sequence[str],
+    workdir: str,
+    extra_env: dict[str, str] | None = None,
+    allow_fork: bool = False,
 ) -> list[str]:
     """Wrap *command* to run as the isolated solution: empty env, writes only in *workdir*."""
     spec = _isolation()
@@ -178,11 +201,10 @@ def _launch_argv(
     clean += ['PYTHONDONTWRITEBYTECODE=1', *(f'{k}={v}' for k, v in (extra_env or {}).items())]
     kind = spec['kind']
     if kind == 'user':
-        for path in writable:
-            os.chmod(path, 0o777)
+        _share_with_solution(workdir)
         return [*spec['prefix'], *clean, *command]
     if kind == 'macos':
-        profile = _macos_profile(spec, writable)
+        profile = _macos_profile(spec, writable, allow_fork)
         return ['sandbox-exec', '-p', profile, *clean, *command]
     if kind == 'bwrap':
         argv = ['bwrap', '--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc']
@@ -241,13 +263,16 @@ def run_solution(
     env: dict[str, str] | None = None,
     input: str | None = None,
     timeout: float | None = None,
+    allow_subprocess: bool = False,
 ) -> subprocess.CompletedProcess:
     """Run the solution as a script in the isolated domain.
 
     *cwd* (default: a fresh scratch directory) is the only place it may write;
     pass any output location inside it and read results back with
     :func:`read_output`. *env* adds variables to an otherwise empty environment.
-    Anything the script leaves running is killed when it exits.
+    Anything the script leaves running is killed when it exits. On macOS the
+    script can't start subprocesses unless *allow_subprocess* is set (a child
+    that detaches could outlive it there).
 
     Raises:
         subprocess.TimeoutExpired: If it runs past *timeout* (default: the case timeout).
@@ -260,7 +285,7 @@ def run_solution(
     # keep us waiting (and alive to tamper) after the script itself exits.
     with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
         proc = subprocess.Popen(
-            _launch_argv(command, workdir, env),
+            _launch_argv(command, workdir, env, allow_fork=allow_subprocess),
             stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
             stdout=out,
             stderr=err,
