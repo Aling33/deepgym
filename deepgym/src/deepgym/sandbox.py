@@ -1,34 +1,34 @@
-"""Sandbox lifecycle management for DeepGym.
+"""Sandbox lifecycle and verifier execution for DeepGym.
 
-Handles creation, setup, execution, and teardown of Daytona sandboxes.
+Creates and tears down Daytona sandboxes and runs verifier jobs (see
+:mod:`deepgym.judge`) locally or in a sandbox, with the solution isolated from
+the judge in both cases.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import os
 import re
-import shutil
+import shlex
 import subprocess
-import sys
-import tempfile
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from deepgym.exceptions import SandboxError, TimeoutError, VerifierError
+from deepgym.judge import (
+    DAYTONA_SETUP,
+    DEADLINE_GRACE_S,
+    JudgeJob,
+    daytona_judge,
+    daytona_uploads,
+    local_judge,
+)
 from deepgym.models import Environment, RunResult, VerifierResult
-from deepgym.verifier_template import wrap_verifier
 
 if TYPE_CHECKING:
     from daytona import Daytona, Sandbox
 
 logger = logging.getLogger(__name__)
-
-_VERIFIER_PATH = '/home/user/verifier.py'
-_SOLUTION_PATH = '/home/user/solution.py'
-_TEST_CASES_PATH = '/home/user/test_cases.json'
 
 _ENV_KEY_PATTERN = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
@@ -50,22 +50,6 @@ def _validate_env_vars(env_vars: dict[str, str] | None) -> None:
                 f'Invalid environment variable name: {key!r}. '
                 'Names must match [A-Za-z_][A-Za-z0-9_]*'
             )
-
-
-def is_standalone_verifier(source: str) -> bool:
-    """Check if verifier source is a standalone script with JSON protocol output.
-
-    Standalone verifiers have their own ``__name__`` guard and produce JSON
-    directly via ``json.dumps``.  Non-standalone verifiers are function bodies
-    that need wrapping with :func:`~deepgym.verifier_template.wrap_verifier`.
-
-    Args:
-        source: Python source code of the verifier.
-
-    Returns:
-        True if the verifier is standalone, False if it needs wrapping.
-    """
-    return '__name__' in source and 'json.dumps' in source
 
 
 class ExecutionResult:
@@ -172,89 +156,37 @@ def create_sandbox(env: Environment, daytona: Daytona) -> Sandbox:
     return sandbox
 
 
-def setup_sandbox(sandbox: Sandbox, env: Environment, model_output: str) -> None:
-    """Upload verifier, solution, and test cases into the sandbox.
-
-    Args:
-        sandbox: The target sandbox.
-        env: The environment specification (contains verifier code / path).
-        model_output: The model-generated solution source code.
+def run_judge_daytona(sandbox: Sandbox, job: JudgeJob) -> ExecutionResult:
+    """Run *job*'s verifier in *sandbox*, with the solution as a separate, unprivileged user.
 
     Raises:
-        SandboxError: If any file upload fails.
+        SandboxError: If setting up users or uploading files fails.
+        TimeoutError: If the verifier outruns its time budget.
+        VerifierError: If the verifier fails to run or prints no protocol JSON.
     """
+    _validate_env_vars(job.env_vars)
     try:
-        # Resolve verifier source.
-        if env.verifier_path is not None:
-            verifier_source = env.verifier_path.read_text(encoding='utf-8')
-        else:
-            verifier_source = env.verifier_code
-
-        # Wrap simple verifiers that don't already produce JSON protocol output.
-        if is_standalone_verifier(verifier_source):
-            ready_code = verifier_source
-        else:
-            ready_code = wrap_verifier(verifier_source)
-
-        # Daytona SDK: upload_file(src: bytes, dst: str) — content first, path second
-        sandbox.fs.upload_file(ready_code.encode('utf-8'), _VERIFIER_PATH)
-        sandbox.fs.upload_file(model_output.encode('utf-8'), _SOLUTION_PATH)
-
-        if env.test_cases is not None:
-            payload = json.dumps(env.test_cases, ensure_ascii=False)
-            sandbox.fs.upload_file(payload.encode('utf-8'), _TEST_CASES_PATH)
-
+        setup = sandbox.process.exec(f'bash -c {shlex.quote(DAYTONA_SETUP)}', timeout=60)
+        if setup.exit_code != 0:
+            raise SandboxError(f'Judge setup failed: {setup.result[-2000:]}')
+        for content, path in daytona_uploads(job):
+            sandbox.fs.upload_file(content, path)
+    except SandboxError:
+        raise
     except Exception as exc:
-        raise SandboxError(f'Failed to set up sandbox files: {exc}') from exc
-
-
-def execute_verifier(
-    sandbox: Sandbox,
-    timeout: int,
-    has_test_cases: bool = False,
-    env_vars: dict[str, str] | None = None,
-) -> VerifierResult:
-    """Run the verifier inside the sandbox and parse its JSON output.
-
-    The verifier is invoked as::
-
-        python verifier.py solution.py [test_cases.json]
-
-    Environment variables are passed inline so they persist for the verifier
-    process (``export`` in a prior exec call is lost between processes).
-
-    Args:
-        sandbox: A sandbox with verifier and solution already uploaded.
-        timeout: Maximum execution time in seconds.
-        has_test_cases: Whether test_cases.json was uploaded.
-        env_vars: Optional env vars to inject into the verifier command.
-
-    Returns:
-        Parsed VerifierResult.
-
-    Raises:
-        VerifierError: If verifier output is not valid JSON or cannot be parsed.
-        TimeoutError: If execution exceeds *timeout* seconds.
-    """
-    _validate_env_vars(env_vars)
-
-    env_prefix = ''
-    if env_vars:
-        env_prefix = ' '.join(f'{k}={_shell_escape(v)}' for k, v in env_vars.items()) + ' '
-
-    cmd = f'{env_prefix}python {_VERIFIER_PATH} {_SOLUTION_PATH}'
-    if has_test_cases:
-        cmd += f' {_TEST_CASES_PATH}'
-
+        raise SandboxError(f'Failed to set up the judge: {exc}') from exc
+    command, env = daytona_judge(job, setup.result)
     try:
-        response = sandbox.process.exec(cmd, timeout=timeout)
+        response = sandbox.process.exec(command, env=env, timeout=job.timeout + DEADLINE_GRACE_S)
     except Exception as exc:
         if is_command_timeout(exc):
-            raise TimeoutError(f'Verifier execution exceeded {timeout}s timeout') from exc
+            raise TimeoutError(f'Verifier exceeded {job.timeout}s') from exc
         raise VerifierError(f'Verifier execution failed: {exc}') from exc
-
     # Exit codes 0 (passed) and 1 (failed) are normal verifier outcomes, so parse regardless.
-    return parse_verifier_output(response.result.strip(), f'exit_code={response.exit_code}')
+    return ExecutionResult(
+        parse_verifier_output(response.result.strip(), f'exit_code={response.exit_code}'),
+        exit_code=response.exit_code,
+    )
 
 
 def cleanup_sandbox(sandbox: Sandbox, daytona: Daytona, *, wait: bool = False) -> None:
@@ -311,171 +243,74 @@ def _extract_json_line(stdout: str) -> str | None:
     return None
 
 
-def _shell_escape(value: str) -> str:
-    """Wrap *value* in single quotes for safe shell interpolation."""
-    return "'" + value.replace("'", "'\\''") + "'"
-
-
 # ---------------------------------------------------------------------------
 # Local executor (no Daytona required)
 # ---------------------------------------------------------------------------
 
 
 class LocalExecutor:
-    """Run verifiers locally via subprocess. For dev/testing only — no isolation."""
+    """Run verifiers locally, with the solution in a sandboxed subprocess where available."""
 
-    def run(
-        self,
-        verifier_code: str,
-        solution_code: str,
-        test_cases: list[dict] | None = None,
-        timeout: int = 30,
-        env_vars: dict[str, str] | None = None,
-    ) -> ExecutionResult:
-        """Execute verifier against solution in a temporary directory.
-
-        Args:
-            verifier_code: Complete Python verifier script.
-            solution_code: The model-generated solution source.
-            test_cases: Optional list of test-case dicts.
-            timeout: Maximum execution time in seconds.
-            env_vars: Optional env vars to inject into the subprocess.
-
-        Returns:
-            ExecutionResult with parsed VerifierResult, stderr, and exit_code.
+    def run(self, job: JudgeJob) -> ExecutionResult:
+        """Run *job*'s verifier as a local subprocess.
 
         Raises:
-            TimeoutError: If execution exceeds *timeout*.
-            VerifierError: If verifier output is invalid or execution fails.
+            TimeoutError: If the verifier outruns its time budget.
+            VerifierError: If the verifier prints no protocol JSON.
         """
-        _validate_env_vars(env_vars)
-
-        tmp_dir = tempfile.mkdtemp(prefix='deepgym_local_')
-        try:
-            verifier_path = Path(tmp_dir) / 'verifier.py'
-            solution_path = Path(tmp_dir) / 'solution.py'
-            test_cases_path = Path(tmp_dir) / 'test_cases.json'
-
-            verifier_path.write_text(verifier_code, encoding='utf-8')
-            solution_path.write_text(solution_code, encoding='utf-8')
-
-            cmd = [sys.executable, str(verifier_path), str(solution_path)]
-
-            if test_cases is not None:
-                test_cases_path.write_text(
-                    json.dumps(test_cases, ensure_ascii=False), encoding='utf-8'
-                )
-                cmd.append(str(test_cases_path))
-
-            # Merge env_vars into a copy of the current environment.
-            proc_env = None
-            if env_vars:
-                proc_env = {**os.environ, **env_vars}
-
+        _validate_env_vars(job.env_vars)
+        with local_judge(job) as (argv, env, cwd):
             try:
                 proc = subprocess.run(
-                    cmd,
+                    argv,
                     capture_output=True,
                     text=True,
-                    timeout=timeout,
-                    cwd=tmp_dir,
-                    env=proc_env,
+                    timeout=job.timeout + DEADLINE_GRACE_S,
+                    cwd=cwd,
+                    env=env,
                 )
             except subprocess.TimeoutExpired as exc:
-                raise TimeoutError(f'Local verifier execution exceeded {timeout}s timeout') from exc
-
-            stdout = proc.stdout.strip()
-            stderr = proc.stderr.strip()
-
-            return ExecutionResult(
-                verifier_result=parse_verifier_output(stdout, f'stderr: {stderr!r}'),
-                stderr=stderr,
-                exit_code=proc.returncode,
-            )
-
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+                raise TimeoutError(f'Local verifier exceeded {job.timeout}s') from exc
+        stderr = proc.stderr.strip()
+        return ExecutionResult(
+            parse_verifier_output(proc.stdout.strip(), f'stderr: {stderr!r}'),
+            stderr=stderr,
+            exit_code=proc.returncode,
+        )
 
 
 class AsyncLocalExecutor:
     """Async version of LocalExecutor using asyncio.subprocess."""
 
-    async def run(
-        self,
-        verifier_code: str,
-        solution_code: str,
-        test_cases: list[dict] | None = None,
-        timeout: int = 30,
-        env_vars: dict[str, str] | None = None,
-    ) -> ExecutionResult:
-        """Execute verifier against solution asynchronously in a temp directory.
-
-        Args:
-            verifier_code: Complete Python verifier script.
-            solution_code: The model-generated solution source.
-            test_cases: Optional list of test-case dicts.
-            timeout: Maximum execution time in seconds.
-            env_vars: Optional env vars to inject into the subprocess.
-
-        Returns:
-            ExecutionResult with parsed VerifierResult, stderr, and exit_code.
+    async def run(self, job: JudgeJob) -> ExecutionResult:
+        """Run *job*'s verifier as a local subprocess without blocking the event loop.
 
         Raises:
-            TimeoutError: If execution exceeds *timeout*.
-            VerifierError: If verifier output is invalid or execution fails.
+            TimeoutError: If the verifier outruns its time budget.
+            VerifierError: If the verifier prints no protocol JSON.
         """
-        _validate_env_vars(env_vars)
-
-        tmp_dir = tempfile.mkdtemp(prefix='deepgym_async_local_')
-        try:
-            verifier_path = Path(tmp_dir) / 'verifier.py'
-            solution_path = Path(tmp_dir) / 'solution.py'
-            test_cases_path = Path(tmp_dir) / 'test_cases.json'
-
-            verifier_path.write_text(verifier_code, encoding='utf-8')
-            solution_path.write_text(solution_code, encoding='utf-8')
-
-            cmd = [sys.executable, str(verifier_path), str(solution_path)]
-
-            if test_cases is not None:
-                test_cases_path.write_text(
-                    json.dumps(test_cases, ensure_ascii=False), encoding='utf-8'
-                )
-                cmd.append(str(test_cases_path))
-
-            # Merge env_vars into a copy of the current environment.
-            proc_env = None
-            if env_vars:
-                proc_env = {**os.environ, **env_vars}
-
+        _validate_env_vars(job.env_vars)
+        with local_judge(job) as (argv, env, cwd):
             proc = await asyncio.create_subprocess_exec(
-                *cmd,
+                *argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=tmp_dir,
-                env=proc_env,
+                cwd=cwd,
+                env=env,
             )
-
             try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=job.timeout + DEADLINE_GRACE_S
                 )
             except asyncio.TimeoutError as exc:
                 proc.kill()
                 await proc.wait()
-                raise TimeoutError(
-                    f'Async local verifier execution exceeded {timeout}s timeout'
-                ) from exc
-
-            stdout = stdout_bytes.decode('utf-8', errors='replace').strip()
-            stderr = stderr_bytes.decode('utf-8', errors='replace').strip()
-            exit_code = proc.returncode if proc.returncode is not None else -1
-
-            return ExecutionResult(
-                verifier_result=parse_verifier_output(stdout, f'stderr: {stderr!r}'),
-                stderr=stderr,
-                exit_code=exit_code,
-            )
-
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+                raise TimeoutError(f'Async local verifier exceeded {job.timeout}s') from exc
+        stderr_text = stderr.decode('utf-8', errors='replace').strip()
+        return ExecutionResult(
+            parse_verifier_output(
+                stdout.decode('utf-8', errors='replace').strip(), f'stderr: {stderr_text!r}'
+            ),
+            stderr=stderr_text,
+            exit_code=proc.returncode if proc.returncode is not None else -1,
+        )

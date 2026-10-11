@@ -11,6 +11,7 @@ from typing import Literal
 
 from deepgym.benchmark_envs import build_run_requests
 from deepgym.exceptions import DeepGymError, SandboxError, TimeoutError, VerifierError
+from deepgym.judge import JudgeJob
 from deepgym.models import (
     Action,
     BatchResult,
@@ -26,12 +27,9 @@ from deepgym.sandbox import (
     build_run_result,
     cleanup_sandbox,
     create_sandbox,
-    execute_verifier,
-    is_standalone_verifier,
-    setup_sandbox,
+    run_judge_daytona,
 )
 from deepgym.session import DaytonaBackend, LocalBackend, Session, run_episode
-from deepgym.verifier_template import wrap_verifier
 
 logger = logging.getLogger(__name__)
 
@@ -118,54 +116,28 @@ class DeepGym:
     def _run_local(self, env: Environment, model_output: str) -> RunResult:
         """Execute using the local subprocess executor."""
         assert self._local_executor is not None
-
-        # Resolve verifier source.
-        if env.verifier_path is not None:
-            verifier_source = env.verifier_path.read_text(encoding='utf-8')
-        else:
-            verifier_source = env.verifier_code
-
-        # Standalone scripts run directly; simple function bodies get wrapped.
-        if is_standalone_verifier(verifier_source):
-            ready_code = verifier_source
-        else:
-            ready_code = wrap_verifier(verifier_source)
-
         start = time.perf_counter()
-        exec_result = self._local_executor.run(
-            verifier_code=ready_code,
-            solution_code=model_output,
-            test_cases=env.test_cases,
-            timeout=env.timeout,
-            env_vars=env.env_vars,
-        )
-        elapsed_ms = (time.perf_counter() - start) * 1000
-
+        exec_result = self._local_executor.run(JudgeJob.for_environment(env, model_output))
         return build_run_result(
             exec_result.verifier_result,
-            elapsed_ms,
+            (time.perf_counter() - start) * 1000,
             'local',
             stderr=exec_result.stderr,
             exit_code=exec_result.exit_code,
         )
 
     def _run_daytona(self, env: Environment, model_output: str) -> RunResult:
-        """Execute using the Daytona sandbox."""
+        """Execute in a fresh Daytona sandbox, deleted afterwards."""
         sandbox = create_sandbox(env, self._daytona)
-        sandbox_id = getattr(sandbox, 'id', 'unknown')
         start = time.perf_counter()
-
         try:
-            setup_sandbox(sandbox, env, model_output)
-            verifier_result = execute_verifier(
-                sandbox,
-                env.timeout,
-                has_test_cases=env.test_cases is not None,
-                env_vars=env.env_vars,
+            exec_result = run_judge_daytona(sandbox, JudgeJob.for_environment(env, model_output))
+            return build_run_result(
+                exec_result.verifier_result,
+                (time.perf_counter() - start) * 1000,
+                getattr(sandbox, 'id', 'unknown'),
+                exit_code=exec_result.exit_code,
             )
-            elapsed_ms = (time.perf_counter() - start) * 1000
-
-            return build_run_result(verifier_result, elapsed_ms, sandbox_id)
         finally:
             cleanup_sandbox(sandbox, self._daytona)
 

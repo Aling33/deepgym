@@ -18,18 +18,14 @@ import json
 import logging
 import os
 import re
-import subprocess
-import sys
-import tempfile
 import textwrap
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
-from deepgym.exceptions import DeepGymError
-from deepgym.sandbox import is_standalone_verifier
-from deepgym.verifier_template import wrap_verifier
+from deepgym.exceptions import DeepGymError, TimeoutError
+from deepgym.judge import JudgeJob
+from deepgym.sandbox import LocalExecutor
 
 if TYPE_CHECKING:
     from deepgym.core import DeepGym
@@ -414,10 +410,9 @@ class AdversarialTester:
         attack_code: str,
         strategy: str,
     ) -> AttackResult:
-        """Run *attack_code* through *env*'s verifier locally.
+        """Run *attack_code* through *env*'s verifier with the local executor.
 
-        We wrap the verifier with the standard template, write both files
-        to a temporary directory, and invoke the verifier in a subprocess.
+        The attack runs exactly as a real solution would: isolated from the judge.
 
         Parameters
         ----------
@@ -432,77 +427,33 @@ class AdversarialTester:
         -------
         AttackResult
         """
-        verifier_source = _resolve_verifier_source(env)
-        # Standalone verifiers run directly; simple function bodies need wrapping.
-        if is_standalone_verifier(verifier_source):
-            wrapped_verifier = verifier_source
-        else:
-            wrapped_verifier = wrap_verifier(verifier_source)
-
-        with tempfile.TemporaryDirectory(prefix='deepgym_adv_') as tmpdir:
-            tmp = Path(tmpdir)
-            verifier_path = tmp / 'verifier.py'
-            solution_path = tmp / 'solution.py'
-
-            verifier_path.write_text(wrapped_verifier, encoding='utf-8')
-            solution_path.write_text(attack_code, encoding='utf-8')
-
-            # Optionally write test cases.
-            test_cases_arg: list[str] = []
-            if env.test_cases:
-                tc_path = tmp / 'test_cases.json'
-                tc_path.write_text(json.dumps(env.test_cases), encoding='utf-8')
-                test_cases_arg = [str(tc_path)]
-
-            try:
-                proc = subprocess.run(
-                    [sys.executable, str(verifier_path), str(solution_path), *test_cases_arg],
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                )
-                stdout = proc.stdout.strip()
-                # Try to parse JSON output from the verifier.
-                try:
-                    output = json.loads(stdout)
-                    score = float(output.get('score', 0.0))
-                    passed = bool(output.get('passed', False))
-                    details_msg = output.get('details') or ''
-                except (json.JSONDecodeError, ValueError):
-                    score = 0.0
-                    passed = False
-                    details_msg = f'Non-JSON verifier output: {stdout[:200]}'
-
-                exploited = score >= self._pass_threshold
-                detail_lines = [
-                    f'exit_code={proc.returncode}, score={score}, passed={passed}',
-                ]
-                if details_msg:
-                    detail_lines.append(str(details_msg)[:500])
-                if proc.stderr.strip():
-                    detail_lines.append(f'stderr: {proc.stderr.strip()[:300]}')
-
-                return AttackResult(
-                    strategy=strategy,
-                    exploited=exploited,
-                    score=score,
-                    details='\n'.join(detail_lines),
-                )
-
-            except subprocess.TimeoutExpired:
-                return AttackResult(
-                    strategy=strategy,
-                    exploited=False,
-                    score=0.0,
-                    details='Verifier timed out (30 s).',
-                )
-            except Exception as exc:
-                return AttackResult(
-                    strategy=strategy,
-                    exploited=False,
-                    score=0.0,
-                    details=f'Execution error: {type(exc).__name__}: {exc}',
-                )
+        try:
+            result = LocalExecutor().run(JudgeJob.for_environment(env, attack_code))
+        except TimeoutError:
+            return AttackResult(
+                strategy=strategy, exploited=False, score=0.0, details='Verifier timed out.'
+            )
+        except DeepGymError as exc:
+            return AttackResult(
+                strategy=strategy,
+                exploited=False,
+                score=0.0,
+                details=f'Execution error: {type(exc).__name__}: {exc}',
+            )
+        verdict = result.verifier_result
+        detail_lines = [
+            f'exit_code={result.exit_code}, score={verdict.score}, passed={verdict.passed}'
+        ]
+        if verdict.details:
+            detail_lines.append(verdict.details[:500])
+        if result.stderr:
+            detail_lines.append(f'stderr: {result.stderr[:300]}')
+        return AttackResult(
+            strategy=strategy,
+            exploited=verdict.score >= self._pass_threshold,
+            score=verdict.score,
+            details='\n'.join(detail_lines),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -593,19 +544,6 @@ def _parse_exploits(response_text: str) -> list[str]:
     return exploits
 
 
-def _resolve_verifier_source(env: Environment) -> str:
-    """Return the verifier source code for an environment.
-
-    Prefers inline ``verifier_code``; falls back to reading
-    ``verifier_path``.
-    """
-    if env.verifier_code:
-        return env.verifier_code
-    if env.verifier_path is not None:
-        return env.verifier_path.read_text(encoding='utf-8')
-    return ''
-
-
 def _generate_llm_exploits(
     env: Environment,
     *,
@@ -647,7 +585,7 @@ def _generate_llm_exploits(
             'anthropic package is required for LLM attacks. Install with: pip install anthropic'
         ) from exc
 
-    verifier_source = _resolve_verifier_source(env)
+    verifier_source = env.verifier_source
     prompt = _LLM_PROMPT_TEMPLATE.format(
         task=env.task,
         verifier_code=verifier_source,

@@ -1,10 +1,11 @@
 """Verifier for the Climbing Stairs task."""
 
-import importlib.util
 import json
 import random
 import sys
 import time
+
+from deepgym_solution import load_solution
 
 
 def ref_climb(n):
@@ -18,9 +19,7 @@ def ref_climb(n):
 
 def verify(solution_path, test_cases_path=None):
     try:
-        spec = importlib.util.spec_from_file_location('solution', solution_path)
-        solution = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(solution)
+        solution = load_solution(solution_path)
     except Exception as e:
         return {
             'schema_version': '1.0',

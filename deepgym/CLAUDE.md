@@ -9,11 +9,13 @@ src/deepgym/
 ├── models.py            # All Pydantic models (Environment, RunResult, VerifierResult, Job, etc.)
 ├── core.py              # Sync DeepGym client (mode: auto/daytona/local)
 ├── async_core.py        # Async client with semaphore-based concurrency
-├── sandbox.py           # Daytona sandbox lifecycle + LocalExecutor fallback
+├── sandbox.py           # Daytona sandbox lifecycle + local/Daytona verifier executors
+├── judge.py             # Judge/solution layout and isolation (Daytona user, sandbox-exec, bwrap)
+├── solution_runtime.py  # Shipped as deepgym_solution: load_solution/run_solution proxy + server
 ├── session.py           # Live multi-turn sessions (Local/Daytona backends, GUI actions)
 ├── computer_use.py      # ComputerUseEnvironment (desktop, GUI-only actions)
 ├── verifier.py          # Verifier model + protocol validation
-├── verifier_template.py # Wrapper normalizing any verifier to JSON protocol
+├── verifier_template.py # Detect verifier shape (AST) and wrap it to print the JSON protocol
 ├── adversarial.py       # Reward-hack detection (5 attack strategies)
 ├── exceptions.py        # DeepGymError hierarchy
 ├── cli.py               # CLI: run, eval, serve, create
@@ -205,6 +207,7 @@ def run(self, env: Environment, model_output: str) -> RunResult:
 - Never log URLs containing API keys.
 - Use environment variables for all sensitive configuration.
 - Verifier code is untrusted — always run with resource limits (timeout, memory).
+- Verifiers must never import or exec the solution themselves; use `load_solution` / `run_solution` from `deepgym_solution` so it runs isolated from the judge.
 
 ### Git
 

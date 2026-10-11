@@ -12,7 +12,6 @@ Also generates environments/humaneval/registry.json indexing all problems.
 """
 
 import json
-import textwrap
 from pathlib import Path
 
 from datasets import load_dataset
@@ -37,7 +36,7 @@ def generate_verifier(task_id: str, entry_point: str, test_code: str) -> str:
 """DeepGym verifier for {task_id}."""
 import sys
 import json
-import importlib.util
+from deepgym_solution import load_solution, solution_namespace
 
 
 # HumanEval test code (stored as string, executed with solution namespace).
@@ -47,11 +46,9 @@ _TEST_CODE = {test_code_repr}
 def verify(solution_path):
     """Load the solution and run HumanEval tests against it."""
     # Load solution module
-    spec = importlib.util.spec_from_file_location("solution", solution_path)
-    mod = importlib.util.module_from_spec(spec)
-
+    # The solution runs in its own isolated process; calls go through a proxy.
     try:
-        spec.loader.exec_module(mod)
+        mod = load_solution(solution_path)
     except Exception as e:
         return {{"score": 0.0, "passed": False, "details": f"Import error: {{type(e).__name__}}: {{e}}"}}
 
@@ -62,7 +59,7 @@ def verify(solution_path):
 
     # Build a namespace with all solution-level names so the test code
     # can reference helper functions defined in the prompt.
-    ns = dict(vars(mod))
+    ns = solution_namespace(mod)
 
     try:
         # Execute the test code (defines check(candidate)) in the solution namespace
@@ -91,58 +88,58 @@ if __name__ == "__main__":
 
 
 def main():
-    output_dir = Path.home() / ".deepgym" / "environments" / "humaneval"
+    output_dir = Path.home() / '.deepgym' / 'environments' / 'humaneval'
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("Loading HumanEval dataset from HuggingFace...")
-    ds = load_dataset("openai/openai_humaneval", split="test")
-    print(f"Loaded {len(ds)} problems.")
+    print('Loading HumanEval dataset from HuggingFace...')
+    ds = load_dataset('openai/openai_humaneval', split='test')
+    print(f'Loaded {len(ds)} problems.')
 
     registry = []
 
     for row in ds:
-        task_id = row["task_id"].replace("/", "_")
-        entry_point = row["entry_point"]
-        prompt = row["prompt"]
-        canonical = row["canonical_solution"]
-        test_code = row["test"]
+        task_id = row['task_id'].replace('/', '_')
+        entry_point = row['entry_point']
+        prompt = row['prompt']
+        canonical = row['canonical_solution']
+        test_code = row['test']
 
         env_dir = output_dir / task_id
         env_dir.mkdir(exist_ok=True)
 
         # task.md — the problem prompt
-        (env_dir / "task.md").write_text(prompt, encoding="utf-8")
+        (env_dir / 'task.md').write_text(prompt, encoding='utf-8')
 
         # reference_solution.py — prompt + canonical solution (complete runnable file)
-        (env_dir / "reference_solution.py").write_text(
-            prompt + canonical, encoding="utf-8"
+        (env_dir / 'reference_solution.py').write_text(
+            prompt + canonical, encoding='utf-8'
         )
 
         # verifier.py
         verifier_src = generate_verifier(task_id, entry_point, test_code)
-        (env_dir / "verifier.py").write_text(verifier_src, encoding="utf-8")
+        (env_dir / 'verifier.py').write_text(verifier_src, encoding='utf-8')
 
         # metadata.json
         metadata = {
-            "id": task_id,
-            "name": entry_point,
-            "difficulty": "medium",
-            "domain": "coding",
-            "benchmark": "humaneval",
-            "tags": ["humaneval", "function-completion"],
+            'id': task_id,
+            'name': entry_point,
+            'difficulty': 'medium',
+            'domain': 'coding',
+            'benchmark': 'humaneval',
+            'tags': ['humaneval', 'function-completion'],
         }
-        (env_dir / "metadata.json").write_text(
-            json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+        (env_dir / 'metadata.json').write_text(
+            json.dumps(metadata, indent=2) + '\n', encoding='utf-8'
         )
 
-        registry.append({**metadata, "path": f"environments/humaneval/{task_id}"})
+        registry.append({**metadata, 'path': f'environments/humaneval/{task_id}'})
 
     # registry.json
-    (output_dir / "registry.json").write_text(
-        json.dumps(registry, indent=2) + "\n", encoding="utf-8"
+    (output_dir / 'registry.json').write_text(
+        json.dumps(registry, indent=2) + '\n', encoding='utf-8'
     )
-    print(f"Generated {len(registry)} HumanEval environments in {output_dir}")
+    print(f'Generated {len(registry)} HumanEval environments in {output_dir}')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

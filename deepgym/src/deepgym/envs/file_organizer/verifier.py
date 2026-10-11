@@ -6,22 +6,17 @@ import subprocess
 import sys
 import tempfile
 
+from deepgym_solution import read_output, run_solution
+
 
 def verify(solution_path, test_cases_path=None):
     """Verify the solution creates the correct directory structure."""
     work_dir = tempfile.mkdtemp(prefix='deepgym_file_org_')
     project_dir = os.path.join(work_dir, 'project')
 
-    env = os.environ.copy()
-    env['PROJECT_DIR'] = project_dir
-
     try:
-        proc = subprocess.run(
-            [sys.executable, solution_path],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            env=env,
+        proc = run_solution(
+            solution_path, cwd=work_dir, env={'PROJECT_DIR': project_dir}, timeout=15
         )
     except subprocess.TimeoutExpired:
         return {
@@ -47,13 +42,11 @@ def verify(solution_path, test_cases_path=None):
     }
 
     for filepath, expected_heading in expected_content.items():
-        full_path = os.path.join(project_dir, filepath)
-        if os.path.isfile(full_path):
-            with open(full_path) as f:
-                content = f.read()
+        try:
+            content = read_output(os.path.join(project_dir, filepath), work_dir)
             checks[f'{filepath}_exists'] = True
             checks[f'{filepath}_content'] = expected_heading in content
-        else:
+        except OSError:
             checks[f'{filepath}_exists'] = False
             checks[f'{filepath}_content'] = False
 

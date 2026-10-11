@@ -10,7 +10,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from deepgym.models import Environment
-from deepgym.reward_qa import fingerprint_verifier, resolve_verifier_source
+from deepgym.reward_qa import fingerprint_verifier
 
 BenchmarkSplit = Literal['public_train', 'public_eval', 'private_holdout', 'canary']
 
@@ -147,7 +147,7 @@ def build_benchmark_audit(
     for env_id in env_ids:
         env = environments[env_id]
         task_hash = _hash_text(_normalize_text(env.task))
-        verifier_hash = fingerprint_verifier(resolve_verifier_source(env))
+        verifier_hash = fingerprint_verifier(env.verifier_source)
         test_cases_hash = _hash_json(env.test_cases or [])
         content_hash = _hash_text(f'{task_hash}:{verifier_hash}:{test_cases_hash}')
 

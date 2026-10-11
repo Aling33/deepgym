@@ -4,7 +4,7 @@ import os
 import shutil
 import subprocess
 
-REPO_DIR = '/tmp/my_repo'
+REPO_DIR = os.path.abspath('my_repo')
 
 
 def run(cmd, **kwargs):
