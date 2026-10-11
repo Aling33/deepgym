@@ -37,7 +37,7 @@ def generate_verifier(task_id: str, entry_point: str, test_code: str) -> str:
 """DeepGym verifier for {task_id}."""
 import sys
 import json
-import importlib.util
+from deepgym_solution import load_solution
 
 
 # HumanEval test code (stored as string, executed with solution namespace).
@@ -47,11 +47,9 @@ _TEST_CODE = {test_code_repr}
 def verify(solution_path):
     """Load the solution and run HumanEval tests against it."""
     # Load solution module
-    spec = importlib.util.spec_from_file_location("solution", solution_path)
-    mod = importlib.util.module_from_spec(spec)
-
+    # The solution runs in its own isolated process; calls go through a proxy.
     try:
-        spec.loader.exec_module(mod)
+        mod = load_solution(solution_path)
     except Exception as e:
         return {{"score": 0.0, "passed": False, "details": f"Import error: {{type(e).__name__}}: {{e}}"}}
 
@@ -62,7 +60,7 @@ def verify(solution_path):
 
     # Build a namespace with all solution-level names so the test code
     # can reference helper functions defined in the prompt.
-    ns = dict(vars(mod))
+    ns = {{name: getattr(mod, name) for name in dir(mod)}}
 
     try:
         # Execute the test code (defines check(candidate)) in the solution namespace

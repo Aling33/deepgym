@@ -19,111 +19,119 @@ from pathlib import Path
 from datasets import load_dataset
 
 
+# Runs inside the isolated solution process: loads the solution, runs the
+# BigCodeBench unittest code against it, prints one JSON result line.
+_RUNNER_SOURCE = """
+import importlib.util
+import io
+import json
+import sys
+import unittest
+
+
+def main():
+    with open(sys.argv[1]) as handle:
+        spec_data = json.load(handle)
+    real_stdout = sys.stdout
+    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+
+    def report(score, passed, details):
+        real_stdout.write(json.dumps({"score": score, "passed": passed, "details": details}) + "\\n")
+        real_stdout.flush()
+
+    try:
+        spec = importlib.util.spec_from_file_location("solution", sys.argv[2])
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    except Exception as e:
+        return report(0.0, False, f"Import error: {type(e).__name__}: {e}")
+    if not hasattr(mod, spec_data["entry_point"]):
+        return report(0.0, False, f"Missing function: {spec_data['entry_point']}")
+    ns = dict(vars(mod))
+    try:
+        exec(spec_data["test_code"], ns)
+        loader, suite = unittest.TestLoader(), unittest.TestSuite()
+        for obj in list(ns.values()):
+            if isinstance(obj, type) and issubclass(obj, unittest.TestCase) and obj is not unittest.TestCase:
+                suite.addTests(loader.loadTestsFromTestCase(obj))
+        if suite.countTestCases() == 0:
+            return report(1.0, True, "Direct assertion tests passed")
+        result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(suite)
+        failed = len(result.failures) + len(result.errors)
+        score = (result.testsRun - failed) / result.testsRun if result.testsRun else 0.0
+        report(score, score >= 0.8, f"{result.testsRun - failed}/{result.testsRun} tests passed")
+    except AssertionError as e:
+        report(0.0, False, f"Assertion failed: {e}")
+    except Exception as e:
+        report(0.0, False, f"Error: {type(e).__name__}: {e}")
+
+
+main()
+"""
+
+
 def generate_verifier(task_id: str, entry_point: str, test_code: str, libs: list) -> str:
     """Generate a DeepGym-compatible verifier from BigCodeBench test code.
 
-    BigCodeBench tests define unittest.TestCase subclasses that exercise the
-    solution's entry-point function.  The verifier loads the solution module,
-    injects all its public names into the test namespace, discovers TestCase
-    classes, runs them, and reports results via the DeepGym JSON protocol.
-
-    Unlike HumanEval (which uses a simple ``check(candidate)`` pattern),
-    BigCodeBench tests directly call the function by name, so we inject all
-    solution-level names into the exec namespace.
+    BigCodeBench tests inspect rich objects (DataFrames, plots), so the tests
+    and the solution must share a process. The verifier runs both together in
+    the isolated solution process (away from the judge and the host) and reads
+    back one JSON result line. A determined model can still forge that line,
+    so prefer function-level benchmarks (HumanEval, MBPP, EvalPlus) for
+    adversarial RL.
     """
-    # Store test code safely using repr so all quotes/escapes are handled.
-    test_code_repr = repr(test_code)
-
     return f'''#!/usr/bin/env python3
-"""DeepGym verifier for BigCodeBench {task_id}."""
-import sys
+"""DeepGym verifier for BigCodeBench {task_id}.
+
+Tests run with the solution in the isolated process; see the importer docstring
+for why this result is forgeable by a determined model.
+"""
 import json
-import importlib.util
-import unittest
-import io
-import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 
+from deepgym_solution import run_solution
 
-# BigCodeBench test code (stored as string, executed with solution namespace).
-_TEST_CODE = {test_code_repr}
+_TEST_CODE = {test_code!r}
+_ENTRY_POINT = {entry_point!r}
+_RUNNER = {_RUNNER_SOURCE!r}
 
 
 def verify(solution_path):
-    """Load the solution and run BigCodeBench tests against it."""
-    # Load solution module
-    spec = importlib.util.spec_from_file_location("solution", solution_path)
-    mod = importlib.util.module_from_spec(spec)
-
+    """Run the BigCodeBench tests with the solution in the isolated process."""
+    work = tempfile.mkdtemp(prefix="deepgym_bcb_")
     try:
-        spec.loader.exec_module(mod)
-    except Exception as e:
-        return {{"score": 0.0, "passed": False, "details": f"Import error: {{type(e).__name__}}: {{e}}"}}
-
-    if not hasattr(mod, {entry_point!r}):
-        return {{"score": 0.0, "passed": False, "details": "Missing function: {entry_point}"}}
-
-    # Build a namespace with all solution-level names so the test code
-    # can reference the entry-point and any helpers/imports from the solution.
-    ns = dict(vars(mod))
-
-    # Suppress stdout/stderr during test execution to prevent stray prints
-    # from corrupting the JSON protocol output.
-    old_stdout, old_stderr = sys.stdout, sys.stderr
-    sys.stdout = io.StringIO()
-    sys.stderr = io.StringIO()
-
-    try:
-        # Execute the test code (defines TestCase classes) in the solution namespace
-        exec(_TEST_CODE, ns)
-
-        # Discover and run unittest TestCase classes
-        loader = unittest.TestLoader()
-        suite = unittest.TestSuite()
-        for name, obj in ns.items():
-            if isinstance(obj, type) and issubclass(obj, unittest.TestCase) and obj is not unittest.TestCase:
-                suite.addTests(loader.loadTestsFromTestCase(obj))
-
-        if suite.countTestCases() == 0:
-            # No unittest classes found -- test code uses direct assertions
-            # If we got here without exception, they passed.
-            return {{"score": 1.0, "passed": True, "details": "Direct assertion tests passed"}}
-
-        # Run tests
-        stream = io.StringIO()
-        runner = unittest.TextTestRunner(stream=stream, verbosity=0)
-        result = runner.run(suite)
-
-        total = result.testsRun
-        failed = len(result.failures) + len(result.errors)
-        passed = total - failed
-        score = passed / total if total > 0 else 0.0
-
-        details = f"{{passed}}/{{total}} tests passed"
-        if result.failures:
-            details += f". Failures: {{len(result.failures)}}"
-        if result.errors:
-            details += f". Errors: {{len(result.errors)}}"
-
-        return {{"score": score, "passed": score >= 0.8, "details": details}}
-
-    except AssertionError as e:
-        return {{"score": 0.0, "passed": False, "details": f"Assertion failed: {{e}}"}}
-    except Exception as e:
-        return {{"score": 0.0, "passed": False, "details": f"Error: {{type(e).__name__}}: {{e}}"}}
+        Path(work, "runner.py").write_text(_RUNNER, encoding="utf-8")
+        spec = {{"test_code": _TEST_CODE, "entry_point": _ENTRY_POINT}}
+        Path(work, "tests.json").write_text(json.dumps(spec), encoding="utf-8")
+        try:
+            proc = run_solution(
+                str(Path(work, "runner.py")),
+                [str(Path(work, "tests.json")), solution_path],
+                cwd=work,
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            return {{"score": 0.0, "passed": False, "details": "Tests timed out"}}
+        results = [line for line in proc.stdout.splitlines() if line.startswith("{{")]
+        if not results:
+            return {{"score": 0.0, "passed": False, "details": f"No result: {{proc.stderr[-500:]}}"}}
+        return json.loads(results[-1])
     finally:
-        sys.stdout, sys.stderr = old_stdout, old_stderr
+        shutil.rmtree(work, ignore_errors=True)
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(json.dumps({{"score": 0.0, "passed": False, "details": "Usage: verifier.py <solution_path>"}}))
         sys.exit(1)
-
     try:
         result = verify(sys.argv[1])
     except Exception as e:
         result = {{"score": 0.0, "passed": False, "details": f"Verifier error: {{type(e).__name__}}: {{e}}"}}
-
     print(json.dumps(result))
 '''
 

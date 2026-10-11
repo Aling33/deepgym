@@ -102,8 +102,9 @@ Tests: {num_base} base + {num_plus} augmented = {total} total.
 import sys
 sys.set_int_max_str_digits(0)
 import json
-import importlib.util
 import math
+
+from deepgym_solution import load_solution
 
 {data_section}
 NUM_BASE = {num_base}
@@ -132,11 +133,9 @@ def _compare(result, expected, atol):
 
 def verify(solution_path):
     """Load solution and run all EvalPlus test cases against it."""
-    spec = importlib.util.spec_from_file_location("solution", solution_path)
-    mod = importlib.util.module_from_spec(spec)
-
+    # The solution runs in its own isolated process; calls go through a proxy.
     try:
-        spec.loader.exec_module(mod)
+        mod = load_solution(solution_path)
     except Exception as e:
         return {{"score": 0.0, "passed": False,
                 "details": f"Import error: {{type(e).__name__}}: {{e}}"}}
