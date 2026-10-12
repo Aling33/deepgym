@@ -12,6 +12,10 @@ and each dataset row names its environment::
 Build the rows with :func:`verl_rows` and save them with
 ``pandas.DataFrame(rows).to_parquet(path)``.
 
+A failed sandbox or verifier scores 0.0 with ``error: 1.0``, and verl trains on it.
+To keep those samples out of the policy loss, use the agent loop in
+:mod:`deepgym.integrations.verl_mask` instead of the reward function.
+
 For a fixed environment in your own reward module, use
 :func:`make_verl_compute_score`; for custom training loops,
 :func:`make_verl_reward_fn`.
@@ -32,6 +36,7 @@ from typing import Any, Literal
 from deepgym.core import DeepGym
 from deepgym.models import Environment, RunResult
 from deepgym.registry import load_environment
+from deepgym.sandboxes import Provider
 
 _FENCED_BLOCK = re.compile(r'```[\w+-]*\n(.*?)```', re.DOTALL)
 
@@ -62,7 +67,7 @@ def compute_score(
     solution_str: str,
     ground_truth: Any = None,
     extra_info: dict | None = None,
-    mode: Literal['auto', 'daytona', 'local', 'apple'] = 'auto',
+    mode: Literal['auto', 'daytona', 'local'] | Provider = 'auto',
     **kwargs: Any,
 ) -> dict[str, float]:
     """Score one verl response with the DeepGym environment its dataset row names.
@@ -84,7 +89,7 @@ def compute_score(
         The same keys for every row, as verl requires to batch them: ``score``,
         ``passed`` (1.0 or 0.0), and ``error``, which is 1.0 when no verdict was
         produced (sandbox or verifier failure, timeout, invalid score). The score is
-        then 0.0. A reward function can't mask a sample in verl, so watch this metric.
+        then 0.0; :mod:`deepgym.integrations.verl_mask` masks such samples out of the loss.
 
     Raises:
         DeepGymError: If the named environment doesn't exist.

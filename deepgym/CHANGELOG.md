@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **verl masking:** `deepgym.integrations.verl_mask.DeepGymSingleTurnAgentLoop` scores single-turn rows itself and zeroes the response mask of samples whose sandbox or verifier failed (`error: 1.0`), so they get no gradient instead of training as a 0. A verl reward function or reward manager can't drop a sample.
 - **Per-environment images:** set `image` on an `Environment`, a `MultiTurnEnvironment` or in `metadata.json` to boot its sandbox from that image. Docker, Apple container, Modal and Daytona pull it from a registry (a Daytona `snapshot` wins); E2B uses it as a template id. The image must run as root and have python3, bash, useradd and util-linux. The HTTP API refuses caller-chosen images.
 - **Quality gate:** `deepgym qa [ENV ...] [--all]` checks single-turn environments before training: the reference solution scores 1.0 on every rerun, empty and stub solutions score below 1.0, and no heuristic reward-hack attack reaches the pass threshold. `--model` adds pass@1/pass@k from an OpenAI-compatible endpoint and flags tasks that are too easy or too hard. Writes one JSON report per environment to `~/.deepgym/qa/` and exits 1 if any environment fails. `--model` with `--mode local` or `auto` needs `--allow-local-exec`. All 26 built-in single-turn environments pass; the environment smoke test now runs the gate.
 - **Reward-hack attacks** (`AdversarialTester`, `RewardAuditor`, the audit API) run through the `DeepGym` client they're given instead of always running locally, so a Daytona or container client runs them in its sandboxes.

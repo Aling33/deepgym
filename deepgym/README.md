@@ -218,6 +218,24 @@ It runs the last fenced code block of each response and logs `score`, `passed`
 and `error` (1.0 when the sandbox or verifier failed and the score is a forced 0).
 For one fixed environment in your own module, use `make_verl_compute_score(env)`.
 
+A verl reward function or reward manager can't drop a sample, so a failed run
+trains as a 0. To keep those samples out of the policy loss, let DeepGym's
+single-turn agent loop score the rows instead. It zeroes the response mask of any
+sample whose `error` is 1.0, so the sample gets no gradient and adds no tokens to
+the loss, and verl skips its own reward step because the score is already set.
+
+```yaml
+# actor_rollout_ref.rollout.agent.agent_loop_config_path
+- name: deepgym_single_turn
+  _target_: deepgym.integrations.verl_mask.DeepGymSingleTurnAgentLoop
+  mode: daytona   # or auto, local, modal, e2b, docker, apple
+```
+
+Then set `actor_rollout_ref.rollout.agent.default_agent_loop=deepgym_single_turn`.
+The rows are the same `verl_rows`. A masked sample's 0 still counts toward its
+GRPO group's mean and std, and a policy that learns to trigger failures escapes
+their penalty, so keep watching `error`.
+
 For multi-turn agent RL, use DeepGym's agent loop and session tool. verl's stock
 `ToolAgentLoop` creates and releases a tool around every call, so the
 `deepgym_agent` loop keeps one sandbox per rollout, sets `reward_score` from the
