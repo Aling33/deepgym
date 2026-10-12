@@ -9,7 +9,9 @@ container.
 
 from __future__ import annotations
 
-from deepgym.sandboxes.cli import CliContainer
+import json
+
+from deepgym.sandboxes.cli import CliContainer, RunningSandbox
 
 
 class DockerContainer(CliContainer):
@@ -18,4 +20,16 @@ class DockerContainer(CliContainer):
     cli = 'docker'
     run_flags = ('--network', 'none', '--pids-limit', '512', '--security-opt', 'no-new-privileges')
     delete_args = ('rm', '--force')
+    list_args = ('ps', '--filter', 'label=deepgym=1', '--format', '{{json .}}')
     network_blocked = True
+
+    @staticmethod
+    def _parse_listing(output: str) -> list[RunningSandbox]:
+        """Parse ``docker ps --format '{{json .}}'``: one JSON object per line."""
+        rows = [json.loads(line) for line in output.splitlines() if line.strip()]
+        return [
+            RunningSandbox(
+                id=row['Names'], image=row['Image'], state=row['State'], started=row['CreatedAt']
+            )
+            for row in rows
+        ]

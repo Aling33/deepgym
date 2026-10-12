@@ -20,7 +20,8 @@ src/deepgym/
 ├── adversarial.py       # Reward-hack detection (5 attack strategies)
 ├── qa/                  # Quality gate (deepgym qa): checks, difficulty, report, gate
 ├── exceptions.py        # DeepGymError hierarchy
-├── cli.py               # CLI: run, eval, serve, create
+├── cli.py               # CLI: run, eval, serve, create, console
+├── console/             # `deepgym console`: FastAPI routes per concern + sqlite stores; serves console-ui's static build
 └── api/
     ├── app.py           # FastAPI app + API key auth middleware
     ├── routes.py        # Sync + async job endpoints
@@ -28,6 +29,7 @@ src/deepgym/
     └── deps.py          # Dependency injection
 src/deepgym/envs/computer_use/  # Desktop tasks: app/ + setup.sh + verifier.py; _shared/ helpers
 examples/                # 3 example environments with verifiers + solutions
+console-ui/              # Next.js static export (bun, Biome); vendored BoardUI kit in components/base
 ```
 
 ## Commands

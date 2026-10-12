@@ -1,0 +1,192 @@
+@import 'tailwindcss';
+@import '../styles/theme.css';
+@import '../styles/typography.css';
+
+/* Theme flips by the .dark class on <html> (next-themes); components only use semantic tokens. */
+@custom-variant dark (&:where(.dark, .dark *));
+@custom-variant rtl (&:dir(rtl));
+@custom-variant ltr (&:dir(ltr));
+
+/* Console tokens: one accent ramp (#7aa2f7 at 400), Inter Tight for display headings. */
+@theme {
+  --color-accent-50: #f1f5fe;
+  --color-accent-100: #e2eafd;
+  --color-accent-200: #c6d6fb;
+  --color-accent-300: #a3bdf9;
+  --color-accent-400: #7aa2f7;
+  --color-accent-500: #5f88ea;
+  --color-accent-600: #4a70d4;
+  --color-accent-700: #3d5cb0;
+  --color-accent-800: #344d8e;
+  --color-accent-900: #2d4173;
+  --color-accent-950: #1b2747;
+
+  --font-display: var(--font-inter-tight), var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+}
+
+@utility text-mono-label {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 14px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+@utility scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-separator-border) transparent;
+}
+
+/* ----- From BoardUI styles/globals.css (MIT): base, dark elevation, table, checkbox tick ----- */
+html,
+body {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-variant-ligatures: contextual;
+  font-kerning: normal;
+}
+html {
+  color-scheme: light;
+  background-color: var(--color-background-full);
+}
+html.dark {
+  color-scheme: dark;
+}
+body {
+  background-color: var(--color-background-full);
+  color: var(--color-text-primary);
+}
+.dark .shadow-2xs {
+  --tw-shadow: var(--shadow-2xs);
+}
+.dark .shadow-xs {
+  --tw-shadow: var(--shadow-xs);
+}
+.dark .shadow-sm {
+  --tw-shadow: var(--shadow-sm);
+}
+.dark .shadow-md {
+  --tw-shadow: var(--shadow-md);
+}
+.dark .shadow-lg {
+  --tw-shadow: var(--shadow-lg);
+}
+.dark .shadow-xl {
+  --tw-shadow: var(--shadow-xl);
+}
+.dark .shadow-card {
+  --tw-shadow: var(--shadow-card);
+}
+.dark .shadow-dropdown {
+  --tw-shadow: var(--shadow-dropdown);
+}
+.dark .shadow-sidebar {
+  --tw-shadow: var(--shadow-sidebar);
+}
+
+@media (max-width: 639px) {
+  input,
+  select,
+  textarea {
+    font-size: 16px;
+  }
+}
+
+/* In the components layer (BoardUI ships it unlayered) so cell utilities like text colours win. */
+@layer components {
+  .bui-table {
+    @apply w-full border-collapse text-start;
+  }
+  .bui-table th {
+    @apply px-3 py-2.5 text-start align-middle text-body-medium text-text-tertiary whitespace-nowrap outline-none;
+    background-color: var(--color-background-secondary-default);
+    border-top: 1px solid var(--color-separator-border);
+    border-bottom: 1px solid var(--color-separator-border);
+  }
+  .bui-table td {
+    @apply px-3 py-2.5 align-middle text-body-medium text-text-primary outline-none;
+  }
+  .bui-table tbody tr:not(:last-child) {
+    border-bottom: 1px solid var(--color-separator-border);
+  }
+  .bui-table tbody tr {
+    @apply transition-colors duration-150;
+  }
+  .bui-table tbody tr[data-focus-visible] {
+    @apply ring-2 ring-inset ring-border-focus-ring;
+  }
+  .bui-table.bui-table-sm th,
+  .bui-table.bui-table-sm td {
+    @apply px-2.5 py-1.5 text-body-2-medium;
+  }
+}
+
+@keyframes check-draw {
+  from {
+    stroke-dashoffset: 1;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+.animate-check-draw {
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+  animation: check-draw 200ms cubic-bezier(0.65, 0, 0.35, 1) forwards;
+}
+
+.recharts-wrapper {
+  direction: ltr;
+}
+.recharts-wrapper:focus,
+.recharts-wrapper:focus-visible,
+.recharts-wrapper :focus,
+.recharts-wrapper :focus-visible {
+  outline: none;
+}
+
+/* ----- Console additions ----- */
+
+/* React Aria marks rows hoverable only when the table has a row action. */
+.bui-table tbody tr[data-hovered] {
+  cursor: pointer;
+  background-color: var(--color-background-secondary-hover);
+}
+
+/* Charts use the console accent first. */
+:root,
+.dark {
+  --color-chart-1: var(--color-accent-400);
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes text-shimmer {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: -100% 0;
+  }
+}
+
+/* Reduced motion must beat every component's own timing, hence !important. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    /* biome-ignore lint/complexity/noImportantStyles: global reduced-motion override */
+    animation-duration: 0.01ms !important;
+    /* biome-ignore lint/complexity/noImportantStyles: global reduced-motion override */
+    transition-duration: 0.01ms !important;
+  }
+}
