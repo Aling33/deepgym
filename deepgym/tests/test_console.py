@@ -203,10 +203,12 @@ class TestQA:
     ) -> None:
         monkeypatch.setenv('DEEPGYM_QA_DIR', str(tmp_path / 'qa'))
         for env, day, ok in [('fizzbuzz', 1, True), ('two_sum', 3, False), ('cyber/x', 2, True)]:
-            checks = [QACheck(name='reference_passes', passed=True, details='1.00 x3'),
-                      QACheck(name='empty_fails', passed=ok, details='0.00')]  # fmt: skip
-            write_report(QAReport(environment=env, checks=checks,
-                                  created_at=datetime(2026, 10, day, tzinfo=timezone.utc)))  # fmt: skip
+            checks = [
+                QACheck(name='reference_passes', passed=True, details='1.00 x3'),
+                QACheck(name='empty_fails', passed=ok, details='0.00'),
+            ]
+            created_at = datetime(2026, 10, day, tzinfo=timezone.utc)
+            write_report(QAReport(environment=env, checks=checks, created_at=created_at))
         (tmp_path / 'qa' / 'broken.json').write_text('{not json')
 
         reports = client.get('/api/qa').json()
@@ -214,7 +216,11 @@ class TestQA:
 
         assert [r['environment'] for r in reports] == ['two_sum', 'cyber/x', 'fizzbuzz']
         assert [r['passed'] for r in reports] == [False, True, True]
-        assert reports[0]['checks'][1] == {'name': 'empty_fails', 'passed': False, 'details': '0.00'}
+        assert reports[0]['checks'][1] == {
+            'name': 'empty_fails',
+            'passed': False,
+            'details': '0.00',
+        }
         assert [r['environment'] for r in fizzbuzz] == ['fizzbuzz']
 
     def test_missing_dir_is_empty(self, client: TestClient) -> None:
