@@ -9,9 +9,15 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 
-from e2b import CommandExitException, TimeoutException
+from e2b import (
+    CommandExitException,
+    SandboxNotRunningException,
+    SandboxUnreachableException,
+    TimeoutException,
+)
 from e2b import Sandbox as E2BClient
 
+from deepgym.exceptions import SandboxError
 from deepgym.sandboxes.protocol import ExecResult, SandboxTimeoutError
 
 logger = logging.getLogger(__name__)
@@ -55,6 +61,9 @@ class E2BSandbox:
         except CommandExitException as exc:
             # E2B raises on any non-zero exit; that's an ordinary result here.
             return ExecResult(exc.exit_code, exc.stdout + exc.stderr)
+        except (SandboxNotRunningException, SandboxUnreachableException) as exc:
+            # Both subclass TimeoutException, but mean the sandbox is gone.
+            raise SandboxError(f'E2B sandbox {self.id} is not reachable: {exc}') from exc
         except TimeoutException as exc:
             raise SandboxTimeoutError(f'command exceeded {timeout}s') from exc
         return ExecResult(result.exit_code, result.stdout + result.stderr)

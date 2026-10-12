@@ -54,8 +54,14 @@ logger = logging.getLogger(__name__)
 _SANDBOX_WORKDIR = '/tmp/deepgym'
 # Unprivileged user that runs sandbox session commands and file writes.
 _AGENT_USER = 'dgagent'
+# Separate unprivileged user for verifiers, so the agent can't read, signal or write to them.
+_VERIFIER_USER = 'dgverifier'
 # Root-only directory where file writes are staged before the session user copies them.
 _STAGING_DIR = '/opt/deepgym-staging'
+# Verifier scripts: readable by the verifier user only.
+_VERIFIER_DIR = '/opt/deepgym-verifier'
+# The loopback-only network namespace, bind-mounted so it outlives any process.
+_NETNS = '/opt/deepgym-netns'
 _DISPLAY = ':0'
 _STEP_OUTPUT = '_step_output.txt'
 
@@ -80,6 +86,15 @@ class SessionBackend(Protocol):
 
     def write_file(self, path: str, content: bytes) -> None:
         """Write a file relative to the work directory."""
+        ...
+
+    def verify(
+        self, code: str, timeout: int, env: dict[str, str] | None = None, *, quiet: bool = False
+    ) -> ExecResult:
+        """Run verifier *code* in the work directory, out of the agent's reach where possible.
+
+        *quiet* discards the verifier's stderr.
+        """
         ...
 
     def start_desktop(self) -> None:
@@ -140,6 +155,12 @@ class LocalBackend:
         target = self._dir / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
+
+    def verify(
+        self, code: str, timeout: int, env: dict[str, str] | None = None, *, quiet: bool = False
+    ) -> ExecResult:
+        """Run verifier *code* inline; it shares the agent's user here."""
+        return self.exec(_inline_python(self.python, code, quiet=quiet), timeout, env)
 
     def start_desktop(self) -> None:
         """Refuse: the local backend has no display."""
@@ -217,6 +238,12 @@ class DaytonaBackend:
             self._sandbox.fs.upload_file(content, f'{_SANDBOX_WORKDIR}/{path}')
         except Exception as exc:
             raise SandboxError(f'Failed to write {path}: {exc}') from exc
+
+    def verify(
+        self, code: str, timeout: int, env: dict[str, str] | None = None, *, quiet: bool = False
+    ) -> ExecResult:
+        """Run verifier *code* inline; it shares the agent's user here."""
+        return self.exec(_inline_python(self.python, code, quiet=quiet), timeout, env)
 
     def start_desktop(self) -> None:
         """Start Xvfb, xfce, and VNC in the sandbox."""
@@ -297,12 +324,14 @@ os.execvp('sleep', ['sleep', 'infinity'])
 class SandboxBackend:
     """Run actions in a throwaway sandbox from any provider (see :mod:`deepgym.sandboxes`).
 
-    Shell only: no desktop. Commands and file writes run as an unprivileged user with
-    all capabilities dropped, because root owns the binaries every provider exec runs
-    with full privileges, so the agent must never be root. When the provider doesn't
-    block the network itself, every command joins one network namespace that has only
-    loopback, so servers started during setup stay reachable across steps while the
-    internet and the host are not.
+    Shell only: no desktop. Agent commands and file writes run as one unprivileged
+    user and verifiers as another, both with every capability dropped and
+    no-new-privs: root owns the binaries every provider exec runs with full
+    privileges, so the agent must never be root, and a different user means it
+    can't read, signal or write into a verifier. When the provider doesn't block the
+    network itself, everything joins one loopback-only network namespace, so servers
+    started during setup stay reachable across steps while the internet and the host
+    are not.
     """
 
     python = 'python3'
@@ -311,43 +340,53 @@ class SandboxBackend:
         self._sandbox = sandbox
         self.sandbox_id = sandbox.id
         try:
-            user = sandbox.exec(
+            users = sandbox.exec(
+                "command -v setpriv >/dev/null || { echo 'setpriv missing'; exit 1; } && "
                 f'useradd --system --no-create-home --shell /usr/sbin/nologin {_AGENT_USER} && '
+                f'useradd --system --no-create-home --shell /usr/sbin/nologin {_VERIFIER_USER} && '
                 f'mkdir -p {_SANDBOX_WORKDIR} && chown {_AGENT_USER}: {_SANDBOX_WORKDIR} && '
-                f'mkdir -p -m 700 {_STAGING_DIR} && '
-                f'echo "$(id -u {_AGENT_USER}) $(id -g {_AGENT_USER})"',
+                f'mkdir -p -m 700 {_STAGING_DIR} && mkdir -p -m 750 {_VERIFIER_DIR} && '
+                f'chgrp {_VERIFIER_USER} {_VERIFIER_DIR} && '
+                f'echo "$(id -u {_AGENT_USER}) $(id -g {_AGENT_USER}) '
+                f'$(id -u {_VERIFIER_USER}) $(id -g {_VERIFIER_USER})"',
                 timeout=30,
             )
-            if user.exit_code != 0:
-                raise SandboxError(f'Could not create the session user: {user.output[-500:]}')
-            uid, gid = user.output.split()[-2:]
-            self._as_agent = shlex.join([
-                'setpriv', f'--reuid={uid}', f'--regid={gid}', '--clear-groups',
-                '--inh-caps=-all', '--bounding-set=-all', '--',
-            ])  # fmt: skip
-            self._enter = self._as_agent
+            if users.exit_code != 0:
+                raise SandboxError(f'Could not create the session users: {users.output[-500:]}')
+            agent_uid, agent_gid, verifier_uid, verifier_gid = users.output.split()[-4:]
+            self._as_agent = _drop_to(agent_uid, agent_gid)
+            self._as_verifier = _drop_to(verifier_uid, verifier_gid)
+            self._offline = ''
             if not sandbox.network_blocked:
-                namespace = f'/proc/{self._offline_namespace()}/ns/net'
-                self._enter = f'nsenter --net={namespace} -- {self._as_agent}'
+                self._make_offline_namespace()
+                self._offline = f'nsenter --net={_NETNS} -- '
         except BaseException:
             self.close()
             raise
 
-    def _offline_namespace(self) -> str:
-        """Start a root process holding a loopback-only network namespace; return its pid."""
-        holder = self._sandbox.exec(
+    def _make_offline_namespace(self) -> None:
+        """Make a loopback-only network namespace and bind-mount it at ``_NETNS``.
+
+        The holder process brings loopback up, then execs ``sleep``; waiting for that
+        proves the namespace exists and is ready. The bind mount keeps it alive and
+        addressable without trusting a PID that could be reused.
+        """
+        made = self._sandbox.exec(
             f'setsid unshare --net -- python3 -c {shlex.quote(_LOOPBACK_UP_THEN_SLEEP)} '
-            '>/dev/null 2>&1 & echo $!',
+            '>/dev/null 2>&1 & pid=$!; '
+            'for _ in $(seq 100); do '
+            '[ "$(cat /proc/$pid/comm 2>/dev/null)" = sleep ] && break; sleep 0.05; done; '
+            '[ "$(cat /proc/$pid/comm 2>/dev/null)" = sleep ] && '
+            '[ "$(readlink /proc/$pid/ns/net)" != "$(readlink /proc/1/ns/net)" ] && '
+            f'touch {_NETNS} && mount --bind /proc/$pid/ns/net {_NETNS} && '
+            f'nsenter --net={_NETNS} true',
             timeout=30,
         )
-        pid = holder.output.strip().splitlines()[-1]
-        check = self._sandbox.exec(f'nsenter --net=/proc/{pid}/ns/net true', timeout=30)
-        if holder.exit_code != 0 or check.exit_code != 0:
+        if made.exit_code != 0:
             raise SandboxError(
                 'Could not isolate the session network; the image needs util-linux '
-                f'(unshare, nsenter): {check.output[-500:]}'
+                f'(unshare, nsenter, mount): {made.output[-500:]}'
             )
-        return pid
 
     def exec(self, command: str, timeout: int, env: dict[str, str] | None = None) -> ExecResult:
         """Run *command* with bash in the work directory, as the session user, offline.
@@ -356,7 +395,7 @@ class SandboxBackend:
             TimeoutError: If the command exceeds *timeout* seconds.
         """
         return self._sandbox.exec(
-            f'{self._enter} bash -c {shlex.quote(command)}',
+            f'{self._offline}{self._as_agent} bash -c {shlex.quote(command)}',
             cwd=_SANDBOX_WORKDIR,
             env=env,
             timeout=timeout,
@@ -383,6 +422,25 @@ class SandboxBackend:
         if done.exit_code != 0:
             raise SandboxError(f'Failed to write {path}: {done.output[-500:]}')
 
+    def verify(
+        self, code: str, timeout: int, env: dict[str, str] | None = None, *, quiet: bool = False
+    ) -> ExecResult:
+        """Run verifier *code* as the verifier user, from a file only that user can read.
+
+        Raises:
+            TimeoutError: If the verifier exceeds *timeout* seconds.
+        """
+        script = f'{_VERIFIER_DIR}/{uuid4().hex}.py'
+        self._sandbox.upload(code.encode('utf-8'), script)
+        stderr = ' 2>/dev/null' if quiet else ''
+        return self._sandbox.exec(
+            f'{self._offline}{self._as_verifier} {self.python} -I {script}{stderr}; '
+            f'status=$?; rm -f {script}; exit $status',
+            cwd=_SANDBOX_WORKDIR,
+            env=env,
+            timeout=timeout,
+        )
+
     def start_desktop(self) -> None:
         """Refuse: only Daytona has a desktop."""
         raise DeepGymError('Desktop environments need the Daytona backend')
@@ -398,6 +456,14 @@ class SandboxBackend:
     def close(self) -> None:
         """Delete the sandbox."""
         self._sandbox.delete()
+
+
+def _drop_to(uid: str, gid: str) -> str:
+    """Command prefix that drops to *uid*/*gid* with no capabilities and no-new-privs."""
+    return shlex.join([
+        'setpriv', f'--reuid={uid}', f'--regid={gid}', '--clear-groups',
+        '--inh-caps=-all', '--bounding-set=-all', '--no-new-privs', '--',
+    ])  # fmt: skip
 
 
 class Session:
@@ -515,9 +581,8 @@ class Session:
             )
         with self._lock:
             start = time.perf_counter()
-            exit_code, stdout = self._backend.exec(
-                _inline_python(self._backend.python, self._env.final_verifier_code),
-                self._env.timeout_per_step,
+            exit_code, stdout = self._backend.verify(
+                self._env.final_verifier_code, self._env.timeout_per_step
             )
             result = parse_verifier_output(stdout, f'exit_code={exit_code}')
             elapsed_ms = (time.perf_counter() - start) * 1000
@@ -598,10 +663,11 @@ class Session:
         """
         self._backend.write_file(_STEP_OUTPUT, output.encode('utf-8'))
         try:
-            stdout = self._backend.exec(
-                _inline_python(self._backend.python, self._env.step_verifier_code) + ' 2>/dev/null',
+            stdout = self._backend.verify(
+                self._env.step_verifier_code,
                 self._env.timeout_per_step,
                 env={'STEP_OUTPUT_PATH': _STEP_OUTPUT, 'STEP_NUMBER': str(self._step)},
+                quiet=True,
             ).output.strip()
         except TimeoutError as exc:
             raise VerifierError(f'Step verifier timed out at step {self._step}') from exc
@@ -659,15 +725,15 @@ def _checked(what: str, result: ExecResult) -> str:
     return result.output
 
 
-def _inline_python(python: str, code: str) -> str:
+def _inline_python(python: str, code: str, *, quiet: bool = False) -> str:
     """Build a command that runs *code* isolated (-I) without writing it to disk.
 
     Verifiers never touch the sandbox filesystem, so an agent process can't swap
-    the file between upload and execution.
+    the file between upload and execution. *quiet* discards stderr.
     """
     encoded = base64.b64encode(code.encode('utf-8')).decode('ascii')
     loader = f"import base64;exec(compile(base64.b64decode('{encoded}'),'<verifier>','exec'))"
-    return f'{python} -I -c "{loader}"'
+    return f'{python} -I -c "{loader}"' + (' 2>/dev/null' if quiet else '')
 
 
 def _signals_done(output: str) -> bool:

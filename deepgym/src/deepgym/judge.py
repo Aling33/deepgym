@@ -232,7 +232,8 @@ def sandbox_isolation(setup_output: str, *, require_offline: bool = False) -> tu
     """Turn SANDBOX_SETUP's output into (isolation spec, python path).
 
     The solution runs as the unprivileged solver user with every capability
-    dropped and, where the sandbox allows it, in its own network namespace
+    dropped and no-new-privs (a setuid binary can't regain root) and, where the
+    sandbox allows it, in its own network namespace
     (loopback only: no internet, no host).
 
     Raises:
@@ -245,7 +246,7 @@ def sandbox_isolation(setup_output: str, *, require_offline: bool = False) -> tu
             '(unshare, setpriv)'
         )
     drop = ['setpriv', f'--reuid={uid}', f'--regid={gid}', '--clear-groups']
-    drop += ['--inh-caps=-all', '--bounding-set=-all', '--']
+    drop += ['--inh-caps=-all', '--bounding-set=-all', '--no-new-privs', '--']
     offline = ['unshare', '--net', '--'] if netns == '1' else []
     if judge_uid == '0':
         prefix = [*offline, *drop]

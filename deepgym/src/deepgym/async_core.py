@@ -585,7 +585,8 @@ class AsyncDeepGym:
             raise
         except Exception as exc:
             raise SandboxError(f'Failed to set up the judge: {exc}') from exc
-        command, env = sandbox_judge(job, setup.result)
+        # Daytona doesn't block the network itself, so refuse to judge online.
+        command, env = sandbox_judge(job, setup.result, require_offline=True)
         try:
             response = await sandbox.process.exec(
                 command, env=env, timeout=job.timeout + DEADLINE_GRACE_S

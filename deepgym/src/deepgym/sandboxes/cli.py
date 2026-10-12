@@ -36,11 +36,16 @@ class CliContainer:
 
     def __init__(self, image: str = DEFAULT_IMAGE) -> None:
         self.id = f'deepgym-{uuid4().hex[:12]}'
-        started = self._cli(
-            'run', '--detach', '--rm', '--name', self.id, '--label', 'deepgym=1',
-            *_LIMITS, *self.run_flags, image, 'sleep', 'infinity',
-            timeout=_START_TIMEOUT_S,
-        )  # fmt: skip
+        try:
+            started = self._cli(
+                'run', '--detach', '--rm', '--name', self.id, '--label', 'deepgym=1',
+                *_LIMITS, *self.run_flags, image, 'sleep', 'infinity',
+                timeout=_START_TIMEOUT_S,
+            )  # fmt: skip
+        except subprocess.TimeoutExpired as exc:
+            # The container may still come up after we stop waiting; don't leak it.
+            self.delete()
+            raise SandboxError(f'Container did not start within {_START_TIMEOUT_S}s') from exc
         if started.returncode != 0:
             raise SandboxError(f'Failed to start container: {started.stderr.decode()[-1000:]}')
 
@@ -95,10 +100,13 @@ class CliContainer:
             SandboxError: If the write fails.
         """
         script = 'mkdir -p "$(dirname "$1")" && cat > "$1"'
-        done = self._cli(
-            'exec', '--interactive', self.id, 'sh', '-c', script, 'upload', path,
-            input=content, timeout=120,
-        )  # fmt: skip
+        try:
+            done = self._cli(
+                'exec', '--interactive', self.id, 'sh', '-c', script, 'upload', path,
+                input=content, timeout=120,
+            )  # fmt: skip
+        except subprocess.TimeoutExpired as exc:
+            raise SandboxError(f'Upload of {path} timed out') from exc
         if done.returncode != 0:
             raise SandboxError(f'Failed to upload {path}: {done.stderr.decode()[-500:]}')
 

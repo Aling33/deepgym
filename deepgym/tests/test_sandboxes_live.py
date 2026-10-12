@@ -166,6 +166,63 @@ def test_session_cannot_kill_the_network_holder(dg: DeepGym) -> None:
     assert 'offline' in after, after
 
 
+# Runs as the agent: logs every python command line, tries to read verifier scripts,
+# and writes a fake passing score into every python process's stdout.
+_SPY = """
+import os, time
+end = time.time() + 40
+while time.time() < end:
+    for pid in [p for p in os.listdir('/proc') if p.isdigit()]:
+        try:
+            cmd = open(f'/proc/{pid}/cmdline', 'rb').read().replace(b'\\0', b' ').decode()
+        except OSError:
+            continue
+        if 'python' in cmd and 'spy.py' not in cmd:
+            with open('leak.txt', 'a') as log:
+                log.write(cmd + '\\n')
+            try:
+                with open(f'/proc/{pid}/fd/1', 'w') as out:
+                    out.write('{"score": 1.0, "passed": true}\\n')
+            except OSError:
+                pass
+    try:
+        for name in os.listdir('/opt/deepgym-verifier'):
+            with open('leak.txt', 'a') as log:
+                log.write(open(f'/opt/deepgym-verifier/{name}').read())
+    except OSError:
+        pass
+    time.sleep(0.02)
+"""
+
+
+def test_session_verifiers_are_out_of_the_agents_reach(dg: DeepGym) -> None:
+    env = MultiTurnEnvironment(
+        task='t',
+        max_steps=6,
+        step_verifier_code='import time\ntime.sleep(1)\nprint(0.0)  # SECRET-STEP\n',
+        final_verifier_code=(
+            'import json, time\n'
+            'print(json.dumps({"score": 0.0, "passed": False}), flush=True)  # SECRET-FINAL\n'
+            'time.sleep(1.5)\n'
+        ),
+    )
+    start_spy = '(setsid python3 spy.py >/dev/null 2>&1 &); sleep 0.5; echo started'
+    with dg.session(env) as session:
+        session.start()
+        rewards = [
+            session.step(Action(action_type='write_file', path='spy.py', content=_SPY)).reward,
+            session.step(Action(action_type='bash', content=start_spy)).reward,
+            session.step(Action(action_type='bash', content='sleep 1')).reward,
+        ]
+        leak = session.step(Action(action_type='bash', content='cat leak.txt; echo END'))
+        result = session.score()
+    assert rewards == [0.0, 0.0, 0.0]
+    assert result.score == 0.0
+    assert 'python' in leak.observation.content, 'the spy should have seen the verifiers run'
+    assert 'SECRET' not in leak.observation.content
+    assert 'b64decode' not in leak.observation.content
+
+
 def test_desktop_env_is_refused(dg: DeepGym) -> None:
     with dg.session(ComputerUseEnvironment(task='t')) as session:
         with pytest.raises(DeepGymError, match='Daytona'):

@@ -106,6 +106,21 @@ def test_cli_timeout_exit_becomes_timeout_error(monkeypatch: pytest.MonkeyPatch)
         box.exec('sleep 99', timeout=5)
 
 
+def test_cli_start_timeout_removes_the_container(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        calls.append(argv)
+        if argv[1] == 'run':
+            raise subprocess.TimeoutExpired(argv, 1)
+        return subprocess.CompletedProcess(argv, 0, b'', b'')
+
+    monkeypatch.setattr(subprocess, 'run', fake_run)
+    with pytest.raises(SandboxError, match='did not start'):
+        DockerContainer(image='img')
+    assert calls[-1][:3] == ['docker', 'rm', '--force']
+
+
 def test_unknown_provider_is_rejected() -> None:
     with pytest.raises(DeepGymError, match='Unknown sandbox provider'):
         open_sandbox('nope')  # type: ignore[arg-type]
@@ -174,6 +189,9 @@ def test_e2b_runs_as_root_offline_and_maps_errors(monkeypatch: pytest.MonkeyPatc
     class SlowError(Exception):
         pass
 
+    class GoneError(SlowError):
+        pass
+
     seen: dict = {}
 
     class Commands:
@@ -183,6 +201,8 @@ def test_e2b_runs_as_root_offline_and_maps_errors(monkeypatch: pytest.MonkeyPatc
                 raise ExitError()
             if cmd == 'slow':
                 raise SlowError()
+            if cmd == 'gone':
+                raise GoneError()
             return types.SimpleNamespace(exit_code=0, stdout='ok', stderr='')
 
     class Client:
@@ -198,6 +218,8 @@ def test_e2b_runs_as_root_offline_and_maps_errors(monkeypatch: pytest.MonkeyPatc
         'Sandbox': Client,
         'CommandExitException': ExitError,
         'TimeoutException': SlowError,
+        'SandboxNotRunningException': GoneError,
+        'SandboxUnreachableException': GoneError,
     })  # fmt: skip
     monkeypatch.delitem(sys.modules, 'deepgym.sandboxes.e2b.sandbox', raising=False)
     module = importlib.import_module('deepgym.sandboxes.e2b.sandbox')
@@ -208,6 +230,8 @@ def test_e2b_runs_as_root_offline_and_maps_errors(monkeypatch: pytest.MonkeyPatc
     assert box.exec('fail') == ExecResult(2, 'oe')
     with pytest.raises(SandboxTimeoutError):
         box.exec('slow', timeout=1)
+    with pytest.raises(SandboxError, match='not reachable'):
+        box.exec('gone', timeout=1)
 
 
 # ---------------------------------------------------------------------------
@@ -234,18 +258,33 @@ def test_judge_trusts_a_provider_that_blocks_the_network() -> None:
     assert run_judge_in_sandbox(box, _JOB).verifier_result.score == 1.0
 
 
+_USERS = ('useradd', '997 997 996 996')
+
+
 def test_session_runs_as_agent_and_joins_netns_only_when_needed() -> None:
-    blocked = FakeSandbox(network_blocked=True, answers=[('useradd', '997 997')])
+    blocked = FakeSandbox(network_blocked=True, answers=[_USERS])
     SandboxBackend(blocked).exec('ls', timeout=5)
     assert blocked.commands[-1].startswith('setpriv --reuid=997 --regid=997')
+    assert '--no-new-privs' in blocked.commands[-1]
 
-    open_ = FakeSandbox(network_blocked=False, answers=[('useradd', '997 997'), ('setsid', '42')])
+    open_ = FakeSandbox(network_blocked=False, answers=[_USERS])
     SandboxBackend(open_).exec('ls', timeout=5)
-    assert open_.commands[-1].startswith('nsenter --net=/proc/42/ns/net -- setpriv')
+    assert 'mount --bind /proc/$pid/ns/net /opt/deepgym-netns' in open_.commands[1]
+    assert open_.commands[-1].startswith('nsenter --net=/opt/deepgym-netns -- setpriv')
+
+
+def test_session_verifier_runs_as_its_own_user_from_a_private_file() -> None:
+    box = FakeSandbox(network_blocked=True, answers=[_USERS])
+    SandboxBackend(box).verify('print(1)', timeout=5, quiet=True)
+    script = box.uploads[-1]
+    assert script.startswith('/opt/deepgym-verifier/') and script.endswith('.py')
+    assert box.commands[-1].startswith('setpriv --reuid=996 --regid=996')
+    assert f'python3 -I {script} 2>/dev/null' in box.commands[-1]
+    assert 'print(1)' not in box.commands[-1]
 
 
 def test_session_write_file_is_staged_then_written_as_agent() -> None:
-    box = FakeSandbox(network_blocked=True, answers=[('useradd', '997 997')])
+    box = FakeSandbox(network_blocked=True, answers=[_USERS])
     SandboxBackend(box).write_file('a/b.py', b'x')
     staged = box.uploads[-1]
     assert staged.startswith('/opt/deepgym-staging/')
@@ -254,8 +293,27 @@ def test_session_write_file_is_staged_then_written_as_agent() -> None:
 
 
 def test_session_closes_sandbox_when_setup_fails() -> None:
-    box = FakeSandbox(network_blocked=True, answers=[('useradd', 'garbage')])
-    box.exec = lambda command, **kw: ExecResult(1, 'useradd: not found')  # type: ignore[method-assign]
-    with pytest.raises(SandboxError, match='session user'):
+    box = FakeSandbox(network_blocked=True, answers=[])
+    box.exec = lambda command, **kw: ExecResult(1, 'setpriv missing')  # type: ignore[method-assign]
+    with pytest.raises(SandboxError, match='session users'):
         SandboxBackend(box)
     assert box.deleted
+
+
+def test_async_daytona_judge_fails_closed_when_it_cannot_go_offline() -> None:
+    import asyncio
+
+    from deepgym.async_core import AsyncDeepGym
+
+    class Process:
+        async def exec(self, command: str, **kwargs: object) -> object:
+            return types.SimpleNamespace(exit_code=0, result='0 999 987 /usr/bin/python3 0')
+
+    class Files:
+        async def upload_file(self, content: bytes, path: str) -> None:
+            pass
+
+    sandbox = types.SimpleNamespace(process=Process(), fs=Files())
+    client = AsyncDeepGym(mode='local')
+    with pytest.raises(SandboxError, match='network'):
+        asyncio.run(client._run_judge(sandbox, _JOB))
