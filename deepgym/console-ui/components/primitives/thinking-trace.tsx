@@ -26,10 +26,15 @@ export function ThinkingTrace({ label, rows, selected, onSelect }: ThinkingTrace
   const [open, setOpen] = useState(true);
   const list = useRef<HTMLDivElement>(null);
 
+  // Scroll only the trace list (scrollIntoView would also scroll the page).
   useEffect(() => {
-    list.current
-      ?.querySelector<HTMLElement>(`[data-index="${selected}"]`)
-      ?.scrollIntoView({ block: 'nearest' });
+    const box = list.current;
+    const row = box?.querySelector<HTMLElement>(`[data-index="${selected}"]`);
+    if (!box || !row) return;
+    if (row.offsetTop < box.scrollTop) box.scrollTop = row.offsetTop;
+    else if (row.offsetTop + row.offsetHeight > box.scrollTop + box.clientHeight) {
+      box.scrollTop = row.offsetTop + row.offsetHeight - box.clientHeight;
+    }
   }, [selected]);
 
   return (

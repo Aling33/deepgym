@@ -17,6 +17,10 @@ from deepgym.models import Environment
 logger = logging.getLogger(__name__)
 
 _MAX_WORKERS = 4
+LOCAL_CUSTOM_CODE_DISABLED = (
+    'Local runs of custom code are disabled. Pick a sandbox provider (docker, apple, daytona, '
+    'modal or e2b), or restart the console with --allow-local-exec.'
+)
 
 
 class Runner:
@@ -29,23 +33,32 @@ class Runner:
         self._clients: dict[RunMode, DeepGym] = {}
         self._lock = threading.Lock()
 
+    @property
+    def allow_local_exec(self) -> bool:
+        """Whether custom solutions may run on this machine."""
+        return self._allow_local_exec
+
     def client(self, mode: RunMode) -> DeepGym:
         """Return the client for *mode*, creating it on first use.
 
         Raises:
-            DeepGymError: If the provider can't be used here, or it would run code on
-                this machine and the console wasn't started with ``--allow-local-exec``.
+            DeepGymError: If the provider can't be used on this machine.
         """
         with self._lock:
             if mode not in self._clients:
                 self._clients[mode] = DeepGym(mode=mode)
-            dg = self._clients[mode]
-        if dg.backend == 'local' and not self._allow_local_exec:
-            raise DeepGymError(
-                f"mode='{mode}' runs solutions on this machine; restart the console with "
-                '--allow-local-exec to allow it, or pick a sandbox provider'
-            )
-        return dg
+            return self._clients[mode]
+
+    def check_allowed(self, dg: DeepGym, custom_code: bool) -> None:
+        """Refuse custom code on this machine unless the console allows local execution.
+
+        Reference solutions ship with DeepGym, so they may always run locally.
+
+        Raises:
+            DeepGymError: If custom code would run locally without ``--allow-local-exec``.
+        """
+        if custom_code and dg.backend == 'local' and not self._allow_local_exec:
+            raise DeepGymError(LOCAL_CUSTOM_CODE_DISABLED)
 
     def submit(
         self, dg: DeepGym, mode: RunMode, jobs: Sequence[tuple[RunSpec, Environment]]

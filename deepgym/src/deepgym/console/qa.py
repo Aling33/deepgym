@@ -1,4 +1,4 @@
-"""QA routes: reports that ``deepgym qa`` writes to ~/.deepgym/qa/*.json."""
+"""QA routes: the per-environment reports ``deepgym qa`` writes (see deepgym.qa.report)."""
 
 from __future__ import annotations
 
@@ -9,11 +9,9 @@ from fastapi import APIRouter
 from pydantic import ValidationError
 
 from deepgym.console.deps import QADirDep
-from deepgym.console.schemas import QAReport
+from deepgym.qa.report import QAReport
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_QA_DIR = Path.home() / '.deepgym' / 'qa'
 
 router = APIRouter(prefix='/qa', tags=['qa'])
 
@@ -23,12 +21,11 @@ def load_reports(qa_dir: Path) -> list[QAReport]:
     reports: list[QAReport] = []
     for path in sorted(qa_dir.glob('*.json')):
         try:
-            report = QAReport.model_validate_json(path.read_text(encoding='utf-8'))
+            reports.append(QAReport.model_validate_json(path.read_text(encoding='utf-8')))
         except (OSError, ValidationError) as exc:
             logger.warning('Skipping QA report %s: %s', path, exc)
-            continue
-        reports.append(report.model_copy(update={'file': path.name}))
-    return sorted(reports, key=lambda report: report.created_at, reverse=True)
+    # timestamp() also orders hand-written reports whose time has no zone.
+    return sorted(reports, key=lambda report: report.created_at.timestamp(), reverse=True)
 
 
 @router.get('', response_model=list[QAReport])

@@ -1,28 +1,27 @@
-"""Tests for the console API: environments, runs, sandboxes, QA reports and UI serving."""
+"""Tests for the console API: environments, runs, sandboxes and QA reports."""
 
 import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
-from deepgym.console import app as console_app
-from deepgym.console.app import create_app
 from deepgym.console.run_store import RunStore
 from deepgym.console.schemas import RunSpec
+from deepgym.qa.report import QACheck, QAReport, write_report
 from deepgym.sandboxes.apple import AppleContainer
 from deepgym.sandboxes.docker import DockerContainer
+from tests.console_client import make_client
 
-REVERSE_OK = 'def reverse_string(s: str) -> str:\n    return s[::-1]\n'
 REVERSE_WRONG = 'def reverse_string(s: str) -> str:\n    return s\n'
 
 
 @pytest.fixture()
 def client(tmp_path: Path) -> TestClient:
-    """Console with a temp database and QA dir, allowed to run solutions locally."""
-    app = create_app(tmp_path / 'console.db', tmp_path / 'qa', allow_local_exec=True)
-    with TestClient(app) as test_client:
+    """Console allowed to run custom solutions locally."""
+    with make_client(tmp_path, allow_local_exec=True) as test_client:
         yield test_client
 
 
@@ -127,25 +126,42 @@ class TestRuns:
         assert client.post('/api/runs', json=body).status_code == code
         assert client.get('/api/runs').json() == []
 
-    def test_local_runs_need_opt_in(self, tmp_path: Path) -> None:
-        client = TestClient(create_app(tmp_path / 'c.db', tmp_path / 'qa'))
-        response = client.post('/api/runs', json={'environments': ['fizzbuzz'], 'mode': 'local'})
-        assert response.status_code == 400
-        assert '--allow-local-exec' in response.json()['detail']
-
     def test_unknown_run_is_404(self, client: TestClient) -> None:
         assert client.get('/api/runs/nope').status_code == 404
 
     def test_restart_fails_unfinished_runs(self, tmp_path: Path) -> None:
-        db = tmp_path / 'console.db'
         spec = RunSpec(environment='fizzbuzz', solution='pass', reference=False)
-        (run,) = RunStore(db).create_group([spec], 'local', 'local')
+        (run,) = RunStore(tmp_path / 'console.db').create_group([spec], 'local', 'local')
 
-        client = TestClient(create_app(db, tmp_path / 'qa'))
-        detail = client.get(f'/api/runs/{run.id}').json()
+        detail = make_client(tmp_path).get(f'/api/runs/{run.id}').json()
 
         assert detail['status'] == 'failed'
         assert detail['error_type'] == 'interrupted'
+
+
+class TestLocalExecPolicy:
+    """Without --allow-local-exec only shipped reference solutions run on this machine."""
+
+    def test_custom_local_solution_is_refused(self, tmp_path: Path) -> None:
+        client = make_client(tmp_path)
+        body = {'environments': ['reverse_string'], 'mode': 'local', 'solution': REVERSE_WRONG}
+
+        response = client.post('/api/runs', json=body)
+
+        assert response.status_code == 400
+        assert '--allow-local-exec' in response.json()['detail']
+        assert 'docker' in response.json()['detail']
+        assert client.get('/api/runs').json() == []
+
+    def test_reference_still_runs_locally(self, tmp_path: Path) -> None:
+        client = make_client(tmp_path)
+        response = client.post('/api/runs', json={'environments': ['fizzbuzz'], 'mode': 'local'})
+        assert response.status_code == 202
+
+    @pytest.mark.parametrize('allowed', [True, False])
+    def test_config_reports_policy(self, tmp_path: Path, allowed: bool) -> None:
+        config = make_client(tmp_path, allow_local_exec=allowed).get('/api/runs/config').json()
+        assert config == {'local_custom_code': allowed}
 
 
 class TestSandboxes:
@@ -155,9 +171,14 @@ class TestSandboxes:
         for provider in listing:
             assert provider['available'] or provider['error']
 
-    @pytest.mark.parametrize('path', ['docker/not-ours', 'apple/deepgym-x;rm', 'modal/deepgym-ab'])
-    def test_kill_rejects_foreign_names(self, client: TestClient, path: str) -> None:
-        assert client.delete(f'/api/sandboxes/{path}').status_code == 422
+    @pytest.mark.parametrize('name', ['not-ours', 'deepgym-x;rm', 'deepgym-', 'my-deepgym-ab12'])
+    def test_kill_refuses_other_names(self, client: TestClient, name: str) -> None:
+        response = client.delete(f'/api/sandboxes/docker/{name}')
+        assert response.status_code == 400
+        assert 'not a DeepGym sandbox' in response.json()['detail']
+
+    def test_kill_refuses_unknown_provider(self, client: TestClient) -> None:
+        assert client.delete('/api/sandboxes/modal/deepgym-ab12').status_code == 422
 
     def test_parse_docker_listing(self) -> None:
         line = {'Names': 'deepgym-ab12', 'Image': 'python:3.12-slim', 'State': 'running',
@@ -177,51 +198,24 @@ class TestSandboxes:
 
 
 class TestQA:
-    def test_reports_newest_first_and_filtered(self, client: TestClient, tmp_path: Path) -> None:
-        qa_dir = tmp_path / 'qa'
-        qa_dir.mkdir()
-        for name, env, created in [('a.json', 'fizzbuzz', '2026-10-01T00:00:00Z'),
-                                   ('b.json', 'fizzbuzz', '2026-10-02T00:00:00'),
-                                   ('c.json', 'two_sum', '2026-10-03T00:00:00+00:00')]:  # fmt: skip
-            report = {'environment': env, 'passed': env == 'two_sum', 'created_at': created,
-                      'checks': [{'name': 'reference passes', 'passed': True, 'details': 'ok'}]}  # fmt: skip
-            (qa_dir / name).write_text(json.dumps(report))
-        (qa_dir / 'broken.json').write_text('{not json')
+    def test_reads_reports_written_by_deepgym_qa(
+        self, client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv('DEEPGYM_QA_DIR', str(tmp_path / 'qa'))
+        for env, day, ok in [('fizzbuzz', 1, True), ('two_sum', 3, False), ('cyber/x', 2, True)]:
+            checks = [QACheck(name='reference_passes', passed=True, details='1.00 x3'),
+                      QACheck(name='empty_fails', passed=ok, details='0.00')]  # fmt: skip
+            write_report(QAReport(environment=env, checks=checks,
+                                  created_at=datetime(2026, 10, day, tzinfo=timezone.utc)))  # fmt: skip
+        (tmp_path / 'qa' / 'broken.json').write_text('{not json')
 
         reports = client.get('/api/qa').json()
         fizzbuzz = client.get('/api/qa?environment=fizzbuzz').json()
 
-        assert [r['file'] for r in reports] == ['c.json', 'b.json', 'a.json']
-        assert reports[0]['checks'][0]['name'] == 'reference passes'
-        assert [r['file'] for r in fizzbuzz] == ['b.json', 'a.json']
+        assert [r['environment'] for r in reports] == ['two_sum', 'cyber/x', 'fizzbuzz']
+        assert [r['passed'] for r in reports] == [False, True, True]
+        assert reports[0]['checks'][1] == {'name': 'empty_fails', 'passed': False, 'details': '0.00'}
+        assert [r['environment'] for r in fizzbuzz] == ['fizzbuzz']
 
     def test_missing_dir_is_empty(self, client: TestClient) -> None:
         assert client.get('/api/qa').json() == []
-
-
-class TestServing:
-    def test_missing_ui_explains_how_to_build(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(console_app, 'STATIC_DIR', tmp_path / 'static')
-        client = TestClient(create_app(tmp_path / 'c.db', tmp_path / 'qa'))
-        response = client.get('/')
-        assert response.status_code == 503
-        assert 'bun run build' in response.text
-
-    def test_serves_built_ui(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        static = tmp_path / 'static'
-        (static / 'runs').mkdir(parents=True)
-        (static / 'index.html').write_text('<html>console</html>')
-        (static / 'runs' / 'index.html').write_text('<html>runs</html>')
-        monkeypatch.setattr(console_app, 'STATIC_DIR', static)
-        client = TestClient(create_app(tmp_path / 'c.db', tmp_path / 'qa'))
-
-        assert client.get('/').text == '<html>console</html>'
-        assert client.get('/runs/').text == '<html>runs</html>'
-        assert client.get('/api/qa').json() == []
-
-    def test_rejects_foreign_host_headers(self, tmp_path: Path) -> None:
-        app = create_app(tmp_path / 'c.db', tmp_path / 'qa', allowed_hosts=['127.0.0.1'])
-        assert TestClient(app, base_url='http://evil.example').get('/api/qa').status_code == 400
-        assert TestClient(app, base_url='http://127.0.0.1').get('/api/qa').status_code == 200

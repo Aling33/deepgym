@@ -128,8 +128,8 @@ export interface QACheck {
   details: string;
 }
 
+/** One environment's `deepgym qa` verdict (src/deepgym/qa/report.py); a lone "skipped" check means not checkable. */
 export interface QAReport {
-  file: string;
   environment: string;
   passed: boolean;
   checks: QACheck[];

@@ -25,6 +25,7 @@ interface NewRunDialogProps {
 
 function NewRunForm({ initialEnv, onClose, onCreated }: Omit<NewRunDialogProps, 'open'>) {
   const { data } = useApi<EnvironmentSummary[]>('/environments?kind=single-turn');
+  const { data: config } = useApi<{ local_custom_code: boolean }>('/runs/config');
   const [selected, setSelected] = useState(() => new Set(initialEnv ? [initialEnv] : []));
   const [mode, setMode] = useState<RunMode>('local');
   const [source, setSource] = useState<'reference' | 'custom'>('reference');
@@ -32,7 +33,12 @@ function NewRunForm({ initialEnv, onClose, onCreated }: Omit<NewRunDialogProps, 
   const [error, setError] = useState<string>();
   const [submitting, setSubmitting] = useState(false);
 
-  const ready = selected.size > 0 && (source === 'reference' || solution.trim() !== '');
+  // Custom code may only run on this machine when the console was started with --allow-local-exec.
+  const localBlocked = source === 'custom' && config?.local_custom_code === false;
+  const ready =
+    selected.size > 0 &&
+    (source === 'reference' || solution.trim() !== '') &&
+    !(localBlocked && mode === 'local');
   const submit = async () => {
     setSubmitting(true);
     setError(undefined);
@@ -93,6 +99,13 @@ function NewRunForm({ initialEnv, onClose, onCreated }: Omit<NewRunDialogProps, 
           onChange={setSolution}
           inputClassName="font-mono text-body-2-regular"
         />
+      )}
+      {localBlocked && (mode === 'local' || mode === 'auto') && (
+        <p className="rounded-2lg bg-status-yellow-background px-3 py-2 text-body-2-medium text-status-yellow-text">
+          Local runs of custom code are disabled. Pick docker, apple, daytona, modal or e2b, or restart the
+          console with <code className="font-mono">--allow-local-exec</code>.
+          {mode === 'auto' && ' Auto runs locally unless DAYTONA_API_KEY is set.'}
+        </p>
       )}
       {error && (
         <p

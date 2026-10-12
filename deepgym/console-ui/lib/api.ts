@@ -14,13 +14,28 @@ async function errorMessage(response: Response): Promise<string> {
   return response.statusText || `HTTP ${response.status}`;
 }
 
-/** Call `/api{path}`; JSON in, JSON out. Throws an Error with the API's message on a non-2xx response. */
-export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const response = await fetch(`/api${path}`, {
-    ...init,
-    headers: init.body ? { 'Content-Type': 'application/json', ...init.headers } : init.headers,
-  });
+/**
+ * The per-launch token the console writes into each page; every API call must send it.
+ * `bun run dev` pages come from Next instead, so they read NEXT_PUBLIC_DEEPGYM_TOKEN.
+ */
+const token = (): string =>
+  document.querySelector<HTMLMetaElement>('meta[name="deepgym-token"]')?.content ??
+  process.env.NEXT_PUBLIC_DEEPGYM_TOKEN ??
+  '';
+
+/** Fetch `/api{path}` with the console token; throws an Error with the API's message on a non-2xx response. */
+export async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers);
+  headers.set('X-DeepGym-Token', token());
+  if (init.body) headers.set('Content-Type', 'application/json');
+  const response = await fetch(`/api${path}`, { ...init, headers });
   if (!response.ok) throw new Error(await errorMessage(response));
+  return response;
+}
+
+/** Call `/api{path}`: JSON in, JSON out. */
+export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const response = await apiFetch(path, init);
   return (response.status === 204 ? undefined : await response.json()) as T;
 }
 

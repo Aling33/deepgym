@@ -6,7 +6,14 @@ from fastapi import APIRouter, HTTPException, Query, status
 
 from deepgym.console.deps import RunnerDep, RunStoreDep
 from deepgym.console.environments import reference_solution
-from deepgym.console.schemas import RunCreate, RunDetail, RunSpec, RunStatus, RunSummary
+from deepgym.console.schemas import (
+    RunConfig,
+    RunCreate,
+    RunDetail,
+    RunSpec,
+    RunStatus,
+    RunSummary,
+)
 from deepgym.exceptions import DeepGymError
 from deepgym.models import Environment
 from deepgym.registry import load_environment
@@ -19,6 +26,7 @@ def start_runs(body: RunCreate, runner: RunnerDep) -> list[RunSummary]:
     """Queue one run per environment; nothing is queued if any environment is unusable."""
     try:
         dg = runner.client(body.mode)
+        runner.check_allowed(dg, custom_code=body.solution is not None)
     except DeepGymError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     jobs = [_plan(name, body.solution) for name in body.environments]
@@ -48,6 +56,12 @@ def _plan(name: str, solution: str | None) -> tuple[RunSpec, Environment]:
             detail=f'{name} has no reference solution; pass a solution',
         )
     return RunSpec(environment=name, solution=code, reference=solution is None), env
+
+
+@router.get('/config', response_model=RunConfig)
+def run_config(runner: RunnerDep) -> RunConfig:
+    """Tell the UI whether custom solutions may run on this machine."""
+    return RunConfig(local_custom_code=runner.allow_local_exec)
 
 
 @router.get('', response_model=list[RunSummary])

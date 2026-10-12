@@ -56,15 +56,20 @@ class QAReport(BaseModel):
         return 'PASS' if self.passed else 'FAIL'
 
 
+def report_dir() -> Path:
+    """Directory QA reports live in: ``$DEEPGYM_QA_DIR``, default ``~/.deepgym/qa``."""
+    return Path(os.environ.get('DEEPGYM_QA_DIR') or Path.home() / '.deepgym' / 'qa')
+
+
 def write_report(report: QAReport) -> Path:
-    """Write *report* to ``$DEEPGYM_QA_DIR/<env>.json`` (default ``~/.deepgym/qa``).
+    """Write *report* to ``<report_dir()>/<env>.json``.
 
     Slashes in the environment name become underscores in the file name.
 
     Returns:
         Path of the written file.
     """
-    directory = Path(os.environ.get('DEEPGYM_QA_DIR') or Path.home() / '.deepgym' / 'qa')
+    directory = report_dir()
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f'{report.environment.replace("/", "_")}.json'
     path.write_text(report.model_dump_json(indent=2) + '\n', encoding='utf-8')

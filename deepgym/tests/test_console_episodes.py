@@ -7,8 +7,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from deepgym.console import record_episode
-from deepgym.console.app import create_app
 from deepgym.models import Action, Observation, RunResult, Trajectory
+from tests.console_client import make_client
 
 PNG = b'\x89PNG\r\n\x1a\n fake image bytes'
 
@@ -42,8 +42,8 @@ def db(tmp_path: Path) -> Path:
 
 
 @pytest.fixture()
-def client(db: Path, tmp_path: Path) -> TestClient:
-    return TestClient(create_app(db, tmp_path / 'qa'))
+def client(tmp_path: Path) -> TestClient:
+    return make_client(tmp_path)
 
 
 def test_post_and_replay(client: TestClient) -> None:

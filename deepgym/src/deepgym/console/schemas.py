@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 from deepgym.models import Action, RunResult, Trajectory
 from deepgym.sandboxes.cli import RunningSandbox
@@ -49,6 +48,13 @@ class RunCreate(BaseModel):
     mode: RunMode = 'local'
     solution: str | None = None
     """Solution source; None runs each environment's reference solution."""
+
+
+class RunConfig(BaseModel):
+    """What the console allows when starting runs."""
+
+    local_custom_code: bool
+    """Whether custom solutions may run on this machine (--allow-local-exec)."""
 
 
 class RunSpec(BaseModel):
@@ -137,29 +143,3 @@ class ProviderSandboxes(BaseModel):
     available: bool
     error: str | None = None
     sandboxes: list[RunningSandbox] = Field(default_factory=list)
-
-
-class QACheck(BaseModel):
-    """One check in a QA report."""
-
-    name: str
-    passed: bool
-    details: str = ''
-
-
-class QAReport(BaseModel):
-    """A QA report file from ~/.deepgym/qa/."""
-
-    model_config = ConfigDict(frozen=True)
-
-    file: str = ''
-    environment: str
-    passed: bool
-    checks: list[QACheck] = Field(default_factory=list)
-    created_at: datetime
-
-    @field_validator('created_at')
-    @classmethod
-    def assume_utc(cls, value: datetime) -> datetime:
-        """Read a timestamp without a zone as UTC, so all reports sort together."""
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)

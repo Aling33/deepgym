@@ -698,12 +698,15 @@ deepgym console --port 8080 --allow-local-exec   # http://127.0.0.1:8080
 
 - **Sandboxes:** live `deepgym-*` containers from Docker and Apple `container`,
   with kill. Cloud sandboxes are not listed.
-- **QA:** checks per environment, read from `~/.deepgym/qa/*.json`.
+- **QA:** the verdicts `deepgym qa` writes to `~/.deepgym/qa/` (or `$DEEPGYM_QA_DIR`).
 
-Runs and episodes are stored in `~/.deepgym/console.db`. `--allow-local-exec` is
-needed for `mode='local'`; without it, pick a sandbox provider. When bound to
-`127.0.0.1` the console only answers requests addressed to localhost. The JSON API
-is under `/api` (docs at `/docs`). `deepgym web` is an alias.
+Runs and episodes are stored in `~/.deepgym/console.db`. Reference solutions may
+run locally, but a pasted solution only runs on your machine with
+`--allow-local-exec`; otherwise pick a sandbox provider. The console has no login,
+so other websites can't drive it: every `/api` call needs the per-launch token the
+console writes into its pages (`X-DeepGym-Token`), writes from other origins are
+refused, and when bound to `127.0.0.1` it only answers requests addressed to
+localhost. `deepgym web` is an alias.
 
 The UI lives in `console-ui/` (Next.js static export, built with bun) and ships
 prebuilt in wheels. From a clone, build it once with
