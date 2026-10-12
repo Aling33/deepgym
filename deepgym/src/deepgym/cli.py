@@ -9,6 +9,7 @@ import sys
 import time
 from pathlib import Path
 
+from deepgym.judge import local_isolation_kind
 from deepgym.sandboxes import PROVIDERS
 
 
@@ -402,8 +403,6 @@ def _guard_local_model_code(mode: str, allowed: bool) -> None:
     'auto' counts as local because it silently falls back to local execution.
     With the opt-in but no sandbox-exec or bwrap, print a warning and continue.
     """
-    from deepgym.judge import local_isolation_kind
-
     if not allowed:
         print(
             f'Error: --model runs model-generated code, and --mode {mode} can run it on this '

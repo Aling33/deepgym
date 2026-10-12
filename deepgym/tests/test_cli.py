@@ -320,7 +320,7 @@ class TestCLIQALocalExecGuard:
         assert '--allow-local-exec' in err
         assert '--mode docker' in err
 
-    @pytest.mark.parametrize('isolation', ['macos', 'none'])
+    @pytest.mark.parametrize('isolation', ['bwrap', 'none'])
     def test_model_with_the_flag_proceeds(
         self,
         isolation: str,
@@ -334,7 +334,7 @@ class TestCLIQALocalExecGuard:
 
         client = ZaiChatClient('key', model='m', transport=httpx.MockTransport(handler))
         monkeypatch.setattr('deepgym.qa.client_from_env', lambda model: client)
-        monkeypatch.setattr('deepgym.judge.local_isolation_kind', lambda: isolation)
+        monkeypatch.setattr('deepgym.cli.local_isolation_kind', lambda: isolation)
         monkeypatch.setenv('DEEPGYM_QA_DIR', str(tmp_path))
         args = ['deepgym', 'qa', 'reverse_string', '--model', 'm', '--samples', '2']
         args += ['--reruns', '0', '--allow-local-exec']
