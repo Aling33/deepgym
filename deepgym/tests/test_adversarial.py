@@ -193,3 +193,25 @@ class TestAdversarialTesterIntegration:
         for r in report.results:
             assert isinstance(r, AttackResult)
             assert r.strategy in ('empty', 'trivial')
+
+
+class TestAttacksUseTheClient:
+    """Attacks run on the tester's DeepGym client, not a hard-wired local executor."""
+
+    def test_attacks_go_through_dg_run(self) -> None:
+        class RecordingDeepGym(DeepGym):
+            def __init__(self) -> None:
+                super().__init__(mode='local')
+                self.outputs: list[str] = []
+
+            def run(self, env, model_output, **kwargs):
+                self.outputs.append(model_output)
+                return super().run(env, model_output, **kwargs)
+
+        dg = RecordingDeepGym()
+        env = Environment(task='Anything', verifier_code='return 1.0\n')
+
+        report = AdversarialTester(dg).test(env, strategies=['empty', 'trivial'])
+
+        assert len(dg.outputs) == 2
+        assert report.exploits_found == 2

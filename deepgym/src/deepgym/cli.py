@@ -95,7 +95,7 @@ def _build_parser() -> argparse.ArgumentParser:
         '--mode',
         default='local',
         choices=['local', 'daytona', 'auto', *PROVIDERS],
-        help='Where verifiers run (reward-hack attacks always run locally)',
+        help='Where verifiers and solutions run (default: local)',
     )
     qa_p.add_argument(
         '--reruns', type=int, default=3, help='Extra reference runs for the determinism check'
@@ -107,6 +107,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     qa_p.add_argument(
         '--samples', type=int, default=8, help='Completions per environment for --model'
+    )
+    qa_p.add_argument(
+        '--allow-local-exec',
+        action='store_true',
+        help='Let --model run model-generated code on this machine (--mode local or auto)',
     )
     qa_p.add_argument('--json', action='store_true', help='Print the reports as JSON')
 
@@ -372,6 +377,8 @@ def _cmd_qa(args: argparse.Namespace) -> None:
     if args.reruns < 0 or args.samples < 2:
         print('Error: --reruns must be >= 0 and --samples >= 2', file=sys.stderr)
         sys.exit(1)
+    if args.model and args.mode in ('local', 'auto'):
+        _guard_local_model_code(args.mode, args.allow_local_exec)
 
     client = client_from_env(args.model) if args.model else None
     dg = DeepGym(mode=args.mode)
@@ -387,6 +394,30 @@ def _cmd_qa(args: argparse.Namespace) -> None:
         print(format_table(reports))
     if not all(report.passed for report in reports):
         sys.exit(1)
+
+
+def _guard_local_model_code(mode: str, allowed: bool) -> None:
+    """Exit unless the user opted in to running model-generated code on this machine.
+
+    'auto' counts as local because it silently falls back to local execution.
+    With the opt-in but no sandbox-exec or bwrap, print a warning and continue.
+    """
+    from deepgym.judge import local_isolation_kind
+
+    if not allowed:
+        print(
+            f'Error: --model runs model-generated code, and --mode {mode} can run it on this '
+            'machine. Use a sandboxed mode (--mode docker, apple, daytona, modal or e2b), '
+            'or pass --allow-local-exec to accept the risk.',
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if local_isolation_kind() == 'none':
+        print(
+            'WARNING: no sandbox-exec or bwrap on this machine. Model-generated code will run '
+            'with only process separation and can read your files.',
+            file=sys.stderr,
+        )
 
 
 def _cmd_benchmark_audit(args: argparse.Namespace) -> None:

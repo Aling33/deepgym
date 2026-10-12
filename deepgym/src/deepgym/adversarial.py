@@ -24,8 +24,6 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel, Field
 
 from deepgym.exceptions import DeepGymError, TimeoutError
-from deepgym.judge import JudgeJob
-from deepgym.sandbox import LocalExecutor
 
 if TYPE_CHECKING:
     from deepgym.core import DeepGym
@@ -127,9 +125,9 @@ class AdversarialTester:
     Parameters
     ----------
     dg:
-        A :class:`~deepgym.core.DeepGym` client instance.  Currently used
-        for configuration only — attacks are executed locally in a
-        subprocess for speed.
+        A :class:`~deepgym.core.DeepGym` client instance.  Each attack runs
+        through it, so it lands in the same backend (local subprocess or
+        sandbox) as a real solution would.
     pass_threshold:
         Score at or above which the attack is deemed to have exploited the
         verifier.  Defaults to ``0.5``.
@@ -143,6 +141,7 @@ class AdversarialTester:
         api_key: str | None = None,
         model: str = 'claude-haiku-4-5-20251001',
     ) -> None:
+        self._dg = dg
         self._pass_threshold = pass_threshold
         self._api_key = api_key
         self._model = model
@@ -410,7 +409,7 @@ class AdversarialTester:
         attack_code: str,
         strategy: str,
     ) -> AttackResult:
-        """Run *attack_code* through *env*'s verifier with the local executor.
+        """Run *attack_code* through *env*'s verifier on this tester's client.
 
         The attack runs exactly as a real solution would: isolated from the judge.
 
@@ -428,7 +427,7 @@ class AdversarialTester:
         AttackResult
         """
         try:
-            result = LocalExecutor().run(JudgeJob.for_environment(env, attack_code))
+            result = self._dg.run(env, attack_code)
         except TimeoutError:
             return AttackResult(
                 strategy=strategy, exploited=False, score=0.0, details='Verifier timed out.'
@@ -440,18 +439,17 @@ class AdversarialTester:
                 score=0.0,
                 details=f'Execution error: {type(exc).__name__}: {exc}',
             )
-        verdict = result.verifier_result
         detail_lines = [
-            f'exit_code={result.exit_code}, score={verdict.score}, passed={verdict.passed}'
+            f'exit_code={result.exit_code}, score={result.score}, passed={result.passed}'
         ]
-        if verdict.details:
-            detail_lines.append(verdict.details[:500])
+        if result.output:
+            detail_lines.append(result.output[:500])
         if result.stderr:
             detail_lines.append(f'stderr: {result.stderr[:300]}')
         return AttackResult(
             strategy=strategy,
-            exploited=verdict.score >= self._pass_threshold,
-            score=verdict.score,
+            exploited=result.score >= self._pass_threshold,
+            score=result.score,
             details='\n'.join(detail_lines),
         )
 

@@ -5,9 +5,11 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
 import pytest
 
 from deepgym.cli import _build_parser, _read_file_or_string, main
+from deepgym.integrations.zai import ZaiChatClient
 
 ENVS_DIR = Path(__file__).resolve().parent.parent / 'src' / 'deepgym' / 'envs'
 
@@ -299,3 +301,48 @@ class TestCLIQASubcommand:
             main()
 
         assert exc_info.value.code == 1
+
+
+class TestCLIQALocalExecGuard:
+    """`deepgym qa --model` refuses to run model code locally without --allow-local-exec."""
+
+    @pytest.mark.parametrize('mode', ['local', 'auto'])
+    def test_model_in_local_mode_needs_the_flag(
+        self, mode: str, capsys: pytest.CaptureFixture
+    ) -> None:
+        args = ['deepgym', 'qa', 'reverse_string', '--model', 'm', '--mode', mode]
+
+        with patch.object(sys, 'argv', args), pytest.raises(SystemExit) as exc_info:
+            main()
+
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert '--allow-local-exec' in err
+        assert '--mode docker' in err
+
+    @pytest.mark.parametrize('isolation', ['macos', 'none'])
+    def test_model_with_the_flag_proceeds(
+        self,
+        isolation: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            answer = '```python\ndef reverse_string(s):\n    return s[::-1]\n```'
+            return httpx.Response(200, json={'choices': [{'message': {'content': answer}}]})
+
+        client = ZaiChatClient('key', model='m', transport=httpx.MockTransport(handler))
+        monkeypatch.setattr('deepgym.qa.client_from_env', lambda model: client)
+        monkeypatch.setattr('deepgym.judge.local_isolation_kind', lambda: isolation)
+        monkeypatch.setenv('DEEPGYM_QA_DIR', str(tmp_path))
+        args = ['deepgym', 'qa', 'reverse_string', '--model', 'm', '--samples', '2']
+        args += ['--reruns', '0', '--allow-local-exec']
+
+        with patch.object(sys, 'argv', args), pytest.raises(SystemExit) as exc_info:
+            main()
+
+        assert exc_info.value.code == 1  # every sample solved: too_easy
+        captured = capsys.readouterr()
+        assert 'difficulty: too_easy: pass@1=1.00 pass@2=1.00' in captured.out
+        assert ('WARNING: no sandbox-exec or bwrap' in captured.err) is (isolation == 'none')

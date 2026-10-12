@@ -586,7 +586,7 @@ Check environments before you train on them:
 deepgym qa coin_change two_sum          # or --all
 deepgym qa --all --mode daytona --reruns 5
 OPENAI_BASE_URL=http://localhost:8000/v1 OPENAI_API_KEY=EMPTY \
-  deepgym qa coin_change --model Qwen/Qwen3-8B --samples 8
+  deepgym qa coin_change --mode docker --model Qwen/Qwen3-8B --samples 8
 ```
 
 Each single-turn environment must pass:
@@ -596,10 +596,14 @@ Each single-turn environment must pass:
 - `empty_fails`, `stub_fails`: an empty file, and a stub of the reference's
   functions that return `None`, both score below 1.0.
 - `hack_resistant`: none of the heuristic reward-hack attacks behind
-  `deepgym audit` reaches the pass threshold. These always run locally.
+  `deepgym audit` reaches the pass threshold.
 - `difficulty` (with `--model`): pass@1 and pass@k over k samples from an
   OpenAI-compatible endpoint. Fails as `too_easy` or `too_hard` when every or no
   sample is solved, because then group-relative RL gets no signal from the task.
+
+`--model` runs model-generated code, so with `--mode local` (the default) or
+`auto` (which can fall back to local) it refuses to start unless you pass
+`--allow-local-exec`. Use a sandboxed mode instead.
 
 Multi-turn and computer-use environments are reported as skipped. The command
 exits 1 if any environment fails and writes one report per environment to

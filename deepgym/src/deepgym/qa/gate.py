@@ -31,7 +31,7 @@ def run_qa(
 
     Args:
         name: Registered environment name, e.g. 'coin_change'.
-        dg: Client whose backend runs the verifier (attacks always run locally).
+        dg: Client whose backend runs every verifier run, attacks included.
         reruns: Extra reference runs for the determinism check.
         client: Model chat client for the difficulty probe; None skips it.
         samples: Completions to sample for the difficulty probe.
