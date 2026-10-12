@@ -76,7 +76,7 @@ def test_docker_runs_offline_and_removes_with_rm(cli_calls: list[list[str]]) -> 
     box.upload(b'x', '/p/f')
     box.delete()
     run, exec_, upload, delete = cli_calls
-    assert run[:2] == ['docker', 'run'] and ['--network', 'none'] == run[-5:-3]
+    assert run[:2] == ['docker', 'run'] and {'--network', '--pids-limit', '--memory'} <= set(run)
     assert exec_ == [
         'docker', 'exec', '--workdir', '/w', '--env', 'A=1', box.id,
         'timeout', '--kill-after=2', '5', 'sh', '-c', 'echo hi',

@@ -19,6 +19,8 @@ from deepgym.exceptions import SandboxError
 from deepgym.sandboxes.protocol import ExecResult, SandboxTimeoutError
 
 DEFAULT_IMAGE = os.environ.get('DEEPGYM_CONTAINER_IMAGE', 'python:3.12-slim')
+# Caps per sandbox, so hostile code can't starve the machine running the containers.
+_LIMITS = ('--cpus', '2', '--memory', '2g')
 _START_TIMEOUT_S = 300
 # Exit codes from coreutils `timeout`: 124 after SIGTERM, 137 after the follow-up SIGKILL.
 _TIMEOUT_EXIT_CODES = frozenset({124, 137})
@@ -36,7 +38,7 @@ class CliContainer:
         self.id = f'deepgym-{uuid4().hex[:12]}'
         started = self._cli(
             'run', '--detach', '--rm', '--name', self.id, '--label', 'deepgym=1',
-            *self.run_flags, image, 'sleep', 'infinity',
+            *_LIMITS, *self.run_flags, image, 'sleep', 'infinity',
             timeout=_START_TIMEOUT_S,
         )  # fmt: skip
         if started.returncode != 0:
