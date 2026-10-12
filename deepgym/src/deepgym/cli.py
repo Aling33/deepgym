@@ -9,6 +9,8 @@ import sys
 import time
 from pathlib import Path
 
+from deepgym.sandboxes import PROVIDERS
+
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -84,6 +86,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help='Optional SQLite path for persisted audits',
     )
     audit_p.add_argument('--json', action='store_true', help='Print machine-readable JSON only')
+
+    # ── qa ────────────────────────────────────────────────────────────
+    qa_p = sub.add_parser('qa', help='Quality-gate environments before training on them')
+    qa_p.add_argument('envs', nargs='*', metavar='ENV', help='Registered environment names')
+    qa_p.add_argument('--all', action='store_true', help='Check every registered environment')
+    qa_p.add_argument(
+        '--mode',
+        default='local',
+        choices=['local', 'daytona', 'auto', *PROVIDERS],
+        help='Where verifiers run (reward-hack attacks always run locally)',
+    )
+    qa_p.add_argument(
+        '--reruns', type=int, default=3, help='Extra reference runs for the determinism check'
+    )
+    qa_p.add_argument(
+        '--model',
+        default=None,
+        help='Probe difficulty with this model via OPENAI_BASE_URL / OPENAI_API_KEY',
+    )
+    qa_p.add_argument(
+        '--samples', type=int, default=8, help='Completions per environment for --model'
+    )
+    qa_p.add_argument('--json', action='store_true', help='Print the reports as JSON')
 
     # ── benchmark-audit ───────────────────────────────────────────────
     bench_p = sub.add_parser(
@@ -333,6 +358,35 @@ def _cmd_audit(args: argparse.Namespace) -> None:
         print(json.dumps(report.model_dump(), indent=2))
         return
     _print_verifier_audit(report)
+
+
+def _cmd_qa(args: argparse.Namespace) -> None:
+    from deepgym.core import DeepGym
+    from deepgym.qa import client_from_env, format_table, run_qa, write_report
+    from deepgym.registry import entry_label, list_environments
+
+    names = [entry_label(entry) for entry in list_environments()] if args.all else args.envs
+    if not names:
+        print('Error: name at least one environment or pass --all', file=sys.stderr)
+        sys.exit(1)
+    if args.reruns < 0 or args.samples < 2:
+        print('Error: --reruns must be >= 0 and --samples >= 2', file=sys.stderr)
+        sys.exit(1)
+
+    client = client_from_env(args.model) if args.model else None
+    dg = DeepGym(mode=args.mode)
+    reports = []
+    for name in names:
+        report = run_qa(name, dg, reruns=args.reruns, client=client, samples=args.samples)
+        write_report(report)
+        reports.append(report)
+
+    if args.json:
+        print(json.dumps([report.model_dump(mode='json') for report in reports], indent=2))
+    else:
+        print(format_table(reports))
+    if not all(report.passed for report in reports):
+        sys.exit(1)
 
 
 def _cmd_benchmark_audit(args: argparse.Namespace) -> None:
@@ -596,6 +650,7 @@ _COMMANDS = {
     'audit': _cmd_audit,
     'benchmark-audit': _cmd_benchmark_audit,
     'generate-prm': _cmd_generate_prm,
+    'qa': _cmd_qa,
     'run': _cmd_run,
     'run-batch': _cmd_run_batch,
     'eval': _cmd_eval,

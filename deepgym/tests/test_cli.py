@@ -27,6 +27,7 @@ class TestCLIHelp:
             ['deepgym', 'eval', '--help'],
             ['deepgym', 'create', '--help'],
             ['deepgym', 'run-batch', '--help'],
+            ['deepgym', 'qa', '--help'],
         ],
     )
     def test_help_exits_zero(self, args: list[str], capsys: pytest.CaptureFixture) -> None:
@@ -256,3 +257,45 @@ class TestCLIAuditSubcommand:
         data = json.loads(capsys.readouterr().out)
         assert data['contamination_risk'] is True
         assert len(data['leaks']) >= 1
+
+
+class TestCLIQASubcommand:
+    """Verify `deepgym qa` writes reports and sets the exit code."""
+
+    def test_qa_json_output_and_report_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        monkeypatch.setenv('DEEPGYM_QA_DIR', str(tmp_path))
+        args = ['deepgym', 'qa', 'reverse_string', 'signup_form', '--reruns', '1', '--json']
+
+        with patch.object(sys, 'argv', args):
+            main()
+
+        data = json.loads(capsys.readouterr().out)
+        assert [(r['environment'], r['passed']) for r in data] == [
+            ('reverse_string', True),
+            ('signup_form', True),
+        ]
+        saved = json.loads((tmp_path / 'reverse_string.json').read_text(encoding='utf-8'))
+        assert saved['checks'] == data[0]['checks']
+
+    def test_qa_exits_one_when_an_env_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        monkeypatch.setenv('DEEPGYM_QA_DIR', str(tmp_path))
+
+        with (
+            patch.object(sys, 'argv', ['deepgym', 'qa', 'no_such_env']),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
+        assert exc_info.value.code == 1
+        assert 'no_such_env: load:' in capsys.readouterr().out
+        assert (tmp_path / 'no_such_env.json').exists()
+
+    def test_qa_requires_an_env(self) -> None:
+        with patch.object(sys, 'argv', ['deepgym', 'qa']), pytest.raises(SystemExit) as exc_info:
+            main()
+
+        assert exc_info.value.code == 1

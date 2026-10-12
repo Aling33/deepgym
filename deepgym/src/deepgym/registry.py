@@ -235,14 +235,14 @@ def _entry_tokens(entry: dict) -> set[str]:
     return tokens
 
 
-def _entry_label(entry: dict) -> str:
+def entry_label(entry: dict) -> str:
     """Registry path without the 'environments/' prefix, e.g. 'humaneval_plus/HumanEval_0'."""
     return str(entry.get('path', '')).removeprefix('environments/')
 
 
 def _entry_keys(entry: dict) -> set[str]:
     """Fully qualified names that pick exactly this entry (slash/underscore-insensitive)."""
-    names = {str(entry.get('path', '')), _entry_label(entry)}
+    names = {str(entry.get('path', '')), entry_label(entry)}
     if entry.get('benchmark') and entry.get('id'):
         names.add(f'{entry["benchmark"]}/{entry["id"]}')
     return {name.replace('/', '_').lower() for name in names if name}
@@ -480,7 +480,7 @@ def load_environment(name: str, variant: int = 0) -> Environment | ComputerUseEn
         if env_dir is not None:
             candidates.setdefault(env_dir.resolve(), (env_dir, entry))
     if len(candidates) > 1:
-        options = sorted(_entry_label(entry) for _, entry in candidates.values())
+        options = sorted(entry_label(entry) for _, entry in candidates.values())
         raise ValueError(f'Environment name {name!r} is ambiguous; use one of: {options}')
     if candidates:
         env_dir, entry = next(iter(candidates.values()))

@@ -578,6 +578,42 @@ Verifiers print JSON to stdout:
 denser signal than 0 or 1. A verifier that returns a float or bool is wrapped
 into this format automatically.
 
+## Quality gate
+
+Check environments before you train on them:
+
+```bash
+deepgym qa coin_change two_sum          # or --all
+deepgym qa --all --mode daytona --reruns 5
+OPENAI_BASE_URL=http://localhost:8000/v1 OPENAI_API_KEY=EMPTY \
+  deepgym qa coin_change --model Qwen/Qwen3-8B --samples 8
+```
+
+Each single-turn environment must pass:
+
+- `reference_passes`: its `reference_solution.py` scores 1.0.
+- `deterministic`: the reference scores the same on every rerun.
+- `empty_fails`, `stub_fails`: an empty file, and a stub of the reference's
+  functions that return `None`, both score below 1.0.
+- `hack_resistant`: none of the heuristic reward-hack attacks behind
+  `deepgym audit` reaches the pass threshold. These always run locally.
+- `difficulty` (with `--model`): pass@1 and pass@k over k samples from an
+  OpenAI-compatible endpoint. Fails as `too_easy` or `too_hard` when every or no
+  sample is solved, because then group-relative RL gets no signal from the task.
+
+Multi-turn and computer-use environments are reported as skipped. The command
+exits 1 if any environment fails and writes one report per environment to
+`~/.deepgym/qa/<env>.json` (set `DEEPGYM_QA_DIR` to change it):
+
+```json
+{
+  "environment": "coin_change",
+  "passed": true,
+  "checks": [{"name": "reference_passes", "passed": true, "details": "score 1.00 (25/25 passed)"}],
+  "created_at": "2026-10-12T16:45:34Z"
+}
+```
+
 ## CLI
 
 ```bash
@@ -594,7 +630,7 @@ The server won't start without auth configured. Set `DEEPGYM_API_KEY` for
 production or `DEEPGYM_NO_AUTH=true` for local development.
 `--allow-local-exec` is required when running without Daytona.
 
-Other commands: `run-batch`, `eval`, `create`, `audit`, `benchmark-audit`,
+Other commands: `run-batch`, `eval`, `create`, `audit`, `qa`, `benchmark-audit`,
 `generate-prm` and `web`. Run `deepgym <command> --help` for options.
 
 ## Development

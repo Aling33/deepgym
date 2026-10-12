@@ -18,6 +18,7 @@ src/deepgym/
 ├── verifier.py          # Verifier model + protocol validation
 ├── verifier_template.py # Detect verifier shape (AST) and wrap it to print the JSON protocol
 ├── adversarial.py       # Reward-hack detection (5 attack strategies)
+├── qa/                  # Quality gate (deepgym qa): checks, difficulty, report, gate
 ├── exceptions.py        # DeepGymError hierarchy
 ├── cli.py               # CLI: run, eval, serve, create
 └── api/
