@@ -27,7 +27,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 from uuid import uuid4
 
-from deepgym.apple_container import AppleContainer, ContainerTimeoutError
 from deepgym.exceptions import (
     ActionError,
     DeepGymError,
@@ -43,13 +42,9 @@ from deepgym.models import (
     Trajectory,
     checked_score,
 )
-from deepgym.sandbox import (
-    _extract_json_line,
-    build_run_result,
-    cleanup_sandbox,
-    is_command_timeout,
-    parse_verifier_output,
-)
+from deepgym.sandbox import _extract_json_line, build_run_result, parse_verifier_output
+from deepgym.sandboxes import ExecResult, Sandbox
+from deepgym.sandboxes.daytona import cleanup_sandbox, is_timeout
 
 if TYPE_CHECKING:
     from daytona import Daytona, Sandbox
@@ -57,17 +52,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _SANDBOX_WORKDIR = '/tmp/deepgym'
-# Unprivileged user that runs Apple container session commands and file writes.
+# Unprivileged user that runs sandbox session commands and file writes.
 _AGENT_USER = 'dgagent'
+# Root-only directory where file writes are staged before the session user copies them.
+_STAGING_DIR = '/opt/deepgym-staging'
 _DISPLAY = ':0'
 _STEP_OUTPUT = '_step_output.txt'
-
-
-class ExecResult(NamedTuple):
-    """Exit code and combined stdout/stderr of a shell command."""
-
-    exit_code: int
-    output: str
 
 
 class StepResult(NamedTuple):
@@ -216,7 +206,7 @@ class DaytonaBackend:
                 timeout=timeout,
             )
         except Exception as exc:
-            if is_command_timeout(exc):
+            if is_timeout(exc):
                 raise TimeoutError(f'Command exceeded {timeout}s timeout') from exc
             raise SandboxError(f'Sandbox exec failed: {exc}') from exc
         return ExecResult(response.exit_code, response.result)
@@ -304,89 +294,110 @@ os.execvp('sleep', ['sleep', 'infinity'])
 """
 
 
-class AppleContainerBackend:
-    """Run actions in a throwaway Apple container VM on macOS. Shell only: no desktop.
+class SandboxBackend:
+    """Run actions in a throwaway sandbox from any provider (see :mod:`deepgym.sandboxes`).
 
-    Every command joins one network namespace that has only loopback, so servers
-    started during setup stay reachable across steps while the internet and the
-    host Mac are not. Commands and file writes run as an unprivileged user with
-    all capabilities dropped: root owns the binaries that every exec runs with
-    full privileges in the container's own network, so the agent must never be root.
+    Shell only: no desktop. Commands and file writes run as an unprivileged user with
+    all capabilities dropped, because root owns the binaries every provider exec runs
+    with full privileges, so the agent must never be root. When the provider doesn't
+    block the network itself, every command joins one network namespace that has only
+    loopback, so servers started during setup stay reachable across steps while the
+    internet and the host are not.
     """
 
     python = 'python3'
 
-    def __init__(self, env: MultiTurnEnvironment) -> None:
-        self._container = AppleContainer()
-        self.sandbox_id = self._container.id
+    def __init__(self, sandbox: Sandbox) -> None:
+        self._sandbox = sandbox
+        self.sandbox_id = sandbox.id
         try:
-            user = self._container.exec(
+            user = sandbox.exec(
                 f'useradd --system --no-create-home --shell /usr/sbin/nologin {_AGENT_USER} && '
                 f'mkdir -p {_SANDBOX_WORKDIR} && chown {_AGENT_USER}: {_SANDBOX_WORKDIR} && '
+                f'mkdir -p -m 700 {_STAGING_DIR} && '
                 f'echo "$(id -u {_AGENT_USER}) $(id -g {_AGENT_USER})"',
                 timeout=30,
             )
             if user.exit_code != 0:
-                raise SandboxError(f'Could not create the session user: {user.result[-500:]}')
-            uid, gid = user.result.split()[-2:]
-            self._as_agent = [
+                raise SandboxError(f'Could not create the session user: {user.output[-500:]}')
+            uid, gid = user.output.split()[-2:]
+            self._as_agent = shlex.join([
                 'setpriv', f'--reuid={uid}', f'--regid={gid}', '--clear-groups',
                 '--inh-caps=-all', '--bounding-set=-all', '--',
-            ]  # fmt: skip
-            holder = self._container.exec(
-                f'setsid unshare --net -- python3 -c {shlex.quote(_LOOPBACK_UP_THEN_SLEEP)} '
-                '>/dev/null 2>&1 & echo $!',
-                timeout=30,
-            )
-            pid = holder.result.strip().splitlines()[-1]
-            check = self._container.exec(f'nsenter --net=/proc/{pid}/ns/net true', timeout=30)
-            if holder.exit_code != 0 or check.exit_code != 0:
-                raise SandboxError(
-                    'Could not isolate the session network; the image needs util-linux '
-                    f'(unshare, nsenter): {check.result[-500:]}'
-                )
+            ])  # fmt: skip
+            self._enter = self._as_agent
+            if not sandbox.network_blocked:
+                namespace = f'/proc/{self._offline_namespace()}/ns/net'
+                self._enter = f'nsenter --net={namespace} -- {self._as_agent}'
         except BaseException:
             self.close()
             raise
-        self._enter = f'nsenter --net=/proc/{pid}/ns/net -- {shlex.join(self._as_agent)}'
+
+    def _offline_namespace(self) -> str:
+        """Start a root process holding a loopback-only network namespace; return its pid."""
+        holder = self._sandbox.exec(
+            f'setsid unshare --net -- python3 -c {shlex.quote(_LOOPBACK_UP_THEN_SLEEP)} '
+            '>/dev/null 2>&1 & echo $!',
+            timeout=30,
+        )
+        pid = holder.output.strip().splitlines()[-1]
+        check = self._sandbox.exec(f'nsenter --net=/proc/{pid}/ns/net true', timeout=30)
+        if holder.exit_code != 0 or check.exit_code != 0:
+            raise SandboxError(
+                'Could not isolate the session network; the image needs util-linux '
+                f'(unshare, nsenter): {check.output[-500:]}'
+            )
+        return pid
 
     def exec(self, command: str, timeout: int, env: dict[str, str] | None = None) -> ExecResult:
-        """Run *command* with bash in the container's work directory, offline.
+        """Run *command* with bash in the work directory, as the session user, offline.
 
         Raises:
             TimeoutError: If the command exceeds *timeout* seconds.
-            SandboxError: If the container call itself fails.
         """
-        try:
-            response = self._container.exec(
-                f'{self._enter} bash -c {shlex.quote(command)}',
-                cwd=_SANDBOX_WORKDIR,
-                env=env,
-                timeout=timeout,
-            )
-        except ContainerTimeoutError as exc:
-            raise TimeoutError(f'Command exceeded {timeout}s timeout') from exc
-        return ExecResult(response.exit_code, response.result)
+        return self._sandbox.exec(
+            f'{self._enter} bash -c {shlex.quote(command)}',
+            cwd=_SANDBOX_WORKDIR,
+            env=env,
+            timeout=timeout,
+        )
 
     def write_file(self, path: str, content: bytes) -> None:
-        """Write *content* to *path* under the work directory, as the session user."""
-        self._container.upload_file(content, f'{_SANDBOX_WORKDIR}/{path}', as_user=self._as_agent)
+        """Write *content* to *path* under the work directory, as the session user.
+
+        Root stages the bytes in a private directory and feeds them on stdin to a write
+        done as the session user, so the agent's symlinks can't redirect a root write.
+
+        Raises:
+            SandboxError: If the write fails.
+        """
+        staged = f'{_STAGING_DIR}/{uuid4().hex}'
+        self._sandbox.upload(content, staged)
+        write = 'mkdir -p "$(dirname "$1")" && cat > "$1"'
+        target = shlex.quote(f'{_SANDBOX_WORKDIR}/{path}')
+        done = self._sandbox.exec(
+            f'{self._as_agent} sh -c {shlex.quote(write)} write {target} < {staged}; '
+            f'status=$?; rm -f {staged}; exit $status',
+            timeout=60,
+        )
+        if done.exit_code != 0:
+            raise SandboxError(f'Failed to write {path}: {done.output[-500:]}')
 
     def start_desktop(self) -> None:
-        """Refuse: Apple containers have no desktop."""
+        """Refuse: only Daytona has a desktop."""
         raise DeepGymError('Desktop environments need the Daytona backend')
 
     def act(self, action: Action) -> None:
-        """Refuse: Apple containers have no desktop."""
+        """Refuse: only Daytona has a desktop."""
         raise DeepGymError('GUI actions need the Daytona backend')
 
     def screenshot(self) -> str:
-        """Refuse: Apple containers have no desktop."""
+        """Refuse: only Daytona has a desktop."""
         raise DeepGymError('Screenshots need the Daytona backend')
 
     def close(self) -> None:
-        """Delete the container."""
-        self._container.delete()
+        """Delete the sandbox."""
+        self._sandbox.delete()
 
 
 class Session:

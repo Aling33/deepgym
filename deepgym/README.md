@@ -39,7 +39,7 @@ result = dg.run(env, model_output=solution)
 print(f'Score: {result.score}, Passed: {result.passed}')
 ```
 
-Optional extras: `deepgym[daytona]` for Daytona sandboxes, `deepgym[server]` for
+Optional extras: `deepgym[daytona]`, `deepgym[modal]` or `deepgym[e2b]` for those sandboxes, `deepgym[server]` for
 `deepgym serve`, `deepgym[hf]` for the Hugging Face Hub, `deepgym[lm_eval]` for
 lm-evaluation-harness, `deepgym[all]` for everything.
 
@@ -59,7 +59,7 @@ lm-evaluation-harness, `deepgym[all]` for everything.
 - Reward functions for TRL, verl, OpenRLHF and Axolotl, plus a verl multi-turn agent loop
 - lm-evaluation-harness tasks (`lm_eval --tasks deepgym_*`) and Hugging Face Hub sharing
 - Gymnasium-style `reset`/`step`/`state` API
-- Runs locally, on Daytona (cloud or self-hosted), or in Apple container VMs on a Mac
+- Runs locally or in sandboxes from Daytona, Modal, E2B, Docker or Apple container
 
 ## For teams and enterprises
 
@@ -76,8 +76,9 @@ Email [contact@deepgym.io](mailto:contact@deepgym.io) or visit [deepgym.io](http
 ```
 prompt --> model --> DeepGym sandbox --> verifier --> score --> training loop
                         |                  |
-                     Daytona / Apple /  JSON protocol:
-                     local subprocess   score, passed, cases
+                     Daytona / Modal /  JSON protocol:
+                     E2B / Docker /     score, passed, cases
+                     Apple / local
 ```
 
 The verifier prints JSON with a score and a per-test breakdown
@@ -87,11 +88,23 @@ The verifier prints JSON with a score and a per-test breakdown
 
 - `local`: a subprocess on your machine. Fine for development.
 - `daytona`: a Daytona sandbox, cloud or self-hosted.
+- `modal`: a Modal sandbox (`pip install 'deepgym[modal]'`, then `modal token set`).
+- `e2b`: an E2B sandbox (`pip install 'deepgym[e2b]'`, set `E2B_API_KEY`).
+- `docker`: a local Docker container with no network.
 - `apple`: a throwaway Linux VM from Apple's container CLI on macOS.
 - `auto` (default): Daytona when `DAYTONA_API_KEY` is set, local otherwise.
 
-For anything shared or untrusted, use Daytona or Apple container.
+```python
+dg = DeepGym(mode='modal')   # same for AsyncDeepGym and dg.session()
+```
+
+Every sandbox mode gives the same isolation, for single runs and shell sessions.
+For anything shared or untrusted, use one of them instead of `local`.
 Computer-use (desktop) environments need Daytona.
+
+Each provider is one folder in `src/deepgym/sandboxes/` implementing a small
+`Sandbox` protocol (run a command as root, upload a file, delete). Adding a
+provider means adding a folder.
 
 ### Daytona setup
 
@@ -106,11 +119,11 @@ docker compose -f docker/docker-compose.yaml up -d
 # Set DAYTONA_API_URL and DAYTONA_API_KEY
 ```
 
-### Apple container (macOS)
+### Docker and Apple container (local)
 
-Each run or session gets a throwaway Linux VM from Apple's
-[container](https://github.com/apple/container) CLI. Same isolation as Daytona,
-no API key, no cloud.
+Each run or session gets a throwaway container (Docker) or Linux VM (Apple's
+[container](https://github.com/apple/container) CLI on macOS). Same isolation as
+the cloud sandboxes, no API key. For Docker, start the daemon. For Apple container:
 
 ```bash
 brew install container
@@ -123,8 +136,8 @@ dg.run(env, solution)
 ```
 
 - Image: `python:3.12-slim`, override with `DEEPGYM_CONTAINER_IMAGE`.
-- Sessions run offline; servers inside the VM still work on localhost.
-- Stop the service with `container system stop`.
+- Sessions run offline; servers inside the sandbox still work on localhost.
+- Stop Apple's service with `container system stop`.
 
 ## Scoring and training
 
@@ -181,7 +194,7 @@ reward:
   custom_reward_function:
     path: pkg://deepgym.integrations.verl
     name: compute_score
-    reward_kwargs: {mode: daytona}   # or auto, local, apple
+    reward_kwargs: {mode: daytona}   # or auto, local, modal, e2b, docker, apple
 ```
 
 It runs the last fenced code block of each response and logs `score`, `passed`
@@ -513,9 +526,9 @@ so a slow case fails on its own and the run still returns partial credit.
 
 ### Isolation
 
-- **Daytona / Apple container:** the solution runs as a separate Linux user that
-  can't read the judge's files, touch the judge's process, or write to its output,
-  with no network.
+- **Sandboxes (Daytona, Modal, E2B, Docker, Apple container):** the solution runs as
+  a separate Linux user that can't read the judge's files, touch the judge's
+  process, or write to its output, with no network.
 - **Locally:** it runs under `sandbox-exec` on macOS or `bwrap` on Linux, with the
   judge directory and the deepgym package hidden. If neither is available, you
   still get process separation and a warning.

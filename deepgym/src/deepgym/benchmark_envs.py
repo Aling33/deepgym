@@ -22,12 +22,8 @@ from pydantic import Field, PrivateAttr
 
 from deepgym.integrations.hf import _require_datasets
 from deepgym.models import Environment, RunResult, VerifierResult
-from deepgym.sandbox import (
-    _extract_json_line,
-    build_run_result,
-    cleanup_sandbox,
-    create_sandbox,
-)
+from deepgym.sandbox import _extract_json_line, build_run_result
+from deepgym.sandboxes.daytona import cleanup_sandbox, create_sandbox
 
 if TYPE_CHECKING:
     from deepgym.core import DeepGym

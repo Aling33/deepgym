@@ -1,8 +1,8 @@
-"""Sandbox lifecycle and verifier execution for DeepGym.
+"""Verifier execution for DeepGym.
 
-Creates and tears down Daytona sandboxes and runs verifier jobs (see
-:mod:`deepgym.judge`) locally or in a sandbox, with the solution isolated from
-the judge in both cases.
+Runs verifier jobs (see :mod:`deepgym.judge`) locally or in a sandbox from any
+provider (see :mod:`deepgym.sandboxes`), with the solution isolated from the
+judge in both cases.
 """
 
 from __future__ import annotations
@@ -13,9 +13,7 @@ import logging
 import re
 import shlex
 import subprocess
-from typing import TYPE_CHECKING
 
-from deepgym.apple_container import ContainerTimeoutError
 from deepgym.exceptions import InvalidScoreError, SandboxError, TimeoutError, VerifierError
 from deepgym.judge import (
     DEADLINE_GRACE_S,
@@ -25,10 +23,8 @@ from deepgym.judge import (
     sandbox_judge,
     sandbox_uploads,
 )
-from deepgym.models import Environment, RunResult, VerifierResult, checked_score
-
-if TYPE_CHECKING:
-    from daytona import Daytona, Sandbox
+from deepgym.models import RunResult, VerifierResult, checked_score
+from deepgym.sandboxes import Sandbox, SandboxTimeoutError
 
 logger = logging.getLogger(__name__)
 
@@ -112,104 +108,42 @@ def build_run_result(
     )
 
 
-def create_sandbox(env: Environment, daytona: Daytona) -> Sandbox:
-    """Create a Daytona sandbox configured for the given environment.
+def run_judge_in_sandbox(sandbox: Sandbox, job: JudgeJob) -> ExecutionResult:
+    """Run *job*'s verifier in *sandbox*.
 
-    Uses a pre-built snapshot when ``env.snapshot`` is set, otherwise falls
-    back to a default Python image.
-
-    Args:
-        env: The environment specification.
-        daytona: An initialised Daytona client.
-
-    Returns:
-        A running Sandbox instance.
+    The solution runs as a separate, unprivileged user with no capabilities and no
+    network: the provider blocks it, or the solution gets its own offline network
+    namespace.
 
     Raises:
-        SandboxError: If sandbox creation fails.
-    """
-    try:
-        from daytona import (
-            CreateSandboxFromImageParams,
-            CreateSandboxFromSnapshotParams,
-            Image,
-        )
-    except ImportError as exc:
-        raise SandboxError(
-            "daytona is required. Install it with: pip install 'deepgym[daytona]'"
-        ) from exc
-
-    try:
-        if env.snapshot:
-            params = CreateSandboxFromSnapshotParams(
-                snapshot=env.snapshot,
-                ephemeral=True,
-            )
-            sandbox = daytona.create(params)
-        else:
-            params = CreateSandboxFromImageParams(
-                image=Image.debian_slim('3.12'),
-                ephemeral=True,
-            )
-            sandbox = daytona.create(params)
-    except Exception as exc:
-        raise SandboxError(f'Failed to create sandbox: {exc}') from exc
-
-    return sandbox
-
-
-def run_judge_in_sandbox(
-    sandbox: Sandbox, job: JudgeJob, *, require_offline: bool = False
-) -> ExecutionResult:
-    """Run *job*'s verifier in *sandbox* (Daytona or Apple container).
-
-    The solution runs as a separate, unprivileged user with no capabilities and,
-    where the sandbox allows it, no network. *require_offline* fails the run
-    instead of letting the solution keep the sandbox's network.
-
-    Raises:
-        SandboxError: If setting up users or uploading files fails, or if
-            *require_offline* is set and the solution can't be cut off the network.
+        SandboxError: If setting up users or uploading files fails, or if the
+            solution can't be cut off the network.
         TimeoutError: If the verifier outruns its time budget.
         VerifierError: If the verifier fails to run or prints no protocol JSON.
     """
     _validate_env_vars(job.env_vars)
     try:
-        setup = sandbox.process.exec(f'bash -c {shlex.quote(SANDBOX_SETUP)}', timeout=60)
+        setup = sandbox.exec(f'bash -c {shlex.quote(SANDBOX_SETUP)}', timeout=60)
         if setup.exit_code != 0:
-            raise SandboxError(f'Judge setup failed: {setup.result[-2000:]}')
+            raise SandboxError(f'Judge setup failed: {setup.output[-2000:]}')
         for content, path in sandbox_uploads(job):
-            sandbox.fs.upload_file(content, path)
+            sandbox.upload(content, path)
     except SandboxError:
         raise
     except Exception as exc:
         raise SandboxError(f'Failed to set up the judge: {exc}') from exc
-    command, env = sandbox_judge(job, setup.result, require_offline=require_offline)
+    command, env = sandbox_judge(job, setup.output, require_offline=not sandbox.network_blocked)
     try:
-        response = sandbox.process.exec(command, env=env, timeout=job.timeout + DEADLINE_GRACE_S)
+        response = sandbox.exec(command, env=env, timeout=job.timeout + DEADLINE_GRACE_S)
+    except SandboxTimeoutError as exc:
+        raise TimeoutError(f'Verifier exceeded {job.timeout}s') from exc
     except Exception as exc:
-        if is_command_timeout(exc):
-            raise TimeoutError(f'Verifier exceeded {job.timeout}s') from exc
         raise VerifierError(f'Verifier execution failed: {exc}') from exc
     # Exit codes 0 (passed) and 1 (failed) are normal verifier outcomes, so parse regardless.
     return ExecutionResult(
-        parse_verifier_output(response.result.strip(), f'exit_code={response.exit_code}'),
+        parse_verifier_output(response.output.strip(), f'exit_code={response.exit_code}'),
         exit_code=response.exit_code,
     )
-
-
-def cleanup_sandbox(sandbox: Sandbox, daytona: Daytona, *, wait: bool = False) -> None:
-    """Safely destroy a sandbox, logging rather than raising errors.
-
-    Args:
-        sandbox: The sandbox to destroy.
-        daytona: The Daytona client that owns the sandbox.
-        wait: Block until Daytona confirms the sandbox is gone.
-    """
-    try:
-        daytona.delete(sandbox, wait=wait)
-    except Exception:
-        logger.warning('Failed to clean up sandbox %s', getattr(sandbox, 'id', '?'))
 
 
 # ---------------------------------------------------------------------------
@@ -245,17 +179,6 @@ def parse_verifier_output(stdout: str, context: str = '') -> VerifierResult:
         return VerifierResult.model_validate(data)
     except ValueError as exc:
         raise VerifierError(f'Failed to parse verifier JSON: {exc}. Raw: {json_str!r}') from exc
-
-
-def is_command_timeout(exc: Exception) -> bool:
-    """Return True if a sandbox exec failed because the command outran its timeout."""
-    if isinstance(exc, ContainerTimeoutError):
-        return True
-    try:
-        from daytona import DaytonaProcessExecutionTimeoutError
-    except ImportError:
-        return False
-    return isinstance(exc, DaytonaProcessExecutionTimeoutError)
 
 
 def _extract_json_line(stdout: str) -> str | None:
