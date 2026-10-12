@@ -26,7 +26,7 @@
     - Daytona: a dedicated Linux user.
     - Local: `sandbox-exec` (macOS) or `bwrap` (Linux), with the judge, the deepgym package and `~/.deepgym` hidden.
   - Only plain data crosses the boundary. All built-in verifiers and the HumanEval, MBPP and EvalPlus importers are migrated; re-run the import scripts for cached benchmarks.
-  - BigCodeBench tests run with the solution inside the sandbox, because they need rich objects. That result is still forgeable by a determined model.
+  - BigCodeBench tests run with the solution inside the sandbox, because they need rich objects. The score travels back over a private pipe fd the solution cannot write to, so it can't be forged by printing a fake line, writing to fd 1/2, or patching unittest to run no cases (zero discovered tests now scores 0, not 1).
 - Per-call `case_timeout` (default 10s), capped by the run's `timeout`: a slow case fails alone and the run returns partial credit instead of timing out.
 - Verifier shape is detected by parsing the source (`script`, `verify_function`, `body`) or set with `verifier_mode`, replacing a text search that misclassified verifiers. `from __future__` imports are hoisted when wrapping.
 - `support_files` on `Environment` (and `metadata.json`) for multi-file verifiers and shared helpers across environments.

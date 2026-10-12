@@ -203,8 +203,14 @@ def _launch_argv(
     workdir: str,
     extra_env: dict[str, str] | None = None,
     allow_fork: bool = False,
+    preserve_fds: Sequence[int] = (),
 ) -> list[str]:
-    """Wrap *command* to run as the isolated solution: empty env, writes only in *workdir*."""
+    """Wrap *command* to run as the isolated solution: empty env, writes only in *workdir*.
+
+    *preserve_fds* are inherited by the child so the caller can hand it a private
+    reporting channel (see :func:`run_solution`). bwrap drops inherited fds unless
+    ``--preserve-fds`` says how many to keep, so we pass the count there.
+    """
     spec = _isolation()
     writable = [workdir]
     clean = ['env', '-i', f'PATH={_PATH}', f'HOME={workdir}', f'TMPDIR={workdir}']
@@ -226,6 +232,9 @@ def _launch_argv(
             argv += ['--tmpfs', path]
         for path in writable:
             argv += ['--bind', path, path]
+        if preserve_fds:
+            # Keep the judge's pipe fd open across bwrap's fd-closing setup.
+            argv += ['--preserve-fds', str(len(preserve_fds))]
         argv += ['--unshare-all', '--die-with-parent', '--new-session', '--chdir', workdir]
         return [*argv, *clean, *command]
     return [*clean, *command]
@@ -274,6 +283,7 @@ def run_solution(
     input: str | None = None,
     timeout: float | None = None,
     allow_subprocess: bool = False,
+    pass_fds: Sequence[int] = (),
 ) -> subprocess.CompletedProcess:
     """Run the solution as a script in the isolated domain.
 
@@ -283,6 +293,11 @@ def run_solution(
     Anything the script leaves running is killed when it exits. On macOS the
     script can't start subprocesses unless *allow_subprocess* is set (a child
     that detaches could outlive it there).
+
+    *pass_fds* are inherited by the script as-is, keyed by their number. Use this
+    for a private reporting pipe the script may write to but cannot reopen or
+    discover (a number is not a path): the judge reads the fd directly, so the
+    score never depends on the script's stdout, which it can forge.
 
     Raises:
         subprocess.TimeoutExpired: If it runs past *timeout* (default: the case timeout).
@@ -295,12 +310,17 @@ def run_solution(
     # keep us waiting (and alive to tamper) after the script itself exits.
     with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
         proc = subprocess.Popen(
-            _launch_argv(command, workdir, env, allow_fork=allow_subprocess),
+            _launch_argv(
+                command, workdir, env,
+                allow_fork=allow_subprocess,
+                preserve_fds=pass_fds,
+            ),
             stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
             stdout=out,
             stderr=err,
             cwd=workdir,
             start_new_session=True,
+            pass_fds=tuple(pass_fds),
         )
         try:
             proc.communicate(None if input is None else input.encode(), timeout=limit)

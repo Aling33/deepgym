@@ -13,18 +13,21 @@ Also generates environments/bigcodebench/registry.json indexing all problems.
 
 import ast
 import json
-import textwrap
 from pathlib import Path
 
-from datasets import load_dataset
+# `datasets` is only needed to download the benchmark, not to build the
+# verifier, so it is imported lazily in main(). That keeps this module (and the
+# verifier generators it exposes) importable for tests without the HF stack.
 
 
 # Runs inside the isolated solution process: loads the solution, runs the
-# BigCodeBench unittest code against it, prints one JSON result line.
+# BigCodeBench unittest code against it, and reports one JSON result line on a
+# private file descriptor the judge handed us (never on stdout, which the
+# solution shares and can forge).
 _RUNNER_SOURCE = """
 import importlib.util
-import io
 import json
+import os
 import sys
 import unittest
 
@@ -32,21 +35,32 @@ import unittest
 def main():
     with open(sys.argv[1]) as handle:
         spec_data = json.load(handle)
-    real_stdout = sys.stdout
-    sys.stdout, sys.stderr = io.StringIO(), io.StringIO()
+    # The judge passes the write end of a pipe as this fd. It is a number, not a
+    # path, so the solution cannot reopen it or learn it by scanning the cwd.
+    report_fd = int(os.environ["DEEPGYM_REPORT_FD"])
+    report = os.fdopen(report_fd, "w")
 
-    def report(score, passed, details):
-        real_stdout.write(json.dumps({"score": score, "passed": passed, "details": details}) + "\\n")
-        real_stdout.flush()
+    def emit(score, passed, details):
+        report.write(json.dumps({"score": score, "passed": passed, "details": details}) + "\\n")
+        report.flush()
+        report.close()
+
+    # Silence both the real stdout and the rebound one: the solution must have no
+    # reachable stream the judge reads. We report only through *report*.
+    try:
+        sys.stdout = sys.stderr = open(os.devnull, "w")
+        sys.__stdout__ = sys.__stderr__ = sys.stdout
+    except Exception:
+        pass
 
     try:
         spec = importlib.util.spec_from_file_location("solution", sys.argv[2])
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
     except Exception as e:
-        return report(0.0, False, f"Import error: {type(e).__name__}: {e}")
+        return emit(0.0, False, f"Import error: {type(e).__name__}: {e}")
     if not hasattr(mod, spec_data["entry_point"]):
-        return report(0.0, False, f"Missing function: {spec_data['entry_point']}")
+        return emit(0.0, False, f"Missing function: {spec_data['entry_point']}")
     ns = dict(vars(mod))
     try:
         exec(spec_data["test_code"], ns)
@@ -55,15 +69,17 @@ def main():
             if isinstance(obj, type) and issubclass(obj, unittest.TestCase) and obj is not unittest.TestCase:
                 suite.addTests(loader.loadTestsFromTestCase(obj))
         if suite.countTestCases() == 0:
-            return report(1.0, True, "Direct assertion tests passed")
-        result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(suite)
+            # A real BigCodeBench task always has assertions. Zero discovered
+            # cases means the solution hid them, not that it passed.
+            return emit(0.0, False, "No tests discovered")
+        result = unittest.TextTestRunner(stream=open(os.devnull, "w"), verbosity=0).run(suite)
         failed = len(result.failures) + len(result.errors)
         score = (result.testsRun - failed) / result.testsRun if result.testsRun else 0.0
-        report(score, score >= 0.8, f"{result.testsRun - failed}/{result.testsRun} tests passed")
+        emit(score, score >= 0.8, f"{result.testsRun - failed}/{result.testsRun} tests passed")
     except AssertionError as e:
-        report(0.0, False, f"Assertion failed: {e}")
+        emit(0.0, False, f"Assertion failed: {e}")
     except Exception as e:
-        report(0.0, False, f"Error: {type(e).__name__}: {e}")
+        emit(0.0, False, f"Error: {type(e).__name__}: {e}")
 
 
 main()
@@ -74,19 +90,19 @@ def generate_verifier(task_id: str, entry_point: str, test_code: str, libs: list
     """Generate a DeepGym-compatible verifier from BigCodeBench test code.
 
     BigCodeBench tests inspect rich objects (DataFrames, plots), so the tests
-    and the solution must share a process. The verifier runs both together in
-    the isolated solution process (away from the judge and the host) and reads
-    back one JSON result line. A determined model can still forge that line,
-    so prefer function-level benchmarks (HumanEval, MBPP, EvalPlus) for
-    adversarial RL.
+    and the solution must share a process. The verifier hands that process the
+    write end of a pipe and reads the one JSON result line back from it; the
+    score never comes from the solution's stdout, which it could forge.
     """
     return f'''#!/usr/bin/env python3
 """DeepGym verifier for BigCodeBench {task_id}.
 
-Tests run with the solution in the isolated process; see the importer docstring
-for why this result is forgeable by a determined model.
+The solution and the tests share one isolated process, but the result travels
+over a private pipe fd the solution cannot reach, so it can't be forged by
+printing a fake score line or patching unittest.
 """
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -101,12 +117,15 @@ _RUNNER = {_RUNNER_SOURCE!r}
 
 
 def verify(solution_path):
-    """Run the BigCodeBench tests with the solution in the isolated process."""
+    """Run the BigCodeBench tests with the solution, reading the result over a pipe."""
     work = tempfile.mkdtemp(prefix="deepgym_bcb_")
+    read_fd = write_fd = None
     try:
         Path(work, "runner.py").write_text(_RUNNER, encoding="utf-8")
         spec = {{"test_code": _TEST_CODE, "entry_point": _ENTRY_POINT}}
         Path(work, "tests.json").write_text(json.dumps(spec), encoding="utf-8")
+        read_fd, write_fd = os.pipe()
+        os.set_inheritable(write_fd, True)
         try:
             proc = run_solution(
                 str(Path(work, "runner.py")),
@@ -114,14 +133,31 @@ def verify(solution_path):
                 cwd=work,
                 timeout=120,
                 allow_subprocess=True,
+                env={{"DEEPGYM_REPORT_FD": str(write_fd)}},
+                pass_fds=(write_fd,),
             )
         except subprocess.TimeoutExpired:
             return {{"score": 0.0, "passed": False, "details": "Tests timed out"}}
-        results = [line for line in proc.stdout.splitlines() if line.startswith("{{")]
-        if not results:
-            return {{"score": 0.0, "passed": False, "details": f"No result: {{proc.stderr[-500:]}}"}}
-        return json.loads(results[-1])
+        finally:
+            # Close our copy of the writer so the read below sees EOF.
+            if write_fd is not None:
+                os.close(write_fd)
+                write_fd = None
+        with os.fdopen(read_fd, "r") as channel:
+            read_fd = None
+            lines = [line for line in channel.read().splitlines() if line.startswith("{{")]
+        if not lines:
+            return {{"score": 0.0, "passed": False, "details": "No report on the private channel"}}
+        # Take the FIRST line: a trailing line could only come from a writer we
+        # did not expect, so it must not be trusted either.
+        return json.loads(lines[0])
     finally:
+        for fd in (read_fd, write_fd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
         shutil.rmtree(work, ignore_errors=True)
 
 
@@ -138,6 +174,8 @@ if __name__ == "__main__":
 
 
 def main():
+    from datasets import load_dataset
+
     output_dir = Path.home() / ".deepgym" / "environments" / "bigcodebench"
     output_dir.mkdir(parents=True, exist_ok=True)
 
