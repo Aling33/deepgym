@@ -17,6 +17,7 @@ from deepgym.models import Environment
 from deepgym.sandbox import run_judge_in_sandbox
 from deepgym.sandboxes import ExecResult, SandboxTimeoutError, open_sandbox
 from deepgym.sandboxes.apple import AppleContainer
+from deepgym.sandboxes.cli import DEFAULT_IMAGE
 from deepgym.sandboxes.docker import DockerContainer
 from deepgym.session import SandboxBackend
 
@@ -94,6 +95,13 @@ def test_apple_adds_netns_caps_and_deletes(cli_calls: list[list[str]]) -> None:
     assert not box.network_blocked
 
 
+def test_cli_boots_the_given_image_or_the_default(cli_calls: list[list[str]]) -> None:
+    open_sandbox('docker', 'python:3.11-slim')
+    open_sandbox('apple')
+    assert cli_calls[0][-3:] == ['python:3.11-slim', 'sleep', 'infinity']
+    assert cli_calls[1][-3:] == [DEFAULT_IMAGE, 'sleep', 'infinity']
+
+
 def test_cli_timeout_exit_becomes_timeout_error(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess:
         return subprocess.CompletedProcess(argv, 124 if argv[1] == 'exec' else 0, b'', b'')
@@ -166,7 +174,9 @@ def test_modal_blocks_network_and_maps_results(monkeypatch: pytest.MonkeyPatch) 
 
     _install(monkeypatch, 'modal', {
         'App': types.SimpleNamespace(lookup=lambda name, create_if_missing: name),
-        'Image': types.SimpleNamespace(debian_slim=lambda python_version: 'image'),
+        'Image': types.SimpleNamespace(
+            debian_slim=lambda python_version: 'image', from_registry=lambda tag: f'reg:{tag}'
+        ),
         'Sandbox': Sandbox,
         'exception': types.SimpleNamespace(Error=Exception),
     })  # fmt: skip
@@ -175,11 +185,14 @@ def test_modal_blocks_network_and_maps_results(monkeypatch: pytest.MonkeyPatch) 
 
     box = module.ModalSandbox()
     assert created['block_network'] is True and created['args'] == ('sleep', 'infinity')
+    assert created['image'] == 'image'
     assert box.exec('false') == ExecResult(3, 'outerr')
     box.upload(b'x', '/a/b/c.txt')
     box.delete()
     assert created['execs'][-1][:2] == ('sh', '-c') and 'mkdir -p /a/b' in created['execs'][-1][2]
     assert created['w'] == '/a/b/c.txt' and created['terminated']
+    module.ModalSandbox('python:3.11-slim')
+    assert created['image'] == 'reg:python:3.11-slim'
 
 
 def test_e2b_runs_as_root_offline_and_maps_errors(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -232,6 +245,8 @@ def test_e2b_runs_as_root_offline_and_maps_errors(monkeypatch: pytest.MonkeyPatc
         box.exec('slow', timeout=1)
     with pytest.raises(SandboxError, match='not reachable'):
         box.exec('gone', timeout=1)
+    module.E2BSandbox('my-template')
+    assert seen['create']['template'] == 'my-template'
 
 
 # ---------------------------------------------------------------------------

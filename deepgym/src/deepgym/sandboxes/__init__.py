@@ -1,9 +1,9 @@
 """Sandbox providers: one folder per provider, each implementing :class:`Sandbox`.
 
-``open_sandbox('docker')`` starts a fresh sandbox by provider name. Daytona is
-opened by :class:`~deepgym.core.DeepGym` itself because it needs a client and the
-environment's snapshot. Provider SDKs are optional extras, imported only when that
-provider is used.
+``open_sandbox('docker', image)`` starts a fresh sandbox by provider name, from the
+environment's image or the provider's default. Daytona is opened by
+:class:`~deepgym.core.DeepGym` itself because it needs a client and the environment's
+snapshot. Provider SDKs are optional extras, imported only when that provider is used.
 """
 
 from __future__ import annotations
@@ -27,8 +27,12 @@ __all__ = [
 ]
 
 
-def open_sandbox(provider: Provider) -> Sandbox:
+def open_sandbox(provider: Provider, image: str | None = None) -> Sandbox:
     """Start a fresh sandbox from *provider*.
+
+    Args:
+        provider: Which provider to use.
+        image: :attr:`~deepgym.models.Environment.image`, or None for the provider's default.
 
     Raises:
         SandboxError: If the sandbox can't be started.
@@ -37,19 +41,19 @@ def open_sandbox(provider: Provider) -> Sandbox:
         case 'apple':
             from deepgym.sandboxes.apple import AppleContainer
 
-            return AppleContainer()
+            return AppleContainer(image)
         case 'docker':
             from deepgym.sandboxes.docker import DockerContainer
 
-            return DockerContainer()
+            return DockerContainer(image)
         case 'modal':
             from deepgym.sandboxes.modal import ModalSandbox
 
-            return ModalSandbox()
+            return ModalSandbox(image)
         case 'e2b':
             from deepgym.sandboxes.e2b import E2BSandbox
 
-            return E2BSandbox()
+            return E2BSandbox(image)
     raise DeepGymError(f'Unknown sandbox provider {provider!r}; choose from {PROVIDERS}')
 
 

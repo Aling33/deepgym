@@ -34,12 +34,12 @@ class CliContainer:
     delete_args: ClassVar[tuple[str, ...]]
     network_blocked: ClassVar[bool]
 
-    def __init__(self, image: str = DEFAULT_IMAGE) -> None:
+    def __init__(self, image: str | None = None) -> None:
         self.id = f'deepgym-{uuid4().hex[:12]}'
         try:
             started = self._cli(
                 'run', '--detach', '--rm', '--name', self.id, '--label', 'deepgym=1',
-                *_LIMITS, *self.run_flags, image, 'sleep', 'infinity',
+                *_LIMITS, *self.run_flags, image or DEFAULT_IMAGE, 'sleep', 'infinity',
                 timeout=_START_TIMEOUT_S,
             )  # fmt: skip
         except subprocess.TimeoutExpired as exc:

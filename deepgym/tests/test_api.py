@@ -392,6 +392,11 @@ class TestSessions:
         resp = client.post('/v1/sessions', json={'environment': 'no_such_env_xyz'})
         assert resp.status_code == 404
 
+    def test_caller_chosen_image_is_refused(self, client: TestClient) -> None:
+        env = {**FILE_CHECK_ENV, 'image': 'attacker/image:latest'}
+        resp = client.post('/v1/sessions', json={'environment': env})
+        assert resp.status_code == 422
+
     def test_session_cap_counts_booting_and_live_sessions(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:

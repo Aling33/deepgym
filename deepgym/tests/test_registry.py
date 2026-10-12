@@ -89,6 +89,15 @@ class TestLoadEnvironment:
         assert isinstance(env, Environment)
         assert env.name == 'HumanEval_0'
 
+    def test_metadata_image_reaches_the_environment(self, tmp_path: Path) -> None:
+        (tmp_path / 'task.md').write_text('Write solve().\n', encoding='utf-8')
+        (tmp_path / 'verifier.py').write_text('return 1.0\n', encoding='utf-8')
+        (tmp_path / 'metadata.json').write_text('{"image": "python:3.11-slim"}', encoding='utf-8')
+
+        env = registry_module._load_env_from_dir(tmp_path)
+
+        assert env.image == 'python:3.11-slim'
+
     def test_load_humaneval_task_id_with_slash_alias(
         self,
         tmp_path: Path,

@@ -99,6 +99,26 @@ def test_session_shell_episode(dg: DeepGym) -> None:
     assert len(trajectory.steps) == 2
 
 
+_PY311 = 'python:3.11-slim'  # not the 3.12 default, so the version shows which image ran
+
+
+def test_env_image_boots_runs_and_sessions(dg: DeepGym) -> None:
+    env = _env(
+        """
+version = sol.version()
+return {'score': float(version == [3, 11]), 'passed': version == [3, 11], 'details': str(version)}
+""",
+        image=_PY311,
+    )
+    solution = 'import sys\ndef version():\n    return list(sys.version_info[:2])\n'
+    result = dg.run(env, solution)
+    assert result.passed, result.output
+    with dg.session(MultiTurnEnvironment(task='t', max_steps=2, image=_PY311)) as session:
+        session.start()
+        step = session.step(Action(action_type='bash', content='python3 --version'))
+    assert 'Python 3.11' in step.observation.content
+
+
 def test_session_is_offline_but_keeps_local_servers(dg: DeepGym) -> None:
     env = MultiTurnEnvironment(
         task='t',

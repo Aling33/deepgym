@@ -128,6 +128,12 @@ class Environment(BaseModel):
     snapshot: str | None = None
     """Pre-built Daytona snapshot name with dependencies pre-installed."""
 
+    image: str | None = None
+    """Image to boot the sandbox from, e.g. 'python:3.11-slim': a registry image for docker,
+    apple, modal and daytona (a snapshot wins), a template id for e2b. None uses the
+    provider's default. It must run as root and have python3, bash, useradd and util-linux
+    (setpriv, unshare, nsenter, mount), as Debian and Ubuntu images do."""
+
     env_vars: dict[str, str] | None = None
     """Environment variables to inject into the sandbox."""
 
@@ -420,6 +426,9 @@ class MultiTurnEnvironment(BaseModel):
 
     snapshot: str | None = None
     """Daytona snapshot to boot. None uses Daytona's default image (has xfce + Chromium)."""
+
+    image: str | None = None
+    """Image to boot the sandbox from; see :attr:`Environment.image`."""
 
     difficulty: Literal['easy', 'medium', 'hard'] = 'medium'
     """Task difficulty level."""
