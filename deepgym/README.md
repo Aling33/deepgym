@@ -670,7 +670,47 @@ production or `DEEPGYM_NO_AUTH=true` for local development.
 `--allow-local-exec` is required when running without Daytona.
 
 Other commands: `run-batch`, `eval`, `create`, `audit`, `qa`, `benchmark-audit`,
-`generate-prm` and `web`. Run `deepgym <command> --help` for options.
+`generate-prm` and `console`. Run `deepgym <command> --help` for options.
+
+## Console
+
+A local web console for the environments, runs, episodes, sandboxes and QA reports
+on your machine (`pip install "deepgym[server]"`):
+
+```bash
+deepgym console --port 8080 --allow-local-exec   # http://127.0.0.1:8080
+```
+
+- **Environments:** search and filter the registry; open one to read its task,
+  verifier, reference solution and metadata.
+- **Runs:** score a pasted solution or the reference against one environment or a
+  small eval, on any provider (`local`, `docker`, `apple`, `daytona`, `modal`, `e2b`).
+  Runs execute in the background; the run page shows per-case results and a diff
+  against the reference.
+- **Episodes:** replay recorded trajectories step by step, with screenshots for
+  computer-use tasks. Record one from your agent loop:
+
+  ```python
+  from deepgym.console import record_episode
+  trajectory, result = dg.run_episode(env, agent)
+  record_episode(trajectory, result, environment='todo_list')
+  ```
+
+- **Sandboxes:** live `deepgym-*` containers from Docker and Apple `container`,
+  with kill. Cloud sandboxes are not listed.
+- **QA:** the verdicts `deepgym qa` writes to `~/.deepgym/qa/` (or `$DEEPGYM_QA_DIR`).
+
+Runs and episodes are stored in `~/.deepgym/console.db`. Reference solutions may
+run locally, but a pasted solution only runs on your machine with
+`--allow-local-exec`; otherwise pick a sandbox provider. The console has no login,
+so other websites can't drive it: every `/api` call needs the per-launch token the
+console writes into its pages (`X-DeepGym-Token`), writes from other origins are
+refused, and when bound to `127.0.0.1` it only answers requests addressed to
+localhost. `deepgym web` is an alias.
+
+The UI lives in `console-ui/` (Next.js static export, built with bun) and ships
+prebuilt in wheels. From a clone, build it once with
+`cd console-ui && bun install && bun run build`.
 
 ## Development
 

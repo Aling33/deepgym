@@ -25,6 +25,7 @@ class TestCLIHelp:
             ['deepgym', 'benchmark-audit', '--help'],
             ['deepgym', 'run', '--help'],
             ['deepgym', 'serve', '--help'],
+            ['deepgym', 'console', '--help'],
             ['deepgym', 'web', '--help'],
             ['deepgym', 'eval', '--help'],
             ['deepgym', 'create', '--help'],
@@ -125,11 +126,45 @@ class TestBuildParser:
         assert args.command == 'run-batch'
         assert args.max_parallel == 10  # default
 
-    def test_web_subcommand_parses(self) -> None:
+    @pytest.mark.parametrize('command', ['console', 'web'])
+    def test_console_subcommand_parses(self, command: str) -> None:
         parser = _build_parser()
-        args = parser.parse_args(['web', '--port', '9090'])
-        assert args.command == 'web'
+        args = parser.parse_args([command, '--port', '9090'])
+        assert args.command == command
         assert args.port == 9090
+        assert args.allow_local_exec is False
+
+
+class TestConsoleCommand:
+    """Verify `deepgym console` (and its `web` alias) builds the app and serves it."""
+
+    @pytest.mark.parametrize('command', ['console', 'web'])
+    def test_runs_uvicorn_with_console_app(
+        self, command: str, capsys: pytest.CaptureFixture
+    ) -> None:
+        argv = ['deepgym', command, '--port', '9191', '--allow-local-exec']
+        with (
+            patch.object(sys, 'argv', argv),
+            patch('deepgym.console.app.create_app') as create_app,
+            patch('uvicorn.run') as run,
+        ):
+            main()
+        create_app.assert_called_once_with(
+            allow_local_exec=True, allowed_hosts=['127.0.0.1', 'localhost']
+        )
+        run.assert_called_once_with(create_app.return_value, host='127.0.0.1', port=9191)
+        assert 'http://127.0.0.1:9191' in capsys.readouterr().out
+
+    def test_warns_when_ui_is_not_built(self, capsys: pytest.CaptureFixture) -> None:
+        with (
+            patch.object(sys, 'argv', ['deepgym', 'console', '--host', '0.0.0.0']),
+            patch('deepgym.console.app.ui_built', return_value=False),
+            patch('deepgym.console.app.create_app') as create_app,
+            patch('uvicorn.run'),
+        ):
+            main()
+        assert 'bun run build' in capsys.readouterr().err
+        assert create_app.call_args.kwargs['allowed_hosts'] is None
 
 
 class TestReadFileOrString:

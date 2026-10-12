@@ -7,6 +7,7 @@ everything used here, so a provider only names its CLI and how it differs.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import subprocess
@@ -14,6 +15,8 @@ import time
 from collections.abc import Mapping
 from typing import ClassVar
 from uuid import uuid4
+
+from pydantic import BaseModel, ConfigDict
 
 from deepgym.exceptions import SandboxError
 from deepgym.sandboxes.protocol import ExecResult, SandboxTimeoutError
@@ -24,6 +27,18 @@ _LIMITS = ('--cpus', '2', '--memory', '2g')
 _START_TIMEOUT_S = 300
 # Exit codes from coreutils `timeout`: 124 after SIGTERM, 137 after the follow-up SIGKILL.
 _TIMEOUT_EXIT_CODES = frozenset({124, 137})
+_NAME_PREFIX = 'deepgym-'
+
+
+class RunningSandbox(BaseModel):
+    """A live DeepGym container as its CLI lists it."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: str
+    image: str
+    state: str
+    started: str
 
 
 class CliContainer:
@@ -32,10 +47,11 @@ class CliContainer:
     cli: ClassVar[str]
     run_flags: ClassVar[tuple[str, ...]] = ()
     delete_args: ClassVar[tuple[str, ...]]
+    list_args: ClassVar[tuple[str, ...]]
     network_blocked: ClassVar[bool]
 
     def __init__(self, image: str | None = None) -> None:
-        self.id = f'deepgym-{uuid4().hex[:12]}'
+        self.id = f'{_NAME_PREFIX}{uuid4().hex[:12]}'
         try:
             started = self._cli(
                 'run', '--detach', '--rm', '--name', self.id, '--label', 'deepgym=1',
@@ -112,10 +128,44 @@ class CliContainer:
 
     def delete(self) -> None:
         """Stop and remove the container; errors are ignored (it may already be gone)."""
+        with contextlib.suppress(SandboxError):
+            self.remove(self.id)
+
+    @classmethod
+    def remove(cls, name: str) -> None:
+        """Force-remove the container *name*, whoever started it.
+
+        Raises:
+            SandboxError: If the CLI is missing or the removal fails.
+        """
         try:
-            self._cli(*self.delete_args, self.id, timeout=60)
-        except (SandboxError, subprocess.TimeoutExpired):
-            pass
+            done = cls._cli(*cls.delete_args, name, timeout=60)
+        except subprocess.TimeoutExpired as exc:
+            raise SandboxError(f'Removing {name} timed out') from exc
+        if done.returncode != 0:
+            raise SandboxError(f'Failed to remove {name}: {done.stderr.decode().strip()[-500:]}')
+
+    @classmethod
+    def running(cls) -> list[RunningSandbox]:
+        """List live DeepGym containers (named ``deepgym-...``).
+
+        Raises:
+            SandboxError: If the CLI is missing or can't list containers.
+        """
+        try:
+            done = cls._cli(*cls.list_args, timeout=30)
+        except subprocess.TimeoutExpired as exc:
+            raise SandboxError(f'{cls.cli} did not list containers within 30s') from exc
+        if done.returncode != 0:
+            detail = done.stderr.decode().strip()[-500:]
+            raise SandboxError(f'{cls.cli} could not list containers: {detail}')
+        listed = cls._parse_listing(done.stdout.decode())
+        return [box for box in listed if box.id.startswith(_NAME_PREFIX)]
+
+    @staticmethod
+    def _parse_listing(output: str) -> list[RunningSandbox]:
+        """Parse the output of ``<cli> <list_args>``."""
+        raise NotImplementedError
 
     @classmethod
     def _cli(

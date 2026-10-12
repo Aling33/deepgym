@@ -77,6 +77,13 @@ class DeepGym:
                 logger.info('No DAYTONA_API_KEY set, using local executor')
                 self._local_executor = LocalExecutor()
 
+    @property
+    def backend(self) -> str:
+        """Where runs execute: 'local', 'daytona', or the sandbox provider's name."""
+        if self._provider:
+            return self._provider
+        return 'local' if self._local_executor is not None else 'daytona'
+
     @staticmethod
     def _init_daytona(api_key: str | None, api_url: str | None = None):
         """Initialise the Daytona SDK client."""

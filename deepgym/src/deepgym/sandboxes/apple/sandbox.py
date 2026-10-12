@@ -9,10 +9,11 @@ user with every capability dropped.
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 
-from deepgym.sandboxes.cli import CliContainer
+from deepgym.sandboxes.cli import CliContainer, RunningSandbox
 
 
 class AppleContainer(CliContainer):
@@ -21,6 +22,7 @@ class AppleContainer(CliContainer):
     cli = 'container'
     run_flags = ('--cap-add', 'CAP_SYS_ADMIN', '--cap-add', 'CAP_NET_ADMIN')
     delete_args = ('delete', '--force')
+    list_args = ('ls', '--format', 'json')
     network_blocked = False
 
     @classmethod
@@ -35,3 +37,16 @@ class AppleContainer(CliContainer):
         except (OSError, subprocess.SubprocessError):
             return False
         return status.returncode == 0 and 'running' in status.stdout
+
+    @staticmethod
+    def _parse_listing(output: str) -> list[RunningSandbox]:
+        """Parse ``container ls --format json``: a JSON array of container records."""
+        return [
+            RunningSandbox(
+                id=row['id'],
+                image=row['configuration']['image']['reference'],
+                state=row['status']['state'],
+                started=row['status'].get('startedDate', ''),
+            )
+            for row in json.loads(output or '[]')
+        ]

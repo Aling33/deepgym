@@ -203,16 +203,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help='Disable API key authentication (development only)',
     )
 
-    # ── web ───────────────────────────────────────────────────────────
-    web_p = sub.add_parser('web', help='Launch web debugging UI')
-    web_p.add_argument('--host', default='127.0.0.1', help='Bind address')
-    web_p.add_argument('--port', type=int, default=8080, help='Port number')
-    web_p.add_argument('--reload', action='store_true', help='Enable auto-reload for development')
-    web_p.add_argument(
+    # ── console ───────────────────────────────────────────────────────
+    console_p = sub.add_parser(
+        'console', aliases=['web'], help='Launch the management console (web UI + API)'
+    )
+    console_p.add_argument('--host', default='127.0.0.1', help='Bind address')
+    console_p.add_argument('--port', type=int, default=8080, help='Port number')
+    console_p.add_argument(
         '--allow-local-exec',
         action='store_true',
         default=False,
-        help='Allow local code execution without Daytona sandboxes (dangerous)',
+        help="Allow runs that execute solutions on this machine (mode 'local')",
     )
 
     return parser
@@ -511,29 +512,31 @@ def _cmd_generate_prm(args: argparse.Namespace) -> None:
         print(f'  Train with:        axolotl train {config_path}')
 
 
-def _cmd_web(args: argparse.Namespace) -> None:
+def _cmd_console(args: argparse.Namespace) -> None:
     try:
         import uvicorn
     except ImportError:
         print(
-            'Error: uvicorn is required to run the web UI. '
-            'Install it with: pip install uvicorn[standard]',
+            'Error: uvicorn is required to run the console. '
+            'Install it with: pip install "deepgym[server]"',
             file=sys.stderr,
         )
         sys.exit(1)
 
-    # Propagate the allow-local-exec flag via environment variable so the
-    # web app can read it at startup.
+    from deepgym.console.app import MISSING_UI_MESSAGE, create_app, ui_built
+
+    if not ui_built():
+        print(MISSING_UI_MESSAGE, file=sys.stderr)
     allow_local = args.allow_local_exec or os.environ.get(
         'DEEPGYM_ALLOW_LOCAL_EXEC', ''
     ).lower() in ('true', '1', 'yes')
-    os.environ['DEEPGYM_ALLOW_LOCAL_EXEC'] = str(allow_local).lower()
-
-    from deepgym.web import create_web_app
-
-    app = create_web_app()
-    print(f'DeepGym Web UI: http://{args.host}:{args.port}')
-    uvicorn.run(app, host=args.host, port=args.port, reload=args.reload)
+    loopback = args.host in ('127.0.0.1', 'localhost')
+    app = create_app(
+        allow_local_exec=allow_local,
+        allowed_hosts=['127.0.0.1', 'localhost'] if loopback else None,
+    )
+    print(f'DeepGym Console: http://{args.host}:{args.port}')
+    uvicorn.run(app, host=args.host, port=args.port)
 
 
 def _cmd_serve(args: argparse.Namespace) -> None:
@@ -686,7 +689,8 @@ _COMMANDS = {
     'eval': _cmd_eval,
     'create': _cmd_create,
     'serve': _cmd_serve,
-    'web': _cmd_web,
+    'console': _cmd_console,
+    'web': _cmd_console,
 }
 
 

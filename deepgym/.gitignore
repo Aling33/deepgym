@@ -59,3 +59,6 @@ scripts/ticker_local.py
 data/cyberbench/*.log
 data/cyberbench/top100_eval_*.jsonl
 data/cyberbench/glm_cache/
+
+# Console UI build output (built by console-ui, shipped in wheels)
+src/deepgym/console/static/
