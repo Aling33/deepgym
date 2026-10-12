@@ -63,16 +63,21 @@ class ZaiChatClient:
         *,
         max_tokens: int = 4096,
         temperature: float = 0.2,
-        thinking: str = 'enabled',
+        thinking: str | None = 'enabled',
     ) -> str:
-        """Return the assistant message content for a chat-completions request."""
+        """Return the assistant message content for a chat-completions request.
+
+        Pass ``thinking=None`` to omit the Z.ai-specific field for other
+        OpenAI-compatible endpoints.
+        """
         payload: dict[str, Any] = {
             'model': self.model,
             'messages': list(messages),
             'max_tokens': max_tokens,
             'temperature': temperature,
-            'thinking': {'type': thinking},
         }
+        if thinking is not None:
+            payload['thinking'] = {'type': thinking}
         headers = {
             'Authorization': f'Bearer {self._api_key}',
             'Content-Type': 'application/json',
@@ -94,7 +99,7 @@ class ZaiChatClient:
         system: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.2,
-        thinking: str = 'enabled',
+        thinking: str | None = 'enabled',
     ) -> str:
         """Convenience wrapper for a single user prompt."""
         messages: list[dict[str, str]] = []

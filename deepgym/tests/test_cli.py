@@ -5,9 +5,11 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
 import pytest
 
 from deepgym.cli import _build_parser, _read_file_or_string, main
+from deepgym.integrations.zai import ZaiChatClient
 
 ENVS_DIR = Path(__file__).resolve().parent.parent / 'src' / 'deepgym' / 'envs'
 
@@ -27,6 +29,7 @@ class TestCLIHelp:
             ['deepgym', 'eval', '--help'],
             ['deepgym', 'create', '--help'],
             ['deepgym', 'run-batch', '--help'],
+            ['deepgym', 'qa', '--help'],
         ],
     )
     def test_help_exits_zero(self, args: list[str], capsys: pytest.CaptureFixture) -> None:
@@ -256,3 +259,90 @@ class TestCLIAuditSubcommand:
         data = json.loads(capsys.readouterr().out)
         assert data['contamination_risk'] is True
         assert len(data['leaks']) >= 1
+
+
+class TestCLIQASubcommand:
+    """Verify `deepgym qa` writes reports and sets the exit code."""
+
+    def test_qa_json_output_and_report_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        monkeypatch.setenv('DEEPGYM_QA_DIR', str(tmp_path))
+        args = ['deepgym', 'qa', 'reverse_string', 'signup_form', '--reruns', '1', '--json']
+
+        with patch.object(sys, 'argv', args):
+            main()
+
+        data = json.loads(capsys.readouterr().out)
+        assert [(r['environment'], r['passed']) for r in data] == [
+            ('reverse_string', True),
+            ('signup_form', True),
+        ]
+        saved = json.loads((tmp_path / 'reverse_string.json').read_text(encoding='utf-8'))
+        assert saved['checks'] == data[0]['checks']
+
+    def test_qa_exits_one_when_an_env_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        monkeypatch.setenv('DEEPGYM_QA_DIR', str(tmp_path))
+
+        with (
+            patch.object(sys, 'argv', ['deepgym', 'qa', 'no_such_env']),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
+        assert exc_info.value.code == 1
+        assert 'no_such_env: load:' in capsys.readouterr().out
+        assert (tmp_path / 'no_such_env.json').exists()
+
+    def test_qa_requires_an_env(self) -> None:
+        with patch.object(sys, 'argv', ['deepgym', 'qa']), pytest.raises(SystemExit) as exc_info:
+            main()
+
+        assert exc_info.value.code == 1
+
+
+class TestCLIQALocalExecGuard:
+    """`deepgym qa --model` refuses to run model code locally without --allow-local-exec."""
+
+    @pytest.mark.parametrize('mode', ['local', 'auto'])
+    def test_model_in_local_mode_needs_the_flag(
+        self, mode: str, capsys: pytest.CaptureFixture
+    ) -> None:
+        args = ['deepgym', 'qa', 'reverse_string', '--model', 'm', '--mode', mode]
+
+        with patch.object(sys, 'argv', args), pytest.raises(SystemExit) as exc_info:
+            main()
+
+        assert exc_info.value.code == 1
+        err = capsys.readouterr().err
+        assert '--allow-local-exec' in err
+        assert '--mode docker' in err
+
+    @pytest.mark.parametrize('isolation', ['bwrap', 'none'])
+    def test_model_with_the_flag_proceeds(
+        self,
+        isolation: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            answer = '```python\ndef reverse_string(s):\n    return s[::-1]\n```'
+            return httpx.Response(200, json={'choices': [{'message': {'content': answer}}]})
+
+        client = ZaiChatClient('key', model='m', transport=httpx.MockTransport(handler))
+        monkeypatch.setattr('deepgym.qa.client_from_env', lambda model: client)
+        monkeypatch.setattr('deepgym.cli.local_isolation_kind', lambda: isolation)
+        monkeypatch.setenv('DEEPGYM_QA_DIR', str(tmp_path))
+        args = ['deepgym', 'qa', 'reverse_string', '--model', 'm', '--samples', '2']
+        args += ['--reruns', '0', '--allow-local-exec']
+
+        with patch.object(sys, 'argv', args), pytest.raises(SystemExit) as exc_info:
+            main()
+
+        assert exc_info.value.code == 1  # every sample solved: too_easy
+        captured = capsys.readouterr()
+        assert 'difficulty: too_easy: pass@1=1.00 pass@2=1.00' in captured.out
+        assert ('WARNING: no sandbox-exec or bwrap' in captured.err) is (isolation == 'none')

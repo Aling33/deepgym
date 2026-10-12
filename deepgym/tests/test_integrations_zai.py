@@ -44,3 +44,16 @@ def test_zai_client_from_env_requires_key(monkeypatch: pytest.MonkeyPatch) -> No
 
     with pytest.raises(RuntimeError, match='ZAI_API_KEY'):
         ZaiChatClient.from_env()
+
+
+def test_zai_client_omits_thinking_when_none() -> None:
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen['payload'] = json.loads(request.content.decode())
+        return httpx.Response(200, json={'choices': [{'message': {'content': 'ok'}}]})
+
+    client = ZaiChatClient('test-key', transport=httpx.MockTransport(handler))
+
+    assert client.complete_prompt('solve task', thinking=None) == 'ok'
+    assert 'thinking' not in seen['payload']
