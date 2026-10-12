@@ -187,17 +187,17 @@ class DaytonaBackend:
     python = 'python3'
 
     def __init__(self, daytona: Daytona, env: MultiTurnEnvironment) -> None:
-        from daytona import CreateSandboxFromSnapshotParams
+        from daytona import CreateSandboxFromImageParams, CreateSandboxFromSnapshotParams, Image
 
         # A label lets us find and delete the sandbox if create() fails after allocating it.
         label = {'deepgym_session': uuid4().hex}
+        options = {'ephemeral': True, 'network_block_all': True, 'labels': label}
+        if env.image and not env.snapshot:
+            params = CreateSandboxFromImageParams(image=Image.base(env.image), **options)
+        else:
+            params = CreateSandboxFromSnapshotParams(snapshot=env.snapshot, **options)
         try:
-            self._sandbox: Sandbox = daytona.create(
-                CreateSandboxFromSnapshotParams(
-                    snapshot=env.snapshot, ephemeral=True, network_block_all=True, labels=label
-                ),
-                timeout=env.setup_timeout,
-            )
+            self._sandbox: Sandbox = daytona.create(params, timeout=env.setup_timeout)
         except Exception as exc:
             _delete_labelled(daytona, label)
             raise SandboxError(f'Failed to create sandbox: {exc}') from exc

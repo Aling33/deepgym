@@ -36,7 +36,7 @@ from deepgym.sandbox import (
     parse_verifier_output,
 )
 from deepgym.sandboxes import PROVIDERS, Provider
-from deepgym.sandboxes.daytona import is_timeout
+from deepgym.sandboxes.daytona import create_params, is_timeout
 
 if TYPE_CHECKING:
     from daytona import AsyncDaytona, Sandbox
@@ -536,33 +536,11 @@ class AsyncDeepGym:
         return AsyncDaytona(config) if config else AsyncDaytona()
 
     async def _create_sandbox(self, env: Environment) -> Sandbox:
-        """Create an ephemeral sandbox from snapshot or image."""
-        try:
-            from daytona import (
-                CreateSandboxFromImageParams,
-                CreateSandboxFromSnapshotParams,
-                Image,
-            )
-        except ImportError as exc:
-            raise SandboxError(
-                "daytona is required. Install it with: pip install 'deepgym[daytona]'"
-            ) from exc
-
+        """Create an ephemeral sandbox from the env's snapshot or image."""
         assert self._daytona is not None
-
+        params = create_params(env)
         try:
-            if env.snapshot:
-                params = CreateSandboxFromSnapshotParams(
-                    snapshot=env.snapshot,
-                    ephemeral=True,
-                )
-                return await self._daytona.create(params)
-            else:
-                params = CreateSandboxFromImageParams(
-                    image=Image.debian_slim('3.12'),
-                    ephemeral=True,
-                )
-                return await self._daytona.create(params)
+            return await self._daytona.create(params)
         except Exception as exc:
             raise SandboxError(f'Failed to create async sandbox: {exc}') from exc
 

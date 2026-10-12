@@ -135,9 +135,26 @@ dg = DeepGym(mode='apple')   # or AsyncDeepGym(mode='apple')
 dg.run(env, solution)
 ```
 
-- Image: `python:3.12-slim`, override with `DEEPGYM_CONTAINER_IMAGE`.
+- Image: `python:3.12-slim`, override with `DEEPGYM_CONTAINER_IMAGE` or per
+  environment (below).
 - Sessions run offline; servers inside the sandbox still work on localhost.
 - Stop Apple's service with `container system stop`.
+
+### Per-environment images
+
+Set `image` on an environment, or in its `metadata.json`, to boot its sandbox from
+an image with the task's dependencies already installed:
+
+```python
+env = Environment(task=..., verifier_code=..., image='python:3.11-slim')
+```
+
+- Docker, Apple container, Modal and Daytona pull it from a registry; E2B treats it
+  as a template id. On Daytona a `snapshot` wins.
+- The image must run as root and have python3, bash, useradd and util-linux
+  (setpriv, unshare, nsenter, mount). Debian and Ubuntu images do; Alpine doesn't.
+- Root in the sandbox runs the image's binaries, so only use images you trust. The
+  HTTP API refuses caller-chosen images.
 
 ## Scoring and training
 

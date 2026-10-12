@@ -27,12 +27,16 @@ class ModalSandbox:
 
     network_blocked = True
 
-    def __init__(self, image: modal.Image | None = None) -> None:
+    def __init__(self, image: str | None = None) -> None:
         app = modal.App.lookup(APP_NAME, create_if_missing=True)
         self._sandbox = modal.Sandbox.create(
             'sleep', 'infinity',
             app=app,
-            image=image or modal.Image.debian_slim(python_version='3.12'),
+            image=(
+                modal.Image.from_registry(image)
+                if image
+                else modal.Image.debian_slim(python_version='3.12')
+            ),
             block_network=True,
             timeout=LIFETIME_S,
         )  # fmt: skip

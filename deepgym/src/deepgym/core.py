@@ -117,7 +117,7 @@ class DeepGym:
             return env.run_with_deepgym(self, model_output, **kwargs)  # type: ignore[return-value]
 
         if self._provider:
-            return self._run_in(open_sandbox(self._provider), env, model_output)
+            return self._run_in(open_sandbox(self._provider, env.image), env, model_output)
         if self._local_executor is not None:
             return self._run_local(env, model_output)
         return self._run_in(DaytonaSandbox(self._daytona, env), env, model_output)
@@ -166,7 +166,7 @@ class DeepGym:
             SandboxError: If the Daytona sandbox cannot be created.
         """
         if self._provider:
-            return Session(env, SandboxBackend(open_sandbox(self._provider)))
+            return Session(env, SandboxBackend(open_sandbox(self._provider, env.image)))
         if self._local_executor is not None:
             return Session(env, LocalBackend())
         return Session(env, DaytonaBackend(self._daytona, env))

@@ -309,7 +309,7 @@ def _load_computer_use_env(env_dir: Path, metadata: dict, variant: int) -> Compu
         files=files,
         **{
             key: metadata[key]
-            for key in ('difficulty', 'domain', 'tags', 'max_steps', 'timeout_per_step')
+            for key in ('difficulty', 'domain', 'tags', 'max_steps', 'timeout_per_step', 'image')
             if key in metadata
         },
     )
@@ -377,7 +377,7 @@ def _load_env_from_dir(
         support_files=_read_support_files(env_dir, settings.get('support_files', [])),
         **{
             key: settings[key]
-            for key in ('verifier_mode', 'timeout', 'case_timeout')
+            for key in ('verifier_mode', 'timeout', 'case_timeout', 'image')
             if key in settings
         },
     )

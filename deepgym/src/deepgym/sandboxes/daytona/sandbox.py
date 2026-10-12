@@ -17,16 +17,24 @@ from deepgym.models import Environment
 from deepgym.sandboxes.protocol import ExecResult, SandboxTimeoutError
 
 if TYPE_CHECKING:
-    from daytona import Daytona, Sandbox
+    from daytona import (
+        CreateSandboxFromImageParams,
+        CreateSandboxFromSnapshotParams,
+        Daytona,
+        Sandbox,
+    )
 
 logger = logging.getLogger(__name__)
 
 
-def create_sandbox(env: Environment, daytona: Daytona) -> Sandbox:
-    """Create a raw Daytona sandbox from ``env.snapshot``, or a Debian Python 3.12 image.
+def create_params(
+    env: Environment,
+) -> CreateSandboxFromSnapshotParams | CreateSandboxFromImageParams:
+    """Return params for an ephemeral judge sandbox: ``env.snapshot``, else ``env.image``,
+    else a Debian Python 3.12 image.
 
     Raises:
-        SandboxError: If the daytona SDK is missing or creation fails.
+        SandboxError: If the daytona SDK is missing.
     """
     try:
         from daytona import CreateSandboxFromImageParams, CreateSandboxFromSnapshotParams, Image
@@ -35,9 +43,18 @@ def create_sandbox(env: Environment, daytona: Daytona) -> Sandbox:
             "daytona is required. Install it with: pip install 'deepgym[daytona]'"
         ) from exc
     if env.snapshot:
-        params = CreateSandboxFromSnapshotParams(snapshot=env.snapshot, ephemeral=True)
-    else:
-        params = CreateSandboxFromImageParams(image=Image.debian_slim('3.12'), ephemeral=True)
+        return CreateSandboxFromSnapshotParams(snapshot=env.snapshot, ephemeral=True)
+    image = Image.base(env.image) if env.image else Image.debian_slim('3.12')
+    return CreateSandboxFromImageParams(image=image, ephemeral=True)
+
+
+def create_sandbox(env: Environment, daytona: Daytona) -> Sandbox:
+    """Create a raw Daytona sandbox from :func:`create_params`.
+
+    Raises:
+        SandboxError: If the daytona SDK is missing or creation fails.
+    """
+    params = create_params(env)
     try:
         return daytona.create(params)
     except Exception as exc:

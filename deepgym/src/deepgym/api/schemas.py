@@ -20,8 +20,8 @@ class APIEnvironment(BaseModel):
     """Environment specification for API requests. No filesystem paths allowed.
 
     Unlike :class:`~deepgym.models.Environment`, this model does not accept
-    ``verifier_path`` or ``snapshot`` fields, preventing remote callers from
-    reading arbitrary files on the server or specifying Daytona snapshots.
+    ``verifier_path``, ``snapshot`` or ``image`` fields, preventing remote callers from
+    reading arbitrary files on the server or choosing what the sandbox boots.
     """
 
     task: str = Field(..., max_length=100_000)
@@ -243,6 +243,16 @@ class CreateSessionRequest(BaseModel):
 
     variant: int = Field(default=0, ge=0)
     """Parameter set to load for a registry computer-use env (ignored for inline specs)."""
+
+    @field_validator('environment')
+    @classmethod
+    def reject_image(
+        cls, v: str | MultiTurnEnvironment | ComputerUseEnvironment
+    ) -> str | MultiTurnEnvironment | ComputerUseEnvironment:
+        """Refuse a caller-chosen image: root in the sandbox runs the image's binaries."""
+        if not isinstance(v, str) and v.image is not None:
+            raise ValueError('image cannot be set over the API')
+        return v
 
 
 # ---------------------------------------------------------------------------
