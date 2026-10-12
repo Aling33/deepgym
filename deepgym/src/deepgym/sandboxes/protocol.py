@@ -1,0 +1,59 @@
+"""What a sandbox provider implements so DeepGym's judge and shell sessions can run on it.
+
+A sandbox is one throwaway Linux machine. ``exec`` runs a shell command as root,
+because the judge creates its own unprivileged users inside (see
+:data:`deepgym.judge.SANDBOX_SETUP`), and ``upload`` writes a file as root.
+Untrusted code never runs as root: the judge and sessions drop to those users.
+
+``network_blocked`` says the provider itself stops all egress. When it doesn't,
+DeepGym puts untrusted code in its own offline network namespace instead, and
+refuses to run if the sandbox can't make one.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import NamedTuple, Protocol
+
+from deepgym.exceptions import TimeoutError
+
+
+class ExecResult(NamedTuple):
+    """Exit code and combined stdout/stderr of a shell command."""
+
+    exit_code: int
+    output: str
+
+
+class SandboxTimeoutError(TimeoutError):
+    """Raised when a sandbox command outruns its timeout."""
+
+
+class Sandbox(Protocol):
+    """A running sandbox, deleted by :meth:`delete`."""
+
+    id: str
+    network_blocked: bool
+
+    def exec(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        env: Mapping[str, str] | None = None,
+        timeout: int | None = None,
+    ) -> ExecResult:
+        """Run *command* with ``sh -c`` as root.
+
+        Raises:
+            SandboxTimeoutError: If the command outruns *timeout* seconds.
+        """
+        ...
+
+    def upload(self, content: bytes, path: str) -> None:
+        """Write *content* to the absolute *path* as root, creating parent directories."""
+        ...
+
+    def delete(self) -> None:
+        """Stop and remove the sandbox; never raises."""
+        ...

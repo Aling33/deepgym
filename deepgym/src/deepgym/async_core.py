@@ -33,9 +33,10 @@ from deepgym.sandbox import (
     ExecutionResult,
     _validate_env_vars,
     build_run_result,
-    is_command_timeout,
     parse_verifier_output,
 )
+from deepgym.sandboxes import PROVIDERS, Provider
+from deepgym.sandboxes.daytona import is_timeout
 
 if TYPE_CHECKING:
     from daytona import AsyncDaytona, Sandbox
@@ -62,7 +63,7 @@ class AsyncDeepGym:
         api_key: str | None = None,
         api_url: str | None = None,
         default_timeout: int = 30,
-        mode: Literal['auto', 'daytona', 'local', 'apple'] = 'auto',
+        mode: Literal['auto', 'daytona', 'local'] | Provider = 'auto',
     ) -> None:
         self._mode = mode
         self._api_key = api_key
@@ -78,9 +79,9 @@ class AsyncDeepGym:
 
         if api_url is not None:
             logger.info('Initialising AsyncDeepGym in HTTP mode: %s', api_url)
-        elif mode == 'apple':
-            # Apple container runs go through the sync client in worker threads;
-            # creating it now fails fast if the container service isn't running.
+        elif mode in PROVIDERS:
+            # Provider runs go through the sync client in worker threads; creating it
+            # now fails fast if the provider can't be used here.
             self._sync_client()
         elif mode == 'local':
             logger.info('Initialising AsyncDeepGym in local mode (no Daytona)')
@@ -141,7 +142,7 @@ class AsyncDeepGym:
         if self._api_url is not None:
             return await self._run_http(env, model_output)
 
-        if self._mode == 'apple':
+        if self._mode in PROVIDERS:
             return await asyncio.to_thread(self._sync_client().run, env, model_output)
 
         if self._local_executor is not None:
@@ -509,8 +510,8 @@ class AsyncDeepGym:
         if self._sync is None:
             from deepgym.core import DeepGym
 
-            if self._mode == 'apple':
-                mode = 'apple'
+            if self._mode in PROVIDERS:
+                mode = self._mode
             else:
                 mode = 'local' if self._local_executor is not None else 'daytona'
             self._sync = DeepGym(api_key=self._api_key, mode=mode)
@@ -584,13 +585,14 @@ class AsyncDeepGym:
             raise
         except Exception as exc:
             raise SandboxError(f'Failed to set up the judge: {exc}') from exc
-        command, env = sandbox_judge(job, setup.result)
+        # Daytona doesn't block the network itself, so refuse to judge online.
+        command, env = sandbox_judge(job, setup.result, require_offline=True)
         try:
             response = await sandbox.process.exec(
                 command, env=env, timeout=job.timeout + DEADLINE_GRACE_S
             )
         except Exception as exc:
-            if is_command_timeout(exc):
+            if is_timeout(exc):
                 raise TimeoutError(f'Verifier exceeded {job.timeout}s') from exc
             raise VerifierError(f'Verifier execution failed: {exc}') from exc
         return ExecutionResult(

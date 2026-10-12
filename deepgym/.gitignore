@@ -43,7 +43,7 @@ Thumbs.db
 data/*.db
 
 # Daytona (submodule, not part of this repo)
-daytona/
+/daytona/
 .DS_Store
 
 # Local scripts (not tracked)

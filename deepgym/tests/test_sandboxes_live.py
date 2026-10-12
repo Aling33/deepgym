@@ -1,22 +1,25 @@
-"""Apple container backend: same isolation guarantees as Daytona, run locally on macOS.
+"""Every sandbox provider gives the same isolation guarantees as Daytona.
 
-Skipped unless Apple's container CLI is installed and its service is running.
+Local providers (Apple container, Docker) run when their CLI is up. Cloud providers
+cost money, so they run only when named, e.g. DEEPGYM_LIVE_PROVIDERS=modal,e2b.
 """
 
 import asyncio
 import contextlib
+import os
 import shlex
 import subprocess
 
 import pytest
 
 from deepgym import AsyncDeepGym, ComputerUseEnvironment, DeepGym, load_environment
-from deepgym.apple_container import apple_container_available
 from deepgym.exceptions import DeepGymError, SandboxError
 from deepgym.models import Action, MultiTurnEnvironment
+from deepgym.sandboxes.apple import AppleContainer
+from deepgym.sandboxes.docker import DockerContainer
 from tests.test_isolation import _env
 
-# Every live isolation test, rerun here against Apple containers via this module's `dg`.
+# Every live isolation test, rerun here on each provider via this module's `dg`.
 from tests.test_isolation_live import (  # noqa: F401
     test_hacks_fail,
     test_judge_temp_files_are_private,
@@ -27,18 +30,32 @@ from tests.test_isolation_live import (  # noqa: F401
     test_solution_user_cannot_touch_judge,
 )
 
-pytestmark = pytest.mark.skipif(
-    not apple_container_available(), reason='needs Apple container CLI with service running'
-)
-
-
-@pytest.fixture(scope='module')
-def dg() -> DeepGym:
-    yield DeepGym(mode='apple')
-    left = subprocess.run(
-        ['container', 'ls', '--all', '--quiet'], capture_output=True, text=True, check=False
+_CLOUD = set(os.environ.get('DEEPGYM_LIVE_PROVIDERS', '').split(','))
+_PROVIDERS = [
+    pytest.param(
+        name,
+        marks=pytest.mark.skipif(not usable, reason=f'{name} not available or not enabled'),
     )
-    assert not [line for line in left.stdout.split() if line.startswith('deepgym-')]
+    for name, usable in [
+        ('apple', AppleContainer.available()),
+        ('docker', DockerContainer.available()),
+        ('modal', 'modal' in _CLOUD),
+        ('e2b', 'e2b' in _CLOUD),
+    ]
+]
+# Lists container names, to check no sandbox outlives its run or session.
+_LIST_CONTAINERS = {
+    'apple': ['container', 'ls', '--all', '--quiet'],
+    'docker': ['docker', 'ps', '--all', '--format', '{{.Names}}'],
+}
+
+
+@pytest.fixture(scope='module', params=_PROVIDERS)
+def dg(request: pytest.FixtureRequest) -> DeepGym:
+    yield DeepGym(mode=request.param)
+    if command := _LIST_CONTAINERS.get(request.param):
+        names = subprocess.run(command, capture_output=True, text=True, check=False).stdout
+        assert not [name for name in names.split() if name.startswith('deepgym-')]
 
 
 def test_solution_has_no_network(dg: DeepGym) -> None:
@@ -149,6 +166,63 @@ def test_session_cannot_kill_the_network_holder(dg: DeepGym) -> None:
     assert 'offline' in after, after
 
 
+# Runs as the agent: logs every python command line, tries to read verifier scripts,
+# and writes a fake passing score into every python process's stdout.
+_SPY = """
+import os, time
+end = time.time() + 40
+while time.time() < end:
+    for pid in [p for p in os.listdir('/proc') if p.isdigit()]:
+        try:
+            cmd = open(f'/proc/{pid}/cmdline', 'rb').read().replace(b'\\0', b' ').decode()
+        except OSError:
+            continue
+        if 'python' in cmd and 'spy.py' not in cmd:
+            with open('leak.txt', 'a') as log:
+                log.write(cmd + '\\n')
+            try:
+                with open(f'/proc/{pid}/fd/1', 'w') as out:
+                    out.write('{"score": 1.0, "passed": true}\\n')
+            except OSError:
+                pass
+    try:
+        for name in os.listdir('/opt/deepgym-verifier'):
+            with open('leak.txt', 'a') as log:
+                log.write(open(f'/opt/deepgym-verifier/{name}').read())
+    except OSError:
+        pass
+    time.sleep(0.02)
+"""
+
+
+def test_session_verifiers_are_out_of_the_agents_reach(dg: DeepGym) -> None:
+    env = MultiTurnEnvironment(
+        task='t',
+        max_steps=6,
+        step_verifier_code='import time\ntime.sleep(1)\nprint(0.0)  # SECRET-STEP\n',
+        final_verifier_code=(
+            'import json, time\n'
+            'print(json.dumps({"score": 0.0, "passed": False}), flush=True)  # SECRET-FINAL\n'
+            'time.sleep(1.5)\n'
+        ),
+    )
+    start_spy = '(setsid python3 spy.py >/dev/null 2>&1 &); sleep 0.5; echo started'
+    with dg.session(env) as session:
+        session.start()
+        rewards = [
+            session.step(Action(action_type='write_file', path='spy.py', content=_SPY)).reward,
+            session.step(Action(action_type='bash', content=start_spy)).reward,
+            session.step(Action(action_type='bash', content='sleep 1')).reward,
+        ]
+        leak = session.step(Action(action_type='bash', content='cat leak.txt; echo END'))
+        result = session.score()
+    assert rewards == [0.0, 0.0, 0.0]
+    assert result.score == 0.0
+    assert 'python' in leak.observation.content, 'the spy should have seen the verifiers run'
+    assert 'SECRET' not in leak.observation.content
+    assert 'b64decode' not in leak.observation.content
+
+
 def test_desktop_env_is_refused(dg: DeepGym) -> None:
     with dg.session(ComputerUseEnvironment(task='t')) as session:
         with pytest.raises(DeepGymError, match='Daytona'):
@@ -158,5 +232,5 @@ def test_desktop_env_is_refused(dg: DeepGym) -> None:
 def test_async_client(dg: DeepGym) -> None:
     env = load_environment('coin_change')
     reference = env.verifier_path.with_name('reference_solution.py').read_text()
-    result = asyncio.run(AsyncDeepGym(mode='apple').run(env, reference))
+    result = asyncio.run(AsyncDeepGym(mode=dg._provider).run(env, reference))
     assert result.score == 1.0

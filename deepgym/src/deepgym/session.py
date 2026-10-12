@@ -27,7 +27,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 from uuid import uuid4
 
-from deepgym.apple_container import AppleContainer, ContainerTimeoutError
 from deepgym.exceptions import (
     ActionError,
     DeepGymError,
@@ -43,13 +42,9 @@ from deepgym.models import (
     Trajectory,
     checked_score,
 )
-from deepgym.sandbox import (
-    _extract_json_line,
-    build_run_result,
-    cleanup_sandbox,
-    is_command_timeout,
-    parse_verifier_output,
-)
+from deepgym.sandbox import _extract_json_line, build_run_result, parse_verifier_output
+from deepgym.sandboxes import ExecResult, Sandbox
+from deepgym.sandboxes.daytona import cleanup_sandbox, is_timeout
 
 if TYPE_CHECKING:
     from daytona import Daytona, Sandbox
@@ -57,17 +52,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _SANDBOX_WORKDIR = '/tmp/deepgym'
-# Unprivileged user that runs Apple container session commands and file writes.
+# Unprivileged user that runs sandbox session commands and file writes.
 _AGENT_USER = 'dgagent'
+# Separate unprivileged user for verifiers, so the agent can't read, signal or write to them.
+_VERIFIER_USER = 'dgverifier'
+# Root-only directory where file writes are staged before the session user copies them.
+_STAGING_DIR = '/opt/deepgym-staging'
+# Verifier scripts: readable by the verifier user only.
+_VERIFIER_DIR = '/opt/deepgym-verifier'
+# The loopback-only network namespace, bind-mounted so it outlives any process.
+_NETNS = '/opt/deepgym-netns'
 _DISPLAY = ':0'
 _STEP_OUTPUT = '_step_output.txt'
-
-
-class ExecResult(NamedTuple):
-    """Exit code and combined stdout/stderr of a shell command."""
-
-    exit_code: int
-    output: str
 
 
 class StepResult(NamedTuple):
@@ -90,6 +86,15 @@ class SessionBackend(Protocol):
 
     def write_file(self, path: str, content: bytes) -> None:
         """Write a file relative to the work directory."""
+        ...
+
+    def verify(
+        self, code: str, timeout: int, env: dict[str, str] | None = None, *, quiet: bool = False
+    ) -> ExecResult:
+        """Run verifier *code* in the work directory, out of the agent's reach where possible.
+
+        *quiet* discards the verifier's stderr.
+        """
         ...
 
     def start_desktop(self) -> None:
@@ -150,6 +155,12 @@ class LocalBackend:
         target = self._dir / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
+
+    def verify(
+        self, code: str, timeout: int, env: dict[str, str] | None = None, *, quiet: bool = False
+    ) -> ExecResult:
+        """Run verifier *code* inline; it shares the agent's user here."""
+        return self.exec(_inline_python(self.python, code, quiet=quiet), timeout, env)
 
     def start_desktop(self) -> None:
         """Refuse: the local backend has no display."""
@@ -216,7 +227,7 @@ class DaytonaBackend:
                 timeout=timeout,
             )
         except Exception as exc:
-            if is_command_timeout(exc):
+            if is_timeout(exc):
                 raise TimeoutError(f'Command exceeded {timeout}s timeout') from exc
             raise SandboxError(f'Sandbox exec failed: {exc}') from exc
         return ExecResult(response.exit_code, response.result)
@@ -227,6 +238,12 @@ class DaytonaBackend:
             self._sandbox.fs.upload_file(content, f'{_SANDBOX_WORKDIR}/{path}')
         except Exception as exc:
             raise SandboxError(f'Failed to write {path}: {exc}') from exc
+
+    def verify(
+        self, code: str, timeout: int, env: dict[str, str] | None = None, *, quiet: bool = False
+    ) -> ExecResult:
+        """Run verifier *code* inline; it shares the agent's user here."""
+        return self.exec(_inline_python(self.python, code, quiet=quiet), timeout, env)
 
     def start_desktop(self) -> None:
         """Start Xvfb, xfce, and VNC in the sandbox."""
@@ -304,89 +321,149 @@ os.execvp('sleep', ['sleep', 'infinity'])
 """
 
 
-class AppleContainerBackend:
-    """Run actions in a throwaway Apple container VM on macOS. Shell only: no desktop.
+class SandboxBackend:
+    """Run actions in a throwaway sandbox from any provider (see :mod:`deepgym.sandboxes`).
 
-    Every command joins one network namespace that has only loopback, so servers
-    started during setup stay reachable across steps while the internet and the
-    host Mac are not. Commands and file writes run as an unprivileged user with
-    all capabilities dropped: root owns the binaries that every exec runs with
-    full privileges in the container's own network, so the agent must never be root.
+    Shell only: no desktop. Agent commands and file writes run as one unprivileged
+    user and verifiers as another, both with every capability dropped and
+    no-new-privs: root owns the binaries every provider exec runs with full
+    privileges, so the agent must never be root, and a different user means it
+    can't read, signal or write into a verifier. When the provider doesn't block the
+    network itself, everything joins one loopback-only network namespace, so servers
+    started during setup stay reachable across steps while the internet and the host
+    are not.
     """
 
     python = 'python3'
 
-    def __init__(self, env: MultiTurnEnvironment) -> None:
-        self._container = AppleContainer()
-        self.sandbox_id = self._container.id
+    def __init__(self, sandbox: Sandbox) -> None:
+        self._sandbox = sandbox
+        self.sandbox_id = sandbox.id
         try:
-            user = self._container.exec(
+            users = sandbox.exec(
+                "command -v setpriv >/dev/null || { echo 'setpriv missing'; exit 1; } && "
                 f'useradd --system --no-create-home --shell /usr/sbin/nologin {_AGENT_USER} && '
+                f'useradd --system --no-create-home --shell /usr/sbin/nologin {_VERIFIER_USER} && '
                 f'mkdir -p {_SANDBOX_WORKDIR} && chown {_AGENT_USER}: {_SANDBOX_WORKDIR} && '
-                f'echo "$(id -u {_AGENT_USER}) $(id -g {_AGENT_USER})"',
+                f'mkdir -p -m 700 {_STAGING_DIR} && mkdir -p -m 750 {_VERIFIER_DIR} && '
+                f'chgrp {_VERIFIER_USER} {_VERIFIER_DIR} && '
+                f'echo "$(id -u {_AGENT_USER}) $(id -g {_AGENT_USER}) '
+                f'$(id -u {_VERIFIER_USER}) $(id -g {_VERIFIER_USER})"',
                 timeout=30,
             )
-            if user.exit_code != 0:
-                raise SandboxError(f'Could not create the session user: {user.result[-500:]}')
-            uid, gid = user.result.split()[-2:]
-            self._as_agent = [
-                'setpriv', f'--reuid={uid}', f'--regid={gid}', '--clear-groups',
-                '--inh-caps=-all', '--bounding-set=-all', '--',
-            ]  # fmt: skip
-            holder = self._container.exec(
-                f'setsid unshare --net -- python3 -c {shlex.quote(_LOOPBACK_UP_THEN_SLEEP)} '
-                '>/dev/null 2>&1 & echo $!',
-                timeout=30,
-            )
-            pid = holder.result.strip().splitlines()[-1]
-            check = self._container.exec(f'nsenter --net=/proc/{pid}/ns/net true', timeout=30)
-            if holder.exit_code != 0 or check.exit_code != 0:
-                raise SandboxError(
-                    'Could not isolate the session network; the image needs util-linux '
-                    f'(unshare, nsenter): {check.result[-500:]}'
-                )
+            if users.exit_code != 0:
+                raise SandboxError(f'Could not create the session users: {users.output[-500:]}')
+            agent_uid, agent_gid, verifier_uid, verifier_gid = users.output.split()[-4:]
+            self._as_agent = _drop_to(agent_uid, agent_gid)
+            self._as_verifier = _drop_to(verifier_uid, verifier_gid)
+            self._offline = ''
+            if not sandbox.network_blocked:
+                self._make_offline_namespace()
+                self._offline = f'nsenter --net={_NETNS} -- '
         except BaseException:
             self.close()
             raise
-        self._enter = f'nsenter --net=/proc/{pid}/ns/net -- {shlex.join(self._as_agent)}'
+
+    def _make_offline_namespace(self) -> None:
+        """Make a loopback-only network namespace and bind-mount it at ``_NETNS``.
+
+        The holder process brings loopback up, then execs ``sleep``; waiting for that
+        proves the namespace exists and is ready. The bind mount keeps it alive and
+        addressable without trusting a PID that could be reused.
+        """
+        made = self._sandbox.exec(
+            f'setsid unshare --net -- python3 -c {shlex.quote(_LOOPBACK_UP_THEN_SLEEP)} '
+            '>/dev/null 2>&1 & pid=$!; '
+            'for _ in $(seq 100); do '
+            '[ "$(cat /proc/$pid/comm 2>/dev/null)" = sleep ] && break; sleep 0.05; done; '
+            '[ "$(cat /proc/$pid/comm 2>/dev/null)" = sleep ] && '
+            '[ "$(readlink /proc/$pid/ns/net)" != "$(readlink /proc/1/ns/net)" ] && '
+            f'touch {_NETNS} && mount --bind /proc/$pid/ns/net {_NETNS} && '
+            f'nsenter --net={_NETNS} true',
+            timeout=30,
+        )
+        if made.exit_code != 0:
+            raise SandboxError(
+                'Could not isolate the session network; the image needs util-linux '
+                f'(unshare, nsenter, mount): {made.output[-500:]}'
+            )
 
     def exec(self, command: str, timeout: int, env: dict[str, str] | None = None) -> ExecResult:
-        """Run *command* with bash in the container's work directory, offline.
+        """Run *command* with bash in the work directory, as the session user, offline.
 
         Raises:
             TimeoutError: If the command exceeds *timeout* seconds.
-            SandboxError: If the container call itself fails.
         """
-        try:
-            response = self._container.exec(
-                f'{self._enter} bash -c {shlex.quote(command)}',
-                cwd=_SANDBOX_WORKDIR,
-                env=env,
-                timeout=timeout,
-            )
-        except ContainerTimeoutError as exc:
-            raise TimeoutError(f'Command exceeded {timeout}s timeout') from exc
-        return ExecResult(response.exit_code, response.result)
+        return self._sandbox.exec(
+            f'{self._offline}{self._as_agent} bash -c {shlex.quote(command)}',
+            cwd=_SANDBOX_WORKDIR,
+            env=env,
+            timeout=timeout,
+        )
 
     def write_file(self, path: str, content: bytes) -> None:
-        """Write *content* to *path* under the work directory, as the session user."""
-        self._container.upload_file(content, f'{_SANDBOX_WORKDIR}/{path}', as_user=self._as_agent)
+        """Write *content* to *path* under the work directory, as the session user.
+
+        Root stages the bytes in a private directory and feeds them on stdin to a write
+        done as the session user, so the agent's symlinks can't redirect a root write.
+
+        Raises:
+            SandboxError: If the write fails.
+        """
+        staged = f'{_STAGING_DIR}/{uuid4().hex}'
+        self._sandbox.upload(content, staged)
+        write = 'mkdir -p "$(dirname "$1")" && cat > "$1"'
+        target = shlex.quote(f'{_SANDBOX_WORKDIR}/{path}')
+        done = self._sandbox.exec(
+            f'{self._as_agent} sh -c {shlex.quote(write)} write {target} < {staged}; '
+            f'status=$?; rm -f {staged}; exit $status',
+            timeout=60,
+        )
+        if done.exit_code != 0:
+            raise SandboxError(f'Failed to write {path}: {done.output[-500:]}')
+
+    def verify(
+        self, code: str, timeout: int, env: dict[str, str] | None = None, *, quiet: bool = False
+    ) -> ExecResult:
+        """Run verifier *code* as the verifier user, from a file only that user can read.
+
+        Raises:
+            TimeoutError: If the verifier exceeds *timeout* seconds.
+        """
+        script = f'{_VERIFIER_DIR}/{uuid4().hex}.py'
+        self._sandbox.upload(code.encode('utf-8'), script)
+        stderr = ' 2>/dev/null' if quiet else ''
+        return self._sandbox.exec(
+            f'{self._offline}{self._as_verifier} {self.python} -I {script}{stderr}; '
+            f'status=$?; rm -f {script}; exit $status',
+            cwd=_SANDBOX_WORKDIR,
+            env=env,
+            timeout=timeout,
+        )
 
     def start_desktop(self) -> None:
-        """Refuse: Apple containers have no desktop."""
+        """Refuse: only Daytona has a desktop."""
         raise DeepGymError('Desktop environments need the Daytona backend')
 
     def act(self, action: Action) -> None:
-        """Refuse: Apple containers have no desktop."""
+        """Refuse: only Daytona has a desktop."""
         raise DeepGymError('GUI actions need the Daytona backend')
 
     def screenshot(self) -> str:
-        """Refuse: Apple containers have no desktop."""
+        """Refuse: only Daytona has a desktop."""
         raise DeepGymError('Screenshots need the Daytona backend')
 
     def close(self) -> None:
-        """Delete the container."""
-        self._container.delete()
+        """Delete the sandbox."""
+        self._sandbox.delete()
+
+
+def _drop_to(uid: str, gid: str) -> str:
+    """Command prefix that drops to *uid*/*gid* with no capabilities and no-new-privs."""
+    return shlex.join([
+        'setpriv', f'--reuid={uid}', f'--regid={gid}', '--clear-groups',
+        '--inh-caps=-all', '--bounding-set=-all', '--no-new-privs', '--',
+    ])  # fmt: skip
 
 
 class Session:
@@ -504,9 +581,8 @@ class Session:
             )
         with self._lock:
             start = time.perf_counter()
-            exit_code, stdout = self._backend.exec(
-                _inline_python(self._backend.python, self._env.final_verifier_code),
-                self._env.timeout_per_step,
+            exit_code, stdout = self._backend.verify(
+                self._env.final_verifier_code, self._env.timeout_per_step
             )
             result = parse_verifier_output(stdout, f'exit_code={exit_code}')
             elapsed_ms = (time.perf_counter() - start) * 1000
@@ -587,10 +663,11 @@ class Session:
         """
         self._backend.write_file(_STEP_OUTPUT, output.encode('utf-8'))
         try:
-            stdout = self._backend.exec(
-                _inline_python(self._backend.python, self._env.step_verifier_code) + ' 2>/dev/null',
+            stdout = self._backend.verify(
+                self._env.step_verifier_code,
                 self._env.timeout_per_step,
                 env={'STEP_OUTPUT_PATH': _STEP_OUTPUT, 'STEP_NUMBER': str(self._step)},
+                quiet=True,
             ).output.strip()
         except TimeoutError as exc:
             raise VerifierError(f'Step verifier timed out at step {self._step}') from exc
@@ -648,15 +725,15 @@ def _checked(what: str, result: ExecResult) -> str:
     return result.output
 
 
-def _inline_python(python: str, code: str) -> str:
+def _inline_python(python: str, code: str, *, quiet: bool = False) -> str:
     """Build a command that runs *code* isolated (-I) without writing it to disk.
 
     Verifiers never touch the sandbox filesystem, so an agent process can't swap
-    the file between upload and execution.
+    the file between upload and execution. *quiet* discards stderr.
     """
     encoded = base64.b64encode(code.encode('utf-8')).decode('ascii')
     loader = f"import base64;exec(compile(base64.b64decode('{encoded}'),'<verifier>','exec'))"
-    return f'{python} -I -c "{loader}"'
+    return f'{python} -I -c "{loader}"' + (' 2>/dev/null' if quiet else '')
 
 
 def _signals_done(output: str) -> bool:
