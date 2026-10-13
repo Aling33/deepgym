@@ -194,6 +194,14 @@ class TestSchema:
         assert trajectory.final_observation == trace.steps[2].observation
         assert trajectory.step_rewards == [0.5, 0.5]
 
+    def test_to_trajectory_never_moves_a_reward_to_another_step(self) -> None:
+        trace = graded_trace()
+        # An older trace: the first step's verifier gave no verdict and the episode went on.
+        unjudged = trace.steps[0].model_copy(update={'reward': None})
+        trace = trace.model_copy(update={'steps': (unjudged, *trace.steps[1:])})
+
+        assert trace.to_trajectory().step_rewards == []
+
 
 class TestProvenance:
     """Content hashes are stable and track what defines the environment."""
@@ -478,12 +486,14 @@ class TestCapture:
 
         with dg.trace(env, AGENT) as tr:
             tr.start()
-            tr.step(Action(action_type='bash', content='echo hello > out.txt'), _reply('echo'))
+            with pytest.raises(VerifierError, match='no verdict'):
+                tr.step(Action(action_type='bash', content='echo hello > out.txt'), _reply('echo'))
             tr.score()
         export_traces([load_trace(tr.path)], 'jsonl', tmp_path / 'rl.jsonl', rows='rl')
 
-        step = load_trace(tr.path).steps[0]
-        assert step.reward is None and step.step_verifier['exit_code'] == 2
+        trace = load_trace(tr.path)
+        assert trace.steps[0].reward is None and trace.steps[0].error.startswith('VerifierError')
+        assert not trace.has_verdict and trace.result.error_type == 'verifier_error'
         assert json.loads((tmp_path / 'rl.jsonl').read_text())['step_rewards'] == [None]
 
     def test_failure_after_scoring_a_step_keeps_the_score(self, tmp_path: Path) -> None:
@@ -507,13 +517,49 @@ class TestCapture:
         with tr:
             tr.start()
             tr.step(Action(action_type='bash', content='echo one'))
-            # The step verifier fails, then the screenshot taken after it fails too.
-            with pytest.raises(SandboxError):
+            # The step verifier fails, then the screenshot taken after it fails too; the
+            # verifier's failure is what ends the episode, so it is what propagates.
+            with pytest.raises(VerifierError):
                 tr.step(Action(action_type='bash', content='echo two'))
 
         first, second = load_trace(tr.path).steps
         assert first.reward == 0.5
         assert (second.reward, second.step_verifier) == (None, None)
+
+    def test_first_step_verifier_failure_then_failed_screenshot(self, tmp_path: Path) -> None:
+        env = WRITE_ENV.model_copy(update={'step_verifier_code': 'print("garbage")'})
+        tr = _desktop_trace(env, screenshots=1, path=tmp_path / 't.jsonl')
+
+        with tr:
+            tr.start()
+            with pytest.raises(VerifierError) as raised:
+                tr.step(Action(action_type='bash', content='echo one'))
+
+        (step,) = load_trace(tr.path).steps
+        assert step.applied and (step.reward, step.step_verifier) == (None, None)
+        assert isinstance(raised.value.__cause__, SandboxError)
+
+    def test_replay_gives_a_failed_step_no_reward(self, dg: DeepGym) -> None:
+        verifier = 'import os\nprint(0.5 if os.environ["STEP_NUMBER"] == "1" else "garbage")\n'
+        env = WRITE_ENV.model_copy(update={'step_verifier_code': verifier})
+
+        with dg.trace(env, AGENT) as tr:
+            tr.start()
+            tr.step(Action(action_type='bash', content='echo one'))
+            with pytest.raises(VerifierError):
+                tr.step(Action(action_type='bash', content='echo two'))
+
+        trajectory = load_trace(tr.path).to_trajectory()
+        assert (len(trajectory.steps), trajectory.step_rewards) == (2, [0.5])
+
+    def test_replay_without_a_step_verifier_counts_zero(self, dg: DeepGym) -> None:
+        env = WRITE_ENV.model_copy(update={'step_verifier_code': ''})
+
+        with dg.trace(env, AGENT) as tr:
+            tr.start()
+            tr.step(Action(action_type='bash', content='echo one'))
+
+        assert load_trace(tr.path).to_trajectory().step_rewards == [0.0]
 
     def test_malformed_step_verifier_error_type_keeps_the_step(self, dg: DeepGym) -> None:
         verifier = 'print(\'{"score": 0.5, "error_type": []}\')\n'
@@ -521,10 +567,11 @@ class TestCapture:
 
         with dg.trace(env, AGENT) as tr:
             tr.start()
-            tr.step(Action(action_type='bash', content='echo one'))
+            with pytest.raises(VerifierError, match='no verdict'):
+                tr.step(Action(action_type='bash', content='echo one'))
 
         (step,) = load_trace(tr.path).steps
-        assert step.reward is None and step.step_verifier['error_type'] == []
+        assert step.reward is None and step.error.startswith('VerifierError')
 
     def test_closed_trace_refuses_everything(self, dg: DeepGym) -> None:
         tr = dg.trace(WRITE_ENV, AGENT)

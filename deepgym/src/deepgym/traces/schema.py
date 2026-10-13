@@ -266,14 +266,25 @@ class Trace(BaseModel):
     def to_trajectory(self) -> Trajectory:
         """Return the episode as a session :class:`Trajectory`, for console replay.
 
-        Steps that failed before producing an observation are left out, and steps
-        without a step reward count 0, as in a session's own trajectory.
+        Steps that failed before producing an observation are left out. Rewards match a
+        session's own trajectory: each step counts 0 when the environment has no step
+        verifier, and a step whose step verifier failed has no step reward at all, so
+        nothing is appended for it (it ended the episode without a verdict). Rewards stay
+        on their own steps: older traces could go on past such a step, and their later
+        rewards are left out rather than shifted onto earlier actions.
         """
         applied = [step for step in self.steps if step.observation is not None]
         if self.initial_observation is None or not applied:
             return Trajectory(final_observation=self.initial_observation)
         shown = [self.initial_observation, *(step.observation for step in applied)]
-        rewards = [step.reward or 0.0 for step in applied]
+        if self.provenance.env.step_verifier_sha256 is None:
+            rewards = [0.0] * len(applied)
+        else:
+            rewards = []
+            for step in applied:
+                if step.reward is None:
+                    break
+                rewards.append(step.reward)
         return Trajectory(
             steps=list(zip(shown, (step.action for step in applied))),
             final_observation=shown[-1],
