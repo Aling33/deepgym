@@ -15,11 +15,19 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import Field, PrivateAttr
 
-from deepgym.exceptions import DeepGymError
+from deepgym.exceptions import DeepGymError, VerifierError
 from deepgym.harbor import HarborEnvironment, HarborTask, load_tasks
 from deepgym.integrations.hf import _require_datasets
+from deepgym.judge import DEADLINE_GRACE_S
 from deepgym.models import Environment, RunResult, VerifierResult
-from deepgym.sandbox import _extract_json_line, build_run_result
+from deepgym.sandbox import (
+    ExecutionResult,
+    build_run_result,
+    check_exit,
+    parse_wrapped_output,
+    split_wrapped_output,
+    wrap_stderr,
+)
 
 if TYPE_CHECKING:
     from deepgym.core import DeepGym
@@ -28,6 +36,9 @@ _RUNNER_PATH = '/home/user/deepgym_runner.py'
 _TASK_PATH = '/home/user/deepgym_task.json'
 _PATCH_PATH = '/home/user/deepgym_candidate.diff'
 _ARCHIVE_PATH = '/home/user/deepgym_task.tar.gz'
+# The patch runner prints this line, flushed, just before it runs the tests: the first time
+# anything the patch wrote executes, as root, so it can stop the runner itself.
+_TESTS_STARTED = 'deepgym-runner: running the tests'
 
 _PATCH_BLOCK_RE = re.compile(r'```(?:diff|patch)?\s*\n(.*?)```', re.DOTALL | re.IGNORECASE)
 _JSON_LIST_RE = re.compile(r'^\s*\[', re.DOTALL)
@@ -167,19 +178,36 @@ def _shell_snippet(value: str) -> str:
     return "'" + value.replace("'", "'\\''") + "'"
 
 
-def _verifier_result_from_output(
-    stdout: str,
-    stderr: str,
-    *,
-    exit_code: int,
-) -> VerifierResult:
-    json_str = _extract_json_line(stdout)
-    if json_str is None:
-        raise ValueError(
-            f'Custom benchmark runner did not emit JSON. exit_code={exit_code}, '
-            f'stdout={stdout!r}, stderr={stderr!r}'
-        )
-    return VerifierResult.model_validate_json(json_str)
+def _parse_runner_output(output: str, marker: str, exit_code: int) -> ExecutionResult:
+    """Parse a runner's verdict from its stdout alone, as the judges read theirs.
+
+    The provider merges the streams, and a JSON line on stderr is no verdict. A runner that
+    printed :data:`_TESTS_STARTED` and then no valid verdict its exit code (0 or 1) backs was
+    stopped by what the patch ran: the environment had run every step before, so that is a
+    judged 0, ``policy_sandbox_failure``.
+
+    Raises:
+        VerifierError: If the runner stopped without a verdict before its tests ran.
+    """
+    stdout, stderr = split_wrapped_output(output, marker)
+    if _TESTS_STARTED not in stdout.splitlines():
+        return parse_wrapped_output(output, marker, exit_code)
+    if exit_code in (0, 1):
+        try:
+            executed = parse_wrapped_output(output, marker, exit_code)
+            check_exit(exit_code, executed.verifier_result.score, executed.verifier_result.passed)
+        except VerifierError:
+            pass
+        else:
+            return executed
+    result = VerifierResult(
+        score=0.0,
+        passed=False,
+        details=f'The runner stopped without a valid verdict (exit {exit_code}) while running '
+        'the tests, so the patch scores 0.',
+        error_type='policy_sandbox_failure',
+    )
+    return ExecutionResult(result, stderr=stderr, exit_code=1)
 
 
 def _run_sandbox_runner(
@@ -191,8 +219,18 @@ def _run_sandbox_runner(
     patch_text: str | None = None,
     archive_path: Path | None = None,
     timeout: int,
-) -> tuple[VerifierResult, int, str]:
-    """Run *script* as root in a fresh sandbox from *dg*'s provider, booted from *env*."""
+) -> tuple[ExecutionResult, str]:
+    """Run *script* as root in a fresh sandbox from *dg*'s provider, booted from *env*.
+
+    The runner keeps to *timeout* itself; the provider allows a grace period on top, so a
+    test the runner kills at its limit is still scored by the runner.
+
+    Returns:
+        The parsed run (see :func:`_parse_runner_output`) and the sandbox's id.
+
+    Raises:
+        VerifierError: If the runner stopped without a verdict before its tests ran.
+    """
     sandbox = dg.open_sandbox(env)
     try:
         sandbox.upload(script.encode('utf-8'), _RUNNER_PATH)
@@ -207,9 +245,9 @@ def _run_sandbox_runner(
             sandbox.upload(archive_path.read_bytes(), _ARCHIVE_PATH)
             command += f' {_ARCHIVE_PATH}'
 
-        response = sandbox.exec(command, timeout=timeout)
-        result = _verifier_result_from_output(response.output, '', exit_code=response.exit_code)
-        return result, response.exit_code, sandbox.id
+        command, marker = wrap_stderr(command)
+        response = sandbox.exec(command, timeout=timeout + DEADLINE_GRACE_S)
+        return _parse_runner_output(response.output, marker, response.exit_code), sandbox.id
     finally:
         sandbox.delete()
 
@@ -230,9 +268,10 @@ def _execute_runner(
         SandboxError: If *dg* runs locally. These runners apply model-written
             patches and run commands and tests outside any judge isolation, so they
             only ever run inside a container or VM.
+        VerifierError: If the runner stopped without a verdict before its tests ran.
     """
     start = time.perf_counter()
-    result, exit_code, sandbox_id = _run_sandbox_runner(
+    executed, sandbox_id = _run_sandbox_runner(
         env,
         dg,
         script,
@@ -242,7 +281,13 @@ def _execute_runner(
         timeout=timeout,
     )
     elapsed_ms = (time.perf_counter() - start) * 1000
-    return build_run_result(result, elapsed_ms, sandbox_id, exit_code=exit_code)
+    return build_run_result(
+        executed.verifier_result,
+        elapsed_ms,
+        sandbox_id,
+        stderr=executed.stderr,
+        exit_code=executed.exit_code,
+    )
 
 
 def _vendored_toml_source() -> str:
@@ -276,23 +321,31 @@ class PatchVerifier:
     def build_runner_script() -> str:
         """Return the self-contained patch runner script.
 
-        A vendored TOML parser is inlined as ``_VENDORED_TOML`` and exec'd only when the
-        image's Python lacks ``tomllib`` (3.10), so the config comparison matches the tools
-        either way; see :func:`_vendored_toml_source`. The runner itself needs Python 3.10+:
-        its annotations (``Path | None``) are evaluated as each function is defined, so on an
-        older image the whole runner fails at load, before it emits a result.
+        It runs in the task image's ``python3``, which can be as old as 3.8 (some SWE-bench
+        Pro images), so its annotations are postponed and it uses nothing newer. A vendored
+        TOML parser is inlined as ``_VENDORED_TOML`` and exec'd only when the image's Python
+        lacks ``tomllib`` (before 3.11), so the config comparison matches the tools either
+        way; see :func:`_vendored_toml_source`.
         """
-        return f'_VENDORED_TOML = {_vendored_toml_source()!r}\n\n' + textwrap.dedent(
+        toml = _vendored_toml_source()
+        header = (
+            'from __future__ import annotations\n\n'
+            f'_TESTS_STARTED = {_TESTS_STARTED!r}\n_VENDORED_TOML = {toml!r}\n\n'
+        )
+        return header + textwrap.dedent(
             """
             import fnmatch
             import json
             import os
             import posixpath
             import re
+            import shlex
             import shutil
+            import signal
             import subprocess
             import sys
             import tempfile
+            import time
             from pathlib import Path
 
 
@@ -337,15 +390,175 @@ class PatchVerifier:
                 )
 
 
-            def _run(command: str, *, cwd: Path | None = None, timeout: int = 300) -> subprocess.CompletedProcess[str]:
-                return subprocess.run(
-                    command,
-                    shell=True,
-                    cwd=str(cwd) if cwd is not None else None,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                )
+            def _read_end(file, limit: int = 65536) -> str:
+                # The last *limit* bytes written to *file*, decoded as UTF-8 with replacements.
+                file.seek(max(0, file.seek(0, os.SEEK_END) - limit))
+                return file.read().decode('utf-8', 'replace')
+
+
+            def _run(command: str, *, cwd: Path | None = None, timeout: float = 300) -> subprocess.CompletedProcess[str]:
+                # Run *command* in its own session, its output in files that nothing it leaves running
+                # can hold open. One still running after *timeout* seconds is killed with everything
+                # it started (SIGKILL) and reported as exit -9: a setup step then fails, and a test
+                # the patch made hang scores 0, without touching the next command.
+                with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+                    proc = subprocess.Popen(
+                        command,
+                        shell=True,
+                        cwd=str(cwd) if cwd is not None else None,
+                        stdout=out,
+                        stderr=err,
+                        start_new_session=True,
+                    )
+                    try:
+                        returncode, note = proc.wait(timeout=timeout), ''
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        proc.wait()
+                        returncode, note = -9, f'\\ntimed out after {timeout:.1f}s'
+                    return subprocess.CompletedProcess(command, returncode, _read_end(out), _read_end(err) + note)
+
+
+            # Rustup's layout in the official rust images. An image flattened without its config
+            # (MiMo's on Docker Hub) keeps the toolchain there but loses the ENV that put it on
+            # PATH, so cargo would be "command not found" for every answer, right or wrong.
+            _CARGO_HOME = '/usr/local/cargo'
+            _RUSTUP_HOME = '/usr/local/rustup'
+
+
+            def _restore_rust_env() -> None:
+                # Put that toolchain back when cargo is missing from PATH but installed there.
+                if shutil.which('cargo') or not os.path.isfile(_CARGO_HOME + '/bin/cargo'):
+                    return
+                os.environ.setdefault('CARGO_HOME', _CARGO_HOME)
+                if os.path.isdir(_RUSTUP_HOME):
+                    os.environ.setdefault('RUSTUP_HOME', _RUSTUP_HOME)
+                os.environ['PATH'] = _CARGO_HOME + '/bin' + os.pathsep + (os.environ.get('PATH') or os.defpath)
+
+
+            # Reserved words that open and close a compound command. What runs inside one may never
+            # run at all (a branch not taken, a loop over nothing), so it is not looked up.
+            _OPENERS = {'if', 'while', 'until', 'for', '{'}
+            _CLOSERS = {'fi', 'done', '}'}
+            _IMPORTABLE = 'import importlib.util, sys; sys.exit(importlib.util.find_spec(sys.argv[1]) is None)'
+
+
+            _OPERATORS = set('();|&\\n')
+            _CONTINUE = ('&&', '||', '|', '|&')  # operators an and-or list goes on after
+
+
+            def _top_level_commands(command: str) -> list:
+                # The simple commands of shell *command* that must run for it to pass, each as its
+                # words without redirections: none inside a compound command or subshell, in an
+                # and-or list with `||` (which handles a missing command), or calling a function
+                # *command* defines. It ends at a here-document, `case` (whose patterns look like
+                # commands) or `function`, and is empty if shlex, stricter than sh, can't split it.
+                lexer = shlex.shlex(command.replace('\\\\\\n', ''), posix=True, punctuation_chars='();<>|&\\n')
+                lexer.whitespace, lexer.whitespace_split, lexer.commenters = ' \\t\\r', True, ''
+                try:
+                    tokens = iter(list(lexer) + [';'])
+                except ValueError:
+                    return []
+                found, listed, words, depth, has_or, defined = [], [], [], 0, False, set()
+                for token in tokens:
+                    if token.startswith('#'):  # a comment runs to the end of its line
+                        token = next((t for t in tokens if t and '\\n' in t and set(t) <= _OPERATORS), ';')
+                    if token.startswith('<<') or (not words and token in ('case', 'function')):
+                        break
+                    if token and set(token) <= set('<>&|') and set(token) & set('<>'):
+                        if words and words[-1].isdigit():
+                            words.pop()  # the redirected descriptor, as in 2>/dev/null
+                        next(tokens, None)  # and the redirection's target
+                    elif not token or not set(token) <= _OPERATORS:
+                        if words or token not in _OPENERS | _CLOSERS:
+                            words.append(token)
+                        else:
+                            depth += 1 if token in _OPENERS else -1
+                    else:
+                        if token.rstrip('\\n') in _CONTINUE:  # a newline after one continues it
+                            token = token.rstrip('\\n')
+                        if token == '()' and len(words) == 1:
+                            defined.add(words[0])
+                        elif words and not depth and words[0] not in defined:
+                            listed.append(words)
+                        words, has_or = [], has_or or token == '||'
+                        if token not in _CONTINUE:  # the and-or list ends
+                            found += [] if has_or else listed
+                            listed, has_or = [], False
+                        depth += token.count('(') - token.count(')')
+                return found
+
+
+            def _python_module(program: str, args: list):
+                # (interpreter flags, module) when *program* is a python run as `-m module`, else None.
+                if not re.fullmatch(r'python[0-9.]*', posixpath.basename(program)):
+                    return None
+                flags = []
+                while args and args[0].startswith('-') and args[0] not in ('-', '-c', '-m'):
+                    take = 2 if args[0] in ('-W', '-X') else 1
+                    flags, args = flags + args[:take], args[take:]
+                return (flags, args[1]) if args[:1] == ['-m'] and args[1:2] else None
+
+
+            def _preflight(command: str, cwd: Path, repo_root: Path) -> str | None:
+                # Why this environment cannot run test *command*, checked before the patch, or None:
+                # a program that always runs (see _top_level_commands) is neither on PATH nor an
+                # executable outside the repo, or the package a `python -m` names is neither in the
+                # repo (or its PYTHONPATH) nor importable by that python, asked without the repo on
+                # its path so no repo code runs. It never runs the command (dash 0.5.10's `sh -n -c`
+                # would). A path in the repo is the repo's own (the hidden tests may add it); nothing
+                # is looked up after a PATH change, `source` or `eval`, a PATH lookup after `cd` when
+                # PATH has relative entries, nor a module after `cd` or `export` or that the shell
+                # would expand. Best effort: what a wrapper script runs is not seen, so its failure
+                # after the patch is scored.
+                repo_dirs = {str(repo_root), str(cwd)}
+                relative = any(not entry.startswith('/') for entry in os.environ.get('PATH', '').split(os.pathsep))
+                names, modules, plain, moved = [], [], True, False
+                for words in _top_level_commands(command):
+                    if any(word.startswith('PATH=') for word in words):
+                        break
+                    words = words[1:] if words[0] == '!' else words
+                    assigned = {}
+                    while words and re.match(r'[A-Za-z_][A-Za-z0-9_]*=', words[0]):
+                        name, _, value = words.pop(0).partition('=')
+                        assigned[name] = value
+                    if not words or re.search(r'[$`*?~\\[]', words[0]):
+                        continue
+                    program = words[0]
+                    if program in ('.', 'source', 'eval', 'alias'):
+                        break
+                    if program.startswith('/'):
+                        if any(program == base or program.startswith(base + '/') for base in repo_dirs):
+                            continue
+                        if not (os.path.isfile(program) and os.access(program, os.X_OK)):
+                            return f'{program} is not an executable file'
+                    elif '/' in program:
+                        continue
+                    elif not (moved and relative):
+                        names.append(program)
+                    module = _python_module(program, words[1:])
+                    computed = any(re.search('[$`]', text) for text in (*assigned.values(), module[1] if module else ''))
+                    if module and plain and not computed:
+                        modules.append((program, *module, assigned.get('PYTHONPATH', '')))
+                    moved = moved or program in ('cd', 'pushd', 'popd')
+                    plain = plain and program not in ('cd', 'pushd', 'popd', 'export', 'unset')
+                if names:
+                    lookup = 'for w; do command -v "$w" >/dev/null 2>&1 || echo "$w"; done'
+                    found = subprocess.run(['/bin/sh', '-c', lookup, 'sh', *names], cwd=str(cwd), capture_output=True, text=True)
+                    missing = found.stdout.split()
+                    if missing:
+                        return 'not found: ' + ', '.join(dict.fromkeys(missing))
+                for python, flags, module, pythonpath in modules:
+                    top = module.split('.')[0]
+                    dirs = [cwd, *(cwd / entry for entry in pythonpath.split(os.pathsep) if entry)]
+                    if any((folder / top).is_dir() or (folder / (top + '.py')).is_file() for folder in dirs):
+                        continue
+                    if subprocess.run([python, *flags, '-c', _IMPORTABLE, top], cwd='/', capture_output=True).returncode:
+                        return f'{python} cannot import {module}'
+                return None
 
 
             # Test infrastructure a model's diff must not touch outside the hidden test
@@ -626,7 +839,7 @@ class PatchVerifier:
                 # under the same suffix rule. A value attached to a short flag (-cci.ini) is tried
                 # without the flag too; --opt=value is split at the '='.
                 base = rel.rsplit('/', 1)[-1]
-                stem = rel[:-3].removesuffix('/__init__') if rel.endswith('.py') else None
+                stem = rel[:-12] if rel.endswith('/__init__.py') else rel[:-3] if rel.endswith('.py') else None
                 words = []
                 for word in filter(None, re.split(r'[\\s\\'"=:;,|&()<>]+', text)):
                     words += [word, word[2:]] if re.match(r'-[A-Za-z].', word) else [word]
@@ -750,7 +963,7 @@ class PatchVerifier:
                 try:
                     for rel, state in saved.items():
                         path = repo_dir / rel
-                        for ancestor in Path(rel).parents[:-1]:
+                        for ancestor in list(Path(rel).parents)[:-1]:
                             folder = repo_dir / ancestor
                             if folder.is_symlink() or (folder.exists() and not folder.is_dir()):
                                 return f'{ancestor} is no longer a directory'
@@ -772,23 +985,32 @@ class PatchVerifier:
 
 
             def main() -> int:
+                started = time.monotonic()
+                _restore_rust_env()
                 task = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
                 patch_path = Path(sys.argv[2])
                 patch_text = patch_path.read_text(encoding='utf-8').strip()
 
-                if not task.get('test_commands'):
-                    # No real test runner: no verdict, so trainers mask the sample
-                    # instead of rewarding a patch nothing checked.
+                test_commands = task.get('test_commands') or []
+                blank = any(not command.strip() for command in test_commands)
+                if blank or not test_commands:
+                    # No real test runner, or a broken task whose blank command would "pass"
+                    # without running a test: no verdict, so trainers mask the sample instead
+                    # of rewarding a patch nothing checked.
                     return _emit(
                         {
                             'schema_version': '1.0',
                             'score': 0.0,
                             'passed': False,
-                            'details': 'No test runner for this task, so it was not scored.',
+                            'details': (
+                                'The task has a blank test command, so it was not run or scored.'
+                                if blank
+                                else 'No test runner for this task, so it was not scored.'
+                            ),
                             'reward_components': {'apply': 0.0, 'tests': 0.0},
                             'metrics': {'pass_fraction': 0.0, 'tests_run': 0},
                             'truncated': False,
-                            'error_type': 'unsupported_runner',
+                            'error_type': 'invalid_task' if blank else 'unsupported_runner',
                             'cases': [],
                         },
                         1,
@@ -811,7 +1033,9 @@ class PatchVerifier:
                     )
 
                 timeout = int(task.get('timeout', 1800))
-                test_commands = task['test_commands']
+                # The whole run keeps to the timeout, so the runner, not the provider, stops a
+                # test that hangs (the provider allows a few seconds more).
+                deadline = started + timeout
                 setup_commands = task.get('setup_commands', '')
                 test_patch = task.get('test_patch', '')
                 apply_credit = float(task.get('apply_credit', 0.3))
@@ -910,6 +1134,24 @@ class PatchVerifier:
                             },
                             1,
                         )
+                    if repo_root is None:
+                        # A missing or broken repo (the image lacks repo_dir, or it is no checkout)
+                        # is the environment's fault, never the patch's, and without the top-level
+                        # the paths can't be checked: no verdict, so trainers mask the sample.
+                        return _emit(
+                            {
+                                'schema_version': '1.0',
+                                'score': 0.0,
+                                'passed': False,
+                                'details': f'git cannot find the repository at {repo_dir}, so the patch was not scored.',
+                                'reward_components': {'apply': 0.0, 'tests': 0.0},
+                                'metrics': {'pass_fraction': 0.0, 'tests_run': 0},
+                                'truncated': False,
+                                'error_type': 'validation_error',
+                                'cases': [],
+                            },
+                            1,
+                        )
                     if hidden is None:
                         return _emit(
                             {
@@ -925,6 +1167,25 @@ class PatchVerifier:
                             },
                             1,
                         )
+                    for index, command in enumerate(test_commands):
+                        broken = _preflight(command, repo_dir, repo_root)
+                        if broken:
+                            # Found before the patch is applied, so the environment's fault, never
+                            # the model's: no verdict. After the patch, every outcome is scored.
+                            return _emit(
+                                {
+                                    'schema_version': '1.0',
+                                    'score': 0.0,
+                                    'passed': False,
+                                    'details': f'Test command {index} cannot run in this environment ({broken}), so the patch was not scored.',
+                                    'reward_components': {'apply': 0.0, 'tests': 0.0},
+                                    'metrics': {'pass_fraction': 0.0, 'tests_run': 0},
+                                    'truncated': False,
+                                    'error_type': 'preflight_failed',
+                                    'cases': [],
+                                },
+                                1,
+                            )
                     saved = _snapshot(repo_dir, hidden)
 
                     check = subprocess.run(
@@ -974,23 +1235,6 @@ class PatchVerifier:
                                 'metrics': {'pass_fraction': 0.0, 'tests_run': 0},
                                 'truncated': False,
                                 'error_type': 'invalid_patch',
-                                'cases': [],
-                            },
-                            1,
-                        )
-                    if repo_root is None:
-                        # Without the top-level the paths can't be checked: no verdict, so
-                        # trainers mask the sample rather than grade an unchecked patch.
-                        return _emit(
-                            {
-                                'schema_version': '1.0',
-                                'score': 0.0,
-                                'passed': False,
-                                'details': 'git cannot find the repository top-level, so the patch was not scored.',
-                                'reward_components': {'apply': 0.0, 'tests': 0.0},
-                                'metrics': {'pass_fraction': 0.0, 'tests_run': 0},
-                                'truncated': False,
-                                'error_type': 'validation_error',
                                 'cases': [],
                             },
                             1,
@@ -1091,11 +1335,37 @@ class PatchVerifier:
                                 1,
                             )
 
-                    per_command_timeout = max(1, timeout // max(len(test_commands), 1))
+                    if deadline <= time.monotonic():
+                        # The steps before the tests used up the time: the harness's doing.
+                        return _emit(
+                            {
+                                'schema_version': '1.0',
+                                'score': 0.0,
+                                'passed': False,
+                                'details': 'The time limit ran out before the tests started, so the patch was not scored.',
+                                'reward_components': {'apply': 0.0, 'tests': 0.0},
+                                'metrics': {'pass_fraction': 0.0, 'tests_run': 0},
+                                'truncated': False,
+                                'error_type': 'validation_timeout',
+                                'cases': [],
+                            },
+                            1,
+                        )
+                    # From here on, code the patch wrote runs, as root: if it stops the runner, this
+                    # line tells the host the tests had started (a scored 0).
+                    print(_TESTS_STARTED, flush=True)
                     passed_count = 0
                     cases = []
                     for index, command in enumerate(test_commands):
-                        proc = _run(command, cwd=repo_dir, timeout=per_command_timeout)
+                        # The preflight found the environment able to run this command before the
+                        # patch, so whatever it does now (no tests collected, a crash, a kill) is
+                        # the patch's to own: every exit is scored. Each gets its share of the time
+                        # left, and once that is gone the rest fail without starting.
+                        left = deadline - time.monotonic()
+                        if left > 0:
+                            proc = _run(command, cwd=repo_dir, timeout=left / (len(test_commands) - index))
+                        else:
+                            proc = subprocess.CompletedProcess(command, -9, '', 'not run: the time limit ran out')
                         passed = proc.returncode == 0
                         if passed:
                             passed_count += 1
@@ -1315,7 +1585,10 @@ class RepoPatchEnvironment(Environment):
     ``repo_dir``, such as the MiMo-V2.6-RL code subset. The model returns a unified
     diff; the SWE-bench Pro patch runner applies it, puts every file the hidden
     ``test_patch`` touches back to its prior state, applies the test patch, runs
-    ``test_command`` and scores 1.0 if it exits 0, else 0.0. A diff that touches any
+    ``test_command`` and scores 1.0 if it exits 0, else 0.0. An environment that can't run
+    the tests, found before the patch is applied (the image lacks ``repo_dir`` or the
+    command's runner, toolchain or module), has no verdict, nor does a blank
+    ``test_command``; after the patch, every exit is scored. A diff that touches any
     other test infrastructure (tests and their helper code, conftest.py, runner config,
     installed dependencies) scores 0.0 with ``error_type='test_infra_tampering'``; data
     fixtures the tests read may change.
