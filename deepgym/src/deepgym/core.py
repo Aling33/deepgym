@@ -126,11 +126,24 @@ class DeepGym:
         if hasattr(env, 'run_with_deepgym'):
             return env.run_with_deepgym(self, model_output, **kwargs)  # type: ignore[return-value]
 
-        if self._provider:
-            return self._run_in(open_sandbox(self._provider, env.image), env, model_output)
         if self._local_executor is not None:
             return self._run_local(env, model_output)
-        return self._run_in(DaytonaSandbox(self._daytona, env), env, model_output)
+        return self._run_in(self.open_sandbox(env), env, model_output)
+
+    def open_sandbox(self, env: Environment) -> Sandbox:
+        """Start a fresh sandbox for *env* on this client's provider or Daytona.
+
+        Raises:
+            SandboxError: In local mode, which has none, or if the sandbox can't be started.
+        """
+        if self._local_executor is not None:
+            raise SandboxError(
+                f'{type(env).__name__} needs a sandbox and local mode has none: '
+                "use DeepGym(mode='docker'), 'apple', 'modal', 'e2b' or 'daytona'."
+            )
+        if self._provider:
+            return open_sandbox(self._provider, env.image)
+        return DaytonaSandbox(self._daytona, env)
 
     def _run_local(self, env: Environment, model_output: str) -> RunResult:
         """Execute using the local subprocess executor."""
@@ -181,7 +194,7 @@ class DeepGym:
             return Session(env, LocalBackend())
         box = DaytonaSandbox(self._daytona, env)
         desktop = DaytonaDesktop(box, env.timeout_per_step, env.setup_timeout)
-        return Session(env, SandboxBackend(box, desktop if env.desktop else None))
+        return Session(env, SandboxBackend(box, desktop=desktop if env.desktop else None))
 
     def run_episode(
         self, env: MultiTurnEnvironment, agent: Callable[[Observation], Action]

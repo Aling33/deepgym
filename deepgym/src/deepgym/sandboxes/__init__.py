@@ -3,15 +3,17 @@
 ``open_sandbox('docker', image)`` starts a fresh sandbox by provider name, from the
 environment's image or the provider's default. Daytona is opened by
 :class:`~deepgym.core.DeepGym` itself because it needs a client and the environment's
-snapshot. Provider SDKs are optional extras, imported only when that provider is used.
+snapshot. ``build_image`` builds a Dockerfile for the container CLIs (apple, docker).
+Provider SDKs are optional extras, imported only when that provider is used.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Literal
 
 from deepgym.exceptions import DeepGymError
-from deepgym.sandboxes.protocol import ExecResult, Sandbox, SandboxTimeoutError
+from deepgym.sandboxes.protocol import TRUSTED_PATH, ExecResult, Sandbox, SandboxTimeoutError
 
 Provider = Literal['apple', 'docker', 'modal', 'e2b']
 PROVIDERS: tuple[Provider, ...] = ('apple', 'docker', 'modal', 'e2b')
@@ -22,6 +24,8 @@ __all__ = [
     'Provider',
     'Sandbox',
     'SandboxTimeoutError',
+    'TRUSTED_PATH',
+    'build_image',
     'check_provider',
     'open_sandbox',
 ]
@@ -55,6 +59,27 @@ def open_sandbox(provider: Provider, image: str | None = None) -> Sandbox:
 
             return E2BSandbox(image)
     raise DeepGymError(f'Unknown sandbox provider {provider!r}; choose from {PROVIDERS}')
+
+
+def build_image(backend: str, context: Path) -> str:
+    """Build the Dockerfile in *context* for *backend*; return the image to boot.
+
+    Args:
+        backend: A client's backend (``DeepGym.backend``): a provider, 'daytona' or 'local'.
+        context: The build context, holding the Dockerfile.
+
+    Raises:
+        DeepGymError: If *backend* boots registry images only (everything but apple and
+            docker), or the build fails.
+    """
+    if backend not in ('apple', 'docker'):
+        raise DeepGymError(
+            f'{backend} sandboxes boot registry images only; give the task a prebuilt image'
+        )
+    from deepgym.sandboxes.apple import AppleContainer
+    from deepgym.sandboxes.docker import DockerContainer
+
+    return (AppleContainer if backend == 'apple' else DockerContainer).build(context)
 
 
 def check_provider(provider: Provider) -> None:

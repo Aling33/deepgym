@@ -8,23 +8,26 @@ everything used here, so a provider only names its CLI and how it differs.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 import shutil
 import subprocess
 import time
 from collections.abc import Mapping
+from pathlib import Path
 from typing import ClassVar
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict
 
 from deepgym.exceptions import SandboxError
-from deepgym.sandboxes.protocol import ExecResult, SandboxTimeoutError
+from deepgym.sandboxes.protocol import TRUSTED_PATH, ExecResult, SandboxTimeoutError
 
 DEFAULT_IMAGE = os.environ.get('DEEPGYM_CONTAINER_IMAGE', 'python:3.12-slim')
 # Caps per sandbox, so hostile code can't starve the machine running the containers.
 _LIMITS = ('--cpus', '2', '--memory', '2g')
 _START_TIMEOUT_S = 300
+_BUILD_TIMEOUT_S = 1800
 # Exit codes from coreutils `timeout`: 124 after SIGTERM, 137 after the follow-up SIGKILL.
 _TIMEOUT_EXIT_CODES = frozenset({124, 137})
 _NAME_PREFIX = 'deepgym-'
@@ -66,6 +69,40 @@ class CliContainer:
             raise SandboxError(f'Failed to start container: {started.stderr.decode()[-1000:]}')
 
     @classmethod
+    def build(cls, context: Path) -> str:
+        """Build the Dockerfile in *context*, unless an identical build exists; return its tag.
+
+        The tag hashes every path in *context* with its permission bits, and each file's
+        bytes or each link's target, so changing any of them means a new build.
+
+        Raises:
+            SandboxError: If the build fails or times out.
+        """
+        digest = hashlib.sha256()
+        for path in sorted(context.rglob('*')):
+            mode = path.lstat().st_mode
+            if path.is_symlink():
+                data = os.readlink(path).encode()
+            elif path.is_file():
+                data = path.read_bytes()
+            else:
+                data = b''
+            digest.update(
+                f'{path.relative_to(context).as_posix()}\0{mode:o}\0{len(data)}\0'.encode()
+            )
+            digest.update(data)
+        tag = f'{_NAME_PREFIX}build:{digest.hexdigest()[:16]}'
+        if cls._cli('image', 'inspect', tag, timeout=30).returncode == 0:
+            return tag
+        try:
+            built = cls._cli('build', '--tag', tag, str(context), timeout=_BUILD_TIMEOUT_S)
+        except subprocess.TimeoutExpired as exc:
+            raise SandboxError(f'Building {context} took over {_BUILD_TIMEOUT_S}s') from exc
+        if built.returncode != 0:
+            raise SandboxError(f'Failed to build {context}: {built.stderr.decode()[-1000:]}')
+        return tag
+
+    @classmethod
     def available(cls) -> bool:
         """Return True if the CLI is installed and its daemon or service answers."""
         if shutil.which(cls.cli) is None:
@@ -96,8 +133,8 @@ class CliContainer:
             argv += ['--env', f'{key}={value}']
         argv.append(self.id)
         if timeout:
-            argv += ['timeout', '--kill-after=2', str(timeout)]
-        argv += ['sh', '-c', command]
+            argv += ['/usr/bin/timeout', '--kill-after=2', str(timeout)]
+        argv += ['/bin/sh', '-c', command]
         start = time.monotonic()
         try:
             done = self._cli(*argv, timeout=(timeout or 3600) + 15)
@@ -115,10 +152,10 @@ class CliContainer:
         Raises:
             SandboxError: If the write fails.
         """
-        script = 'mkdir -p "$(dirname "$1")" && cat > "$1"'
+        script = f'PATH={TRUSTED_PATH}; mkdir -p "$(dirname "$1")" && cat > "$1"'
         try:
             done = self._cli(
-                'exec', '--interactive', self.id, 'sh', '-c', script, 'upload', path,
+                'exec', '--interactive', self.id, '/bin/sh', '-c', script, 'upload', path,
                 input=content, timeout=120,
             )  # fmt: skip
         except subprocess.TimeoutExpired as exc:
