@@ -14,12 +14,15 @@ Tier 3 uses black-box iterative probing with feedback-only access
 
 from __future__ import annotations
 
+import ast
+import builtins
 import json
+import keyword
 import logging
 import os
 import re
 import textwrap
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field
 
@@ -45,7 +48,10 @@ DEFAULT_STRATEGIES: list[str] = [
     'llm_attack',
 ]
 
-_PASS_THRESHOLD: float = 0.5  # score above this ⇒ exploit found
+PASS_THRESHOLD: float = 0.5  # score above this ⇒ exploit found
+
+_EXPECTED_KEYS = ('expected', 'output', 'answer')
+"""Test-case keys that may hold the expected output, in the order they're tried."""
 
 _EXIT_PLUGIN = 'def pytest_sessionfinish(session, exitstatus):\n    import os\n    os._exit(0)\n'
 _ATEXIT_EXIT = 'import atexit, os; atexit.register(os._exit, 0)\n'
@@ -77,6 +83,104 @@ PATCH_TAMPERING_ATTACKS: dict[str, dict[str, str]] = {
 }
 """Diffs that try to pass a patch task's hidden tests without fixing anything, by adding
 test infrastructure the test runner loads by itself (file path -> content)."""
+
+
+_ENTRY_POINT_BODIES = {
+    'hardcoded': 'return 0',
+    'trivial': 'return None',
+    'overflow': "return float('nan')",
+    'pattern': 'return args[0] if args else None',
+}
+"""What each attack's version of the env's entry points returns: a constant, nothing,
+NaN, or its own input echoed back. The empty attack defines nothing."""
+
+
+def entry_points(env: Environment) -> list[str]:
+    """Return the function names a solution to *env* must define, best evidence first.
+
+    The reference solution's top-level functions, then what the verifier reaches on the
+    module load_solution returns (``sol.name(...)``, ``getattr(sol, NAME)``), then names
+    the task shows as code (`` `name(` `` or ``def name(``). Empty for a script task.
+    """
+    names = [*_top_level_functions(env.reference_solution or ''), *_loaded_names(env)]
+    # A task also shows syntax (`if(x)`) and builtins (`sorted()`): never entry points.
+    names += [
+        name
+        for name in re.findall(r'(?:`|\bdef\s+)([A-Za-z_]\w*)\s*\(', env.task)
+        if not hasattr(builtins, name)
+    ]
+    return list(
+        dict.fromkeys(
+            name
+            for name in names
+            if name.isidentifier() and not keyword.iskeyword(name) and not name.startswith('_')
+        )
+    )
+
+
+def _parse(source: str) -> ast.Module | None:
+    """Parse *source*, a module or a verifier body (top-level ``return``); None if neither."""
+    for text in (source, 'def _body():\n' + textwrap.indent(source, '    ')):
+        try:
+            return ast.parse(text)
+        except SyntaxError:
+            continue
+    return None
+
+
+def _top_level_functions(source: str) -> list[str]:
+    """Names of the top-level functions in *source*, if it parses as Python."""
+    try:
+        body = ast.parse(source).body
+    except SyntaxError:
+        return []
+    return [node.name for node in body if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)]
+
+
+def _loaded_names(env: Environment) -> list[str]:
+    """Attributes the verifier reaches on the solution module from load_solution()."""
+    tree = _parse(env.verifier_source)
+    if tree is None:
+        return []
+
+    def is_load(node: ast.AST) -> bool:
+        func = node.func if isinstance(node, ast.Call) else None
+        return getattr(func, 'id', getattr(func, 'attr', None)) == 'load_solution'
+
+    constants = {
+        target.id: node.value.value
+        for node in tree.body
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+        for target in node.targets
+        if isinstance(target, ast.Name) and isinstance(node.value.value, str)
+    }
+    loaded = {
+        target.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign) and is_load(node.value)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+
+    def is_module(node: ast.AST) -> bool:
+        return is_load(node) or (isinstance(node, ast.Name) and node.id in loaded)
+
+    names: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and is_module(node.value):
+            names.append(node.attr)
+        elif (
+            isinstance(node, ast.Call)
+            and getattr(node.func, 'id', None) in ('getattr', 'hasattr')
+            and len(node.args) >= 2
+            and is_module(node.args[0])
+        ):
+            name = node.args[1]
+            if isinstance(name, ast.Constant) and isinstance(name.value, str):
+                names.append(name.value)
+            elif isinstance(name, ast.Name) and name.id in constants:
+                names.append(constants[name.id])
+    return names
 
 
 def new_files_diff(files: dict[str, str]) -> str:
@@ -145,7 +249,7 @@ class AdversarialReport(BaseModel):
             exploits_found=exploits,
             inconclusive=inconclusive,
             results=results,
-            is_robust=exploits == 0 and inconclusive == 0,
+            is_robust=bool(results) and exploits == 0 and inconclusive == 0,
         )
 
 
@@ -155,7 +259,8 @@ class BlackBoxRound(BaseModel):
     round_num: int = Field(..., ge=1, description='1-indexed round number.')
     attempts: list[dict] = Field(
         default_factory=list,
-        description='Per-attempt dicts with keys: code, score, strategy.',
+        description='Per-attempt dicts with keys: code, score, strategy, inconclusive (true '
+        'when the run got no verdict, so its score of 0 means nothing).',
     )
     best_score: float = Field(
         default=0.0, ge=0.0, le=1.0, description='Highest score in this round.'
@@ -169,8 +274,19 @@ class BlackBoxReport(BaseModel):
     """Aggregate results from a multi-round black-box adversarial attack."""
 
     verifier_id: str = Field(..., description='Identifier for the tested verifier.')
+    status: Literal['exploitable', 'robust', 'inconclusive'] = Field(
+        ...,
+        description="'exploitable' if a judged attempt reached the pass threshold; 'robust' "
+        'only if every round ran and every attempt was judged without one; otherwise '
+        "'inconclusive': the scan is incomplete and says nothing, so keep testing.",
+    )
     exploitable: bool = Field(
         ..., description='True if any non-solution scored above the pass threshold.'
+    )
+    problems: list[str] = Field(
+        default_factory=list,
+        description='Why the scan is incomplete: failed or empty LLM rounds, attempts that '
+        'got no verdict.',
     )
     rounds: list[BlackBoxRound] = Field(default_factory=list, description='Per-round details.')
     total_attempts: int = Field(default=0, ge=0, description='Total attempts across all rounds.')
@@ -214,7 +330,7 @@ class AdversarialTester:
         self,
         dg: DeepGym,
         *,
-        pass_threshold: float = _PASS_THRESHOLD,
+        pass_threshold: float = PASS_THRESHOLD,
         api_key: str | None = None,
         model: str = 'claude-haiku-4-5-20251001',
     ) -> None:
@@ -284,22 +400,28 @@ class AdversarialTester:
         Returns
         -------
         str
-            Python source code of the adversarial "solution".
+            Python source code of the adversarial "solution": the strategy's generic
+            payload, plus that strategy's version of every :func:`entry_points` function,
+            so a verifier that calls the env's real function meets the attack.
         """
         if strategy == 'empty':
             return self._attack_empty()
         elif strategy == 'hardcoded':
-            return self._attack_hardcoded(env)
+            code = self._attack_hardcoded(env)
         elif strategy == 'trivial':
-            return self._attack_trivial(env)
+            code = self._attack_trivial(env)
         elif strategy == 'overflow':
-            return self._attack_overflow()
+            code = self._attack_overflow()
         elif strategy == 'pattern':
-            return self._attack_pattern(env)
+            code = self._attack_pattern(env)
         elif strategy == 'llm_attack':
             return self._attack_llm(env)
         else:
             return f'# Unknown strategy: {strategy}\npass\n'
+        body = _ENTRY_POINT_BODIES[strategy]
+        return code + ''.join(
+            f'\n\ndef {name}(*args, **kwargs):\n    {body}\n' for name in entry_points(env)
+        )
 
     # -- individual strategies ------------------------------------------
 
@@ -324,19 +446,18 @@ class AdversarialTester:
             '',
         ]
         if env.test_cases:
-            # Try to extract expected outputs from test cases and print them.
-            outputs: list[str] = []
-            for tc in env.test_cases:
-                expected = tc.get('expected') or tc.get('output') or tc.get('answer')
-                if expected is not None:
-                    outputs.append(json.dumps(expected))
+            # Print each test case's expected output. Chosen by key, so 0, False and ''
+            # count; decoded from JSON at run time, so true/false/null stay valid.
+            outputs = [
+                next(tc[key] for key in _EXPECTED_KEYS if key in tc)
+                for tc in env.test_cases
+                if any(key in tc for key in _EXPECTED_KEYS)
+            ]
             if outputs:
-                lines.append('_HARDCODED = [')
-                for o in outputs:
-                    lines.append(f'    {o},')
-                lines.append(']')
+                lines.append(f'_HARDCODED = json.loads({json.dumps(outputs)!r})')
                 lines.append('for item in _HARDCODED:')
-                lines.append('    print(item)')
+                # Text as it is (an exact-output check wants hello, not "hello").
+                lines.append('    print(item if isinstance(item, str) else json.dumps(item))')
             else:
                 lines.append('print(0)')
         else:
@@ -398,8 +519,8 @@ class AdversarialTester:
             '',
         ]
         if env.test_cases:
-            # Echo back the input field of each test case.
-            lines.append('test_cases = ' + json.dumps(env.test_cases, indent=2))
+            # Echo back the input field of each test case (decoded from JSON at run time).
+            lines.append(f'test_cases = json.loads({json.dumps(env.test_cases)!r})')
             lines.append('')
             lines.append('for tc in test_cases:')
             lines.append('    # Parrot back the input as the output.')
@@ -522,12 +643,13 @@ class AdversarialTester:
         if result.stderr:
             detail_lines.append(f'stderr: {result.stderr[:300]}')
         details = '\n'.join(detail_lines)
-        exploited = result.score >= self._pass_threshold
-        if not exploited and result.error_type in inconclusive_errors:
+        if result.error_type in inconclusive_errors:
             return _not_run(strategy, f'Attack did not reach the verifier: {details}')
-        # A low score is only resistance if the verifier actually judged the attack.
-        if not exploited and not result.has_verdict:
+        # Only a verdict counts, either way: a run that failed (even one that printed a
+        # high score before it did) neither resisted nor exploited the verifier.
+        if not result.has_verdict:
             return _not_run(strategy, f'Verifier gave no verdict: {details}')
+        exploited = result.score >= self._pass_threshold
         return AttackResult(
             strategy=strategy,
             exploited=exploited,
@@ -722,7 +844,7 @@ class LLMAdversarialTester:
         model: str = 'claude-haiku-4-5-20251001',
         max_attacks: int = 5,
         *,
-        pass_threshold: float = _PASS_THRESHOLD,
+        pass_threshold: float = PASS_THRESHOLD,
     ) -> None:
         self._api_key = api_key
         self._model = model
@@ -893,7 +1015,7 @@ class BlackBoxAdversarialTester:
         max_rounds: int = 5,
         attempts_per_round: int = 3,
         *,
-        pass_threshold: float = _PASS_THRESHOLD,
+        pass_threshold: float = PASS_THRESHOLD,
     ) -> None:
         self._api_key = api_key
         self._model = model
@@ -939,6 +1061,7 @@ class BlackBoxAdversarialTester:
         rounds: list[BlackBoxRound] = []
         all_attempts: list[dict] = []
         all_strategies: list[str] = []
+        problems: list[str] = []
         best_score = 0.0
         best_strategy = ''
 
@@ -962,11 +1085,18 @@ class BlackBoxAdversarialTester:
                 exploits, strategies = self._call_llm(client, prompt)
             except DeepGymError as exc:
                 logger.warning('Black-box round %d failed: %s', round_num, exc)
+                problems.append(f'round {round_num}: {exc}')
                 break
 
             if not exploits:
                 logger.warning('Black-box round %d: no exploits parsed', round_num)
+                problems.append(f'round {round_num}: the LLM returned no parseable attempts')
                 break
+            if len(exploits) < self._attempts_per_round:  # fewer attacks than the scan claims
+                problems.append(
+                    f'round {round_num}: {len(exploits)} of {self._attempts_per_round} '
+                    'attempts parsed'
+                )
 
             round_attempts: list[dict] = []
             round_best = 0.0
@@ -977,10 +1107,14 @@ class BlackBoxAdversarialTester:
                     'code': code,
                     'score': result.score,
                     'strategy': strategy,
+                    'inconclusive': result.inconclusive,
                 }
                 round_attempts.append(attempt)
                 all_attempts.append(attempt)
                 all_strategies.append(strategy)
+                if result.inconclusive:  # no verdict: its 0 is no evidence either way
+                    problems.append(f'round {round_num}: {strategy} got no verdict')
+                    continue
 
                 if result.score > round_best:
                     round_best = result.score
@@ -1006,9 +1140,15 @@ class BlackBoxAdversarialTester:
                 )
                 break
 
+        exploitable = best_score >= self._pass_threshold
+        if not exploitable and not all_attempts:
+            problems.append('no attempt ran')
+        status = 'exploitable' if exploitable else 'inconclusive' if problems else 'robust'
         return BlackBoxReport(
             verifier_id=env.task[:80],
-            exploitable=best_score >= self._pass_threshold,
+            status=status,
+            exploitable=exploitable,
+            problems=problems,
             rounds=rounds,
             total_attempts=len(all_attempts),
             total_rounds=len(rounds),
@@ -1029,7 +1169,10 @@ class BlackBoxAdversarialTester:
         """
         lines: list[str] = []
         for i, a in enumerate(attempts, 1):
-            lines.append(f'- Attempt {i} ({a["strategy"]}): score = {a["score"]:.2f}')
+            outcome = (
+                'no verdict (the run failed)' if a.get('inconclusive') else f'{a["score"]:.2f}'
+            )
+            lines.append(f'- Attempt {i} ({a["strategy"]}): score = {outcome}')
         return '\n'.join(lines)
 
     def _call_llm(

@@ -13,6 +13,7 @@ from deepgym.adversarial import (
     AdversarialTester,
     AttackResult,
     LLMAdversarialTester,
+    entry_points,
 )
 from deepgym.core import DeepGym
 from deepgym.models import Environment
@@ -272,3 +273,131 @@ class TestAttacksUseTheClient:
 
         assert len(dg.outputs) == 2
         assert report.exploits_found == 2
+
+
+class TestAttacksTargetTheEntryPoint:
+    """Attacks define the function the verifier calls, so a weak check meets them."""
+
+    _ANY_NUMBER = (
+        'from deepgym_solution import load_solution\n'
+        'sol = load_solution(solution_path)\n'
+        'got = sol.multiply(7, 3)\n'
+        'return 1.0 if isinstance(got, (int, float)) else 0.0\n'
+    )
+
+    def test_entry_points_come_from_the_reference_verifier_and_task(self) -> None:
+        constant = (
+            'from deepgym_solution import load_solution\n'
+            "ENTRY = 'area'\n\n"
+            'def verify(solution_path, test_cases_path=None):\n'
+            '    return float(getattr(load_solution(solution_path), ENTRY)(2) == 4)\n'
+        )
+        env = Environment(task='Write `scale(x)` and `area(r)`.', verifier_code=constant)
+        multiply = Environment(task='Multiply.', verifier_code=self._ANY_NUMBER)
+
+        syntax = Environment(task='Use `if(x)` and `sorted(xs)` in `solve(xs)`.', verifier_code='0')
+
+        assert entry_points(multiply) == ['multiply']
+        assert entry_points(env) == ['area', 'scale']
+        assert entry_points(syntax) == ['solve']  # no keywords or builtins
+
+    def test_a_verifier_that_accepts_any_number_is_exploited(self, dg: DeepGym) -> None:
+        # Before attacks aimed at multiply(), this verifier passed every QA check.
+        env = Environment(task='Write multiply(a, b).', verifier_code=self._ANY_NUMBER)
+
+        report = AdversarialTester(dg).test(env, strategies=['hardcoded', 'pattern'])
+
+        assert report.exploits_found == 2
+
+
+@pytest.mark.parametrize(
+    ('strategy', 'printed'),
+    [('hardcoded', ['true', '0', '']), ('pattern', ['[1]', 'null', '""'])],
+)
+def test_payloads_carry_json_values_as_python(strategy: str, printed: list[str]) -> None:
+    cases = [{'input': [1], 'expected': True}, {'input': None, 'output': 0}, {'answer': ''}]
+    env = Environment(task='t', verifier_code='return 0.0\n', test_cases=cases)
+
+    code = AdversarialTester(DeepGym(mode='local'))._generate_attack(env, strategy)
+
+    run = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr  # JSON true and null used to be NameErrors
+    assert run.stdout.splitlines() == printed  # falsey ones kept; text printed as it is
+
+
+class _ScriptedLLM:
+    """Stands in for the Anthropic client: answers each round from a list."""
+
+    def __init__(self, replies: list[str]) -> None:
+        self.replies = iter(replies)
+        self.messages = self
+
+    def create(self, **kwargs: object) -> object:
+        reply = next(self.replies)
+        if isinstance(reply, Exception):
+            raise reply
+        return type('Message', (), {'content': [type('Text', (), {'text': reply})()]})()
+
+
+@pytest.mark.parametrize(
+    ('replies', 'verifier', 'problem'),
+    [
+        ([RuntimeError('overloaded')], 'return 0.0\n', 'round 1: Anthropic API call failed'),
+        (['no exploits here'], 'return 0.0\n', 'round 1: the LLM returned no parseable'),
+        (['---EXPLOIT 1: x---\nprint(1)'] * 2, "raise RuntimeError('judge down')\n", 'no verdict'),
+    ],
+)
+def test_an_incomplete_black_box_scan_is_inconclusive(
+    replies: list, verifier: str, problem: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import types
+
+    from deepgym.adversarial import BlackBoxAdversarialTester
+
+    llm = _ScriptedLLM(replies)
+    fake = types.ModuleType('anthropic')
+    fake.Anthropic = lambda api_key: llm
+    monkeypatch.setitem(sys.modules, 'anthropic', fake)  # no SDK or network needed
+    tester = BlackBoxAdversarialTester(DeepGym(mode='local'), api_key='k', max_rounds=2)
+
+    report = tester.test(Environment(task='Add numbers.', verifier_code=verifier))
+
+    assert (report.status, report.exploitable) == ('inconclusive', False)  # never ROBUST
+    assert any(problem in line for line in report.problems)
+
+
+def test_a_black_box_round_with_too_few_attempts_is_inconclusive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import types
+
+    from deepgym.adversarial import BlackBoxAdversarialTester
+
+    llm = _ScriptedLLM(['---EXPLOIT 1: x---\nprint(1)'] * 2)  # one of the three asked for
+    fake = types.ModuleType('anthropic')
+    fake.Anthropic = lambda api_key: llm
+    monkeypatch.setitem(sys.modules, 'anthropic', fake)
+    tester = BlackBoxAdversarialTester(
+        DeepGym(mode='local'), api_key='k', max_rounds=2, attempts_per_round=3
+    )
+
+    report = tester.test(Environment(task='Add numbers.', verifier_code='return 0.0\n'))
+
+    assert report.status == 'inconclusive'
+    assert 'round 1: 1 of 3 attempts parsed' in report.problems
+
+
+def test_a_high_score_without_a_verdict_is_no_exploit(dg: DeepGym) -> None:
+    # Prints full marks with its own error: the run has no verdict, so it proves nothing.
+    verifier = "return {'score': 1.0, 'passed': True, 'error_type': 'runtime_error'}\n"
+    env = Environment(task='Anything', verifier_code=verifier)
+
+    report = AdversarialTester(dg).test(env, strategies=['empty'])
+
+    assert (report.exploits_found, report.inconclusive, report.is_robust) == (0, 1, False)
+
+
+def test_no_attacks_is_never_robust() -> None:
+    env = Environment(task='Anything', verifier_code='return 0.0\n')
+
+    assert not AdversarialReport.from_results(env, []).is_robust
