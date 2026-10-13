@@ -53,7 +53,10 @@ def main():
             if isinstance(obj, type) and issubclass(obj, unittest.TestCase) and obj is not unittest.TestCase:
                 suite.addTests(loader.loadTestsFromTestCase(obj))
         if suite.countTestCases() == 0:
-            return report(1.0, True, "Direct assertion tests passed")
+            # A real BigCodeBench task always has assertions. An empty suite means
+            # the solution hid its cases (the loader is the only way they are
+            # found), so this is not a pass.
+            return report(0.0, False, "No tests discovered")
         result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(suite)
         # Count test methods, like testsRun: outcomes are recorded once per subTest.
         def method(test):
