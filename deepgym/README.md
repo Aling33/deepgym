@@ -105,7 +105,8 @@ The verifier prints JSON with a score and a per-test breakdown
 
 ### Runtime modes
 
-- `local`: a subprocess on your machine. Fine for development.
+- `local`: a subprocess on your machine. Fine for development. Repo, terminal and
+  cyber benchmark tasks refuse it (see below).
 - `daytona`: a Daytona sandbox, cloud or self-hosted.
 - `modal`: a Modal sandbox (`pip install 'deepgym[modal]'`, then `modal token set`).
 - `e2b`: an E2B sandbox (`pip install 'deepgym[e2b]'`, set `E2B_API_KEY`).
@@ -336,6 +337,11 @@ env = load_environment_from_hub('your-org/deepgym-coin-change')
 
 ## Repo, terminal and cyber tasks
 
+These tasks apply the model's patch, or run its commands, and then run tests, all
+outside the judge isolation that `deepgym_solution` gives single-file solutions. So
+they only run in a sandbox: with `mode='local'` (or `auto` without Daytona) they raise
+`SandboxError`. Use `docker`, `apple`, `modal`, `e2b` or `daytona`.
+
 ### SWE-bench Pro
 
 Clones the repo, checks out the base commit, applies the model's patch, runs the
@@ -344,7 +350,7 @@ tests and scores by pass fraction.
 ```python
 from deepgym import DeepGym, load_environment
 
-dg = DeepGym(mode='auto')
+dg = DeepGym(mode='daytona')  # clones the repo, so the sandbox needs network
 env = load_environment('swebench_pro')
 
 result = dg.run(
@@ -359,6 +365,41 @@ result = dg.run(
 print(result.score)
 ```
 
+### MiMo-V2.6-RL code tasks
+
+[XiaomiMiMo/MiMo-V2.6-RL-oss](https://huggingface.co/datasets/XiaomiMiMo/MiMo-V2.6-RL-oss)
+(Apache-2.0) is the RL data behind MiMo-V2.6. Its code subset has 2,698 repo-level
+tasks, each with its own Docker image, hidden test patch and test command.
+
+```bash
+pip install datasets
+python scripts/import_mimo_rl.py   # writes ~/.deepgym/environments/mimo_code/
+docker pull docker.io/xiaomimimo/mimo-v2.6-rl-oss:format-code-task-001457
+```
+
+```python
+from deepgym import DeepGym, load_environment
+
+dg = DeepGym(mode='docker')
+env = load_environment('mimo_code/format-code-task-001457')
+result = dg.run(env, '''```diff\n... unified diff ...\n```''')
+```
+
+- The sandbox boots from the task's image. The model's diff is applied, every file
+  the hidden test patch touches is put back as it was, and then the hidden tests are
+  applied. The score is 1.0 if the test command exits 0, else 0.0, as in MiMo's
+  training. A diff can't edit the hidden tests, but it can still change the code they
+  run, so the reward is only as strong as the tests.
+- The tests run as root in that sandbox because the images expect root's toolchains
+  and caches, so the sandbox, not `deepgym_solution`, is what isolates them.
+- Images are amd64 and up to about 3.4 GB. Pull them first: a sandbox waits at most
+  5 minutes for its image. Docker sandboxes are capped at 2 CPUs and 2 GB, which some
+  builds exceed.
+- The other subsets aren't imported because their rewards can't be reproduced here:
+  cyber grades with a submit script inside each image, general with LLM-judged
+  rubrics against mock apps, webdev with a visual grader, and music with MiMo's
+  statistical style scorer.
+
 ### Terminal-Bench 2.0
 
 Runs terminal commands in a task sandbox and checks the expected output or state.
@@ -366,7 +407,7 @@ Runs terminal commands in a task sandbox and checks the expected output or state
 ```python
 from deepgym import DeepGym, load_environment
 
-dg = DeepGym(mode='auto')
+dg = DeepGym(mode='daytona')
 env = load_environment('terminal_bench_2')
 
 result = dg.run(
@@ -421,10 +462,7 @@ a model-produced unified diff in a sandbox, then scores application, touched-fil
 overlap, changed-line similarity, minimality and safety scope.
 
 ```bash
-# Local verifier smoke/diagnostics
-python scripts/run_cybergym_artifact_eval.py --count 100 --mode local --max-parallel 12
-
-# Daytona-isolated execution for untrusted model outputs
+# Daytona-isolated execution for model outputs
 python scripts/run_cybergym_artifact_eval.py --count 20 --mode daytona --max-parallel 4
 
 # Ask GLM for candidate patches when rate limits allow
@@ -437,7 +475,7 @@ Inside a trainer, score completions like any other environment:
 from deepgym import DeepGym
 from deepgym.cybergym_artifacts import CyberGymPatchEnvironment, load_cybergym_rows
 
-dg = DeepGym(mode='auto')  # Daytona when configured, local fallback otherwise
+dg = DeepGym(mode='daytona')
 row = load_cybergym_rows(count=1)[0]
 env = CyberGymPatchEnvironment.from_row(row)
 
@@ -539,6 +577,7 @@ python scripts/import_humaneval.py      # 164 problems
 python scripts/import_evalplus.py       # HumanEval+ and MBPP+
 python scripts/import_mbpp.py           # 500 problems
 python scripts/import_bigcodebench.py   # 1,140 problems
+python scripts/import_mimo_rl.py        # 2,698 MiMo-V2.6-RL code tasks
 ```
 
 Imported problems are then available through `load_environment()`.
