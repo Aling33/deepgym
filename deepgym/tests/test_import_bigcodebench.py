@@ -103,3 +103,21 @@ def test_suite_that_ran_nothing_has_no_verdict(env: Environment, dg: DeepGym) ->
 
     assert result.exit_code == 2
     assert result.has_verdict is False
+
+
+_HIDE_TESTS = (
+    _SKIP + '    return x * x\n'
+    '\n'
+    '\n'
+    '# The runner finds the cases through this loader, so stubbing it out\n'
+    '# leaves an empty suite.\n'
+    'unittest.TestLoader.loadTestsFromTestCase = lambda self, case: unittest.TestSuite()\n'
+)
+
+
+def test_hidden_test_cases_score_zero(env: Environment, dg: DeepGym) -> None:
+    """Hiding the tests used to score 1.0 for "direct assertion tests passed"."""
+    result = dg.run(env, _HIDE_TESTS)
+
+    assert result.score == 0.0
+    assert result.passed is False
