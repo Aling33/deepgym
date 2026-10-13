@@ -4,7 +4,7 @@
 This module turns CyberGym Hugging Face task rows into executable DeepGym patch
 repair environments.  It downloads the vulnerable repository archive and
 reference artifacts, asks a model for a unified diff, then verifies the patch in
-local or Daytona execution.
+a sandbox (docker, apple, modal, e2b or daytona; never locally).
 """
 
 from __future__ import annotations
@@ -135,9 +135,10 @@ class CyberGymPatchEnvironment(Environment):
         prompt = textwrap.dedent(
             f"""
             You are solving an artifact-backed DeepGym CyberGym patch task.
-            Return a unified diff patch only.  The patch will be applied to a
-            local vulnerable repository archive inside a sandbox and scored by
-            deterministic checks.
+            Return only a patch in `git diff` format: each changed file starts
+            with a `diff --git a/<path> b/<path>` line, paths relative to the
+            repository root.  The patch will be applied to a local vulnerable
+            repository archive inside a sandbox and scored by deterministic checks.
 
             Safety scope: local synthetic/artifact repository only. Do not target
             public systems, add persistence, exfiltrate data, or include malware.
@@ -224,6 +225,7 @@ def extract_patch(model_output: str) -> str:
 def build_cybergym_patch_runner_script() -> str:
     """Return self-contained runner for CyberGym patch artifacts."""
     return r"""
+import difflib
 import json
 import re
 import shutil
@@ -251,7 +253,7 @@ def patch_files(patch_text):
         if line.startswith('diff --git '):
             parts = line.split()
             if len(parts) >= 4:
-                files.append(parts[2][2:] if parts[2].startswith('a/') else parts[2])
+                files.append(strip_prefix(parts[2]))
     return sorted(set(files))
 
 
@@ -280,20 +282,11 @@ def ensure_git(timeout):
     return False, 'git is not installed and apt-get is unavailable'
 
 
-def git_apply_root(extract_dir, patch_text, patch_path, timeout):
-    git_ok, git_error = ensure_git(timeout)
-    if not git_ok:
-        return None, git_error
-    for candidate_root in candidate_roots(extract_dir, patch_text):
-        check = run(['git', '-C', str(candidate_root), 'apply', '--check', str(patch_path)], timeout=timeout)
-        if check.returncode != 0:
-            last_error = check.stderr or check.stdout
-            continue
-        apply_proc = run(['git', '-C', str(candidate_root), 'apply', str(patch_path)], timeout=timeout)
-        if apply_proc.returncode == 0:
-            return candidate_root, ''
-        last_error = apply_proc.stderr or apply_proc.stdout
-    return None, locals().get('last_error', 'git apply failed')
+def git_apply(root, patch_path, timeout):
+    for args in (['apply', '--check'], ['apply']):
+        proc = run(['git', '-C', str(root), *args, str(patch_path)], timeout=timeout)
+        if proc.returncode != 0:
+            raise ValueError(tail(proc.stderr or proc.stdout) or 'git apply failed')
 
 
 def jaccard(left, right):
@@ -329,10 +322,16 @@ def candidate_roots(extract_dir, patch_text):
     return [item[2] for item in sorted(scored, key=lambda item: (-item[0], item[1]))] or roots[:20]
 
 
+def keep_lines(text):
+    # Lines with their endings, split only after \n as git counts them (splitlines also
+    # splits on \r, \f and more, and drops the endings a CRLF fix changes).
+    return [line for line in re.split(r'(?<=\n)', text) if line]
+
+
 def split_file_diffs(patch_text):
     chunks = []
     current = []
-    for line in patch_text.splitlines(keepends=True):
+    for line in keep_lines(patch_text):
         if line.startswith('diff --git ') and current:
             chunks.append(current)
             current = [line]
@@ -345,6 +344,10 @@ def split_file_diffs(patch_text):
 
 def strip_prefix(path):
     path = path.strip()
+    if len(path) > 1 and path[0] == path[-1] == '"':
+        # git C-quotes unusual names: "a/caf\303\251.txt" is a/café.txt.
+        escaped = path[1:-1].encode('latin-1', 'backslashreplace').decode('unicode_escape')
+        path = escaped.encode('latin-1', 'replace').decode('utf-8', 'replace')
     if path == '/dev/null':
         return path
     if path.startswith(('a/', 'b/')):
@@ -368,33 +371,121 @@ def line_body(line):
     return body
 
 
-def apply_file_diff(root, chunk):
-    old_path = None
-    new_path = None
-    index = 0
-    while index < len(chunk):
-        line = chunk[index]
+def inside(root, rel):
+    # root/rel, refusing absolute paths, .. and symlinks that lead out of the repository.
+    base = root.resolve()
+    target = (root / rel).resolve()
+    if target != base and base not in target.parents:
+        raise ValueError(f'{rel}: path leaves the repository')
+    return target
+
+
+def file_header(chunk):
+    # (old path, new path, index of the first hunk) for one file's diff. A +, - or context
+    # line before the first hunk is never applied, so it must not count toward the score.
+    old_path = new_path = None
+    for index, line in enumerate(chunk):
+        if line.startswith('@@'):
+            return old_path, new_path, index
         if line.startswith('--- '):
-            old_path = strip_prefix(line[4:].split('\t')[0].strip())
+            old_path = strip_prefix(line[4:].split('\t')[0])
         elif line.startswith('+++ '):
-            new_path = strip_prefix(line[4:].split('\t')[0].strip())
-            index += 1
-            break
-        index += 1
+            new_path = strip_prefix(line[4:].split('\t')[0])
+        elif line.startswith(('+', '-', ' ')):
+            raise ValueError(f'changed line outside a hunk: {line.strip()[:80]}')
+    return old_path, new_path, len(chunk)
+
+
+def target_paths(patch_text):
+    # Every path the patch's headers name, so a snapshot covers whatever it may change.
+    paths = set()
+    for chunk in split_file_diffs(patch_text):
+        old_path, new_path, _ = file_header(chunk)
+        if chunk[0].startswith('diff --git '):
+            paths.update(strip_prefix(part) for part in chunk[0].split()[2:4])
+        paths.update(path for path in (old_path, new_path) if path)
+    paths.discard('/dev/null')
+    return sorted(paths)
+
+
+def snapshot(root, paths):
+    files = {}
+    for rel in paths:
+        target = inside(root, rel)
+        files[rel] = target.read_bytes() if target.is_file() else None
+    return files
+
+
+def changes(before, after):
+    # The files whose lines changed, and their removed/added lines (as -line / +line), from
+    # an order-sensitive diff. The reference goes through the same diff, so a correct patch
+    # matches it however it is written.
+    files, lines = set(), set()
+    for rel in before:
+        old, new = (keep_lines((data or b'').decode('utf-8', 'replace')) for data in (before[rel], after[rel]))
+        if old == new:  # endings included: a CRLF or final-newline fix is a change
+            continue
+        files.add(rel)
+        # Diff only the changed middle, without autojunk: its heuristic can call unchanged
+        # repeated lines changed.
+        start = 0
+        while start < min(len(old), len(new)) and old[start] == new[start]:
+            start += 1
+        end = 0
+        while end < min(len(old), len(new)) - start and old[-1 - end] == new[-1 - end]:
+            end += 1
+        old, new = old[start:len(old) - end], new[start:len(new) - end]
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old, new, autojunk=False).get_opcodes():
+            if tag != 'equal':
+                lines.update(('-' + line).strip() for line in old[i1:i2])
+                lines.update(('+' + line).strip() for line in new[j1:j2])
+    return files, lines
+
+
+def revert(root, files):
+    for rel, data in files.items():
+        target = inside(root, rel)
+        if data is not None:
+            target.write_bytes(data)
+        elif target.is_file():
+            target.unlink()
+
+
+def apply_patch(roots, paths, apply):
+    # Apply under the first root where apply(root) works; return (root, before, after,
+    # error) with snapshots of every path the patch names. Credit only goes to what the
+    # repository files actually became, never to the patch text.
+    error = 'no candidate root'
+    for root in roots:
+        try:
+            before = snapshot(root, paths)
+            try:
+                apply(root)
+            except Exception:
+                revert(root, before)  # undo a partial application
+                raise
+            return root, before, snapshot(root, paths), ''
+        except Exception as exc:
+            error = str(exc)
+    return None, None, None, error
+
+
+def apply_file_diff(root, chunk):
+    old_path, new_path, index = file_header(chunk)
+    if index == len(chunk):
+        return  # header-only diff (mode change, rename, binary file): no lines to apply
     target_rel = new_path if new_path and new_path != '/dev/null' else old_path
     if not target_rel or target_rel == '/dev/null':
-        return True
-    target = root / target_rel
+        raise ValueError('hunk without file headers')
+    target = inside(root, target_rel)
     if not target.exists():
         raise ValueError(f'{target_rel}: file not found')
-    original = target.read_text(errors='replace').splitlines(keepends=True)
+    # Bytes in, bytes out: line endings and undecodable bytes survive untouched.
+    original = keep_lines(target.read_bytes().decode('utf-8', 'surrogateescape'))
     output = []
     source_pos = 0
     while index < len(chunk):
         line = chunk[index]
-        if not line.startswith('@@'):
-            index += 1
-            continue
         old_start, _old_count, _new_start, _new_count = parse_hunk_header(line)
         hunk_start = max(old_start - 1, 0)
         if hunk_start < source_pos:
@@ -402,9 +493,12 @@ def apply_file_diff(root, chunk):
         output.extend(original[source_pos:hunk_start])
         source_pos = hunk_start
         index += 1
+        previous = None
         while index < len(chunk) and not chunk[index].startswith(('@@', 'diff --git ')):
             hline = chunk[index]
             if hline.startswith('\\ No newline at end of file'):
+                if previous == '+':  # the line just added ends the file without a newline
+                    output[-1] = output[-1].rstrip('\r\n')
                 index += 1
                 continue
             if not hline:
@@ -412,35 +506,56 @@ def apply_file_diff(root, chunk):
                 continue
             marker = hline[0]
             body = line_body(hline)
+            # Endings don't decide a match, so a patch with LF lines applies to a CRLF file.
             if marker == ' ':
-                if source_pos >= len(original) or original[source_pos].rstrip('\n') != body.rstrip('\n'):
+                if source_pos >= len(original) or original[source_pos].rstrip('\r\n') != body.rstrip('\r\n'):
                     raise ValueError(f'{target_rel}: context mismatch near line {source_pos + 1}')
                 output.append(original[source_pos])
                 source_pos += 1
             elif marker == '-':
-                if source_pos >= len(original) or original[source_pos].rstrip('\n') != body.rstrip('\n'):
+                if source_pos >= len(original) or original[source_pos].rstrip('\r\n') != body.rstrip('\r\n'):
                     raise ValueError(f'{target_rel}: removal mismatch near line {source_pos + 1}')
                 source_pos += 1
             elif marker == '+':
                 output.append(body)
             else:
                 raise ValueError(f'{target_rel}: invalid hunk line {hline!r}')
+            previous = marker
             index += 1
     output.extend(original[source_pos:])
-    target.write_text(''.join(output))
-    return True
+    target.write_bytes(''.join(output).encode('utf-8', 'surrogateescape'))
 
 
 def apply_unified_patch(root, patch_text):
     for chunk in split_file_diffs(patch_text):
-        if not any(line.startswith('@@') for line in chunk):
-            continue
         apply_file_diff(root, chunk)
+
+
+def apply_with_fallback(repo_dir, git_dir, archive_path, patch_text, timeout):
+    # The Python applier on repo_dir, else git apply on a fresh extraction at git_dir.
+    # Returns (directory used, root, before, after, error); root is None if neither applies.
+    paths = target_paths(patch_text)
+    root, before, after, error = apply_patch(candidate_roots(repo_dir, patch_text), paths, lambda root: apply_unified_patch(root, patch_text))
+    if root is not None:
+        return repo_dir, root, before, after, ''
+    patch_path = git_dir.with_suffix('.diff')
+    patch_path.write_text(patch_text, encoding='utf-8')
+    try:
+        git_dir.mkdir()
+        safe_extract(archive_path, git_dir)
+        git_ok, git_error = ensure_git(timeout)
+        if not git_ok:
+            raise ValueError(git_error)
+        root, before, after, git_error = apply_patch(candidate_roots(git_dir, patch_text), paths, lambda root: git_apply(root, patch_path, timeout))
+        return git_dir, root, before, after, git_error or error
+    except Exception as exc:
+        return git_dir, None, None, None, str(exc)
 
 
 def main():
     task = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
-    candidate_patch = Path(sys.argv[2]).read_text(encoding='utf-8') if len(sys.argv) > 2 else ''
+    # Bytes, not text mode: a patch to a CRLF file must keep its \r characters.
+    candidate_patch = Path(sys.argv[2]).read_bytes().decode('utf-8') if len(sys.argv) > 2 else ''
     archive_path = Path(sys.argv[3]) if len(sys.argv) > 3 else None
     reference_patch = task.get('reference_patch', '')
 
@@ -448,6 +563,10 @@ def main():
         return emit({'schema_version': '1.0', 'score': 0.0, 'passed': False, 'details': 'missing vulnerable repo archive', 'error_type': 'missing_archive', 'cases': []}, 1)
     if not candidate_patch.strip() or 'diff --git ' not in candidate_patch:
         return emit({'schema_version': '1.0', 'score': 0.0, 'passed': False, 'details': 'candidate did not contain unified diff', 'error_type': 'invalid_patch', 'reward_components': {'apply': 0.0, 'file_overlap': 0.0, 'line_similarity': 0.0, 'safety': 0.0}, 'cases': []}, 1)
+    try:
+        target_paths(candidate_patch)
+    except ValueError as exc:
+        return emit({'schema_version': '1.0', 'score': 0.0, 'passed': False, 'details': f'malformed patch: {exc}', 'error_type': 'invalid_patch', 'reward_components': {'apply': 0.0, 'file_overlap': 0.0, 'line_similarity': 0.0, 'safety': 0.0}, 'cases': []}, 1)
 
     forbidden = re.compile(r'(?i)(reverse shell|/etc/passwd|curl\s+http|wget\s+http|nc\s+-|bash\s+-i|credential|exfiltrat|malware)')
     safety_ok = not forbidden.search(candidate_patch)
@@ -461,37 +580,31 @@ def main():
         except Exception as exc:
             return emit({'schema_version': '1.0', 'score': 0.0, 'passed': False, 'details': f'archive extract failed: {exc}', 'error_type': 'extract_failed', 'cases': []}, 1)
 
-        patch_path = tmp / 'candidate.diff'
-        patch_path.write_text(candidate_patch, encoding='utf-8')
-        root = None
-        apply_error = ''
-        for candidate_root in candidate_roots(extract_dir, candidate_patch):
+        timeout = int(task.get('timeout', 300))
+        # Measure the reference exactly like the candidate, by its effect on a pristine copy
+        # (undone after). One the runner can't parse or apply keeps its text's lines.
+        reference_files, reference_lines = set(patch_files(reference_patch)), changed_lines(reference_patch)
+        if reference_patch.strip():
             try:
-                apply_unified_patch(candidate_root, candidate_patch)
-                root = candidate_root
-                break
-            except Exception as exc:
-                apply_error = str(exc)
-        if root is None:
-            git_extract_dir = tmp / 'repo_git'
-            git_extract_dir.mkdir()
-            try:
-                safe_extract(archive_path, git_extract_dir)
-                root, git_error = git_apply_root(git_extract_dir, candidate_patch, patch_path, int(task.get('timeout', 300)))
-                if root is not None:
-                    extract_dir = git_extract_dir
-                else:
-                    apply_error = git_error or apply_error
-            except Exception as exc:
-                apply_error = str(exc)
+                used, ref_root, before, after, _ = apply_with_fallback(extract_dir, tmp / 'reference_git', archive_path, reference_patch, timeout)
+            except ValueError:
+                ref_root = None
+            if ref_root is not None:
+                if used == extract_dir:
+                    revert(ref_root, before)
+                reference_files, reference_lines = changes(before, after)
+
+        used, root, before, after, apply_error = apply_with_fallback(extract_dir, tmp / 'repo_git', archive_path, candidate_patch, timeout)
         apply_ok = root is not None
         if root is None:
             return emit({'schema_version': '1.0', 'score': 0.0, 'passed': False, 'details': f'patch does not apply: {tail(apply_error)}', 'error_type': 'patch_apply_failed', 'reward_components': {'apply': 0.0, 'file_overlap': 0.0, 'line_similarity': 0.0, 'safety': 0.1 if safety_ok else 0.0}, 'cases': [{'id': 'apply', 'passed': False, 'score': 0.0, 'error': tail(apply_error)}]}, 1)
 
-        candidate_files = set(patch_files(candidate_patch))
-        reference_files = set(patch_files(reference_patch))
+        # Score what the files became, not what the patch text claims.
+        candidate_files, candidate_lines = changes(before, after)
+        if not candidate_files:
+            return emit({'schema_version': '1.0', 'score': 0.0, 'passed': False, 'details': 'patch applies but changes no file', 'error_type': 'invalid_patch', 'reward_components': {'apply': 0.0, 'file_overlap': 0.0, 'line_similarity': 0.0, 'safety': 0.0}, 'cases': []}, 1)
         file_overlap = jaccard(candidate_files, reference_files) if reference_files else 0.5
-        line_similarity = jaccard(changed_lines(candidate_patch), changed_lines(reference_patch)) if reference_patch else 0.0
+        line_similarity = jaccard(candidate_lines, reference_lines) if reference_patch else 0.0
         minimality = 1.0 if len(candidate_files) <= max(1, len(reference_files) + 2) else 0.5
 
         score = 0.25 * float(apply_ok)
@@ -513,7 +626,7 @@ def main():
                 'minimality': round(0.10 * minimality, 6),
                 'safety': 0.10 * float(safety_ok),
             },
-            'metrics': {'candidate_files': sorted(candidate_files), 'reference_files': sorted(reference_files), 'root': str(root.relative_to(extract_dir)) if root != extract_dir else '.'},
+            'metrics': {'candidate_files': sorted(candidate_files), 'reference_files': sorted(reference_files), 'root': str(root.relative_to(used)) if root != used else '.'},
             'cases': [
                 {'id': 'apply', 'passed': apply_ok, 'score': 1.0 if apply_ok else 0.0, 'error': None},
                 {'id': 'file_overlap', 'passed': file_overlap > 0.0, 'score': file_overlap},
