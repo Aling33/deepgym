@@ -59,6 +59,9 @@ def check_env(env_dir: Path, dg: DeepGym) -> list[QACheck]:
     Returns:
         files, metadata and verifier_source; then, if those pass, reference_passes,
         deterministic, empty_fails, stub_fails (single-turn) and protocol; then approval.
+        A desktop env whose reference can't run here (it ships no episode to replay,
+        or the backend gives no desktop) reports a single skipped reference_passes
+        instead of the run checks.
     """
     if (env_dir / 'task.toml').is_file():
         return [_harbor_check(env_dir), approval_check(env_dir)]
@@ -120,8 +123,9 @@ def _files_check(env_dir: Path, metadata: EnvMetadata | None) -> QACheck:
     if metadata is not None and metadata.type == 'multi-turn':
         if not (env_dir / REFERENCE_ACTIONS).is_file():
             problems.append(f'{REFERENCE_ACTIONS} is missing (the episode that must score 1.0)')
-    elif not any((env_dir / name).is_file() for name in REFERENCE_FILES):
-        problems.append(f'{" or ".join(REFERENCE_FILES)} is missing (it must score 1.0)')
+    elif metadata is None or metadata.type != 'computer-use':
+        if not any((env_dir / name).is_file() for name in REFERENCE_FILES):
+            problems.append(f'{" or ".join(REFERENCE_FILES)} is missing (it must score 1.0)')
     root = env_dir.resolve()
     for rel in metadata.support_files if metadata else []:
         path = (env_dir / rel).resolve()
@@ -129,7 +133,10 @@ def _files_check(env_dir: Path, metadata: EnvMetadata | None) -> QACheck:
             problems.append(f'support file {rel!r} is not a file inside the folder')
     if problems:
         return QACheck(name='files', status='fail', details='; '.join(problems))
-    return QACheck(name='files', status='pass', details='task, verifier, reference and metadata')
+    details = 'task, verifier, reference and metadata'
+    if metadata is not None and metadata.type == 'computer-use':
+        details = 'task, verifier and metadata (a desktop env may ship a reference episode)'
+    return QACheck(name='files', status='pass', details=details)
 
 
 def _verifier_check(env_dir: Path) -> QACheck:
@@ -162,7 +169,7 @@ def lint_env(env_dir: Path) -> list[str]:
         for rel in (metadata.support_files if metadata else [])
         if (env_dir / rel).is_file()
     }
-    prepended = metadata is not None and metadata.type == 'multi-turn'
+    prepended = metadata is not None and metadata.type in ('multi-turn', 'computer-use')
     try:
         return lint_verifier(path.read_text(encoding='utf-8'), support, prepended=prepended)
     except SyntaxError as exc:
@@ -170,7 +177,12 @@ def lint_env(env_dir: Path) -> list[str]:
 
 
 def _run_checks(env_dir: Path, dg: DeepGym) -> list[QACheck]:
-    """Run the reference, empty and stub solutions (or episodes) and judge them."""
+    """Run the reference, empty and stub solutions (or episodes) and judge them.
+
+    A desktop env whose reference can't run here — one with no episode to replay, or
+    one off the Daytona backend — reports a single skipped ``reference_passes``: no
+    local session can drive a desktop.
+    """
     try:
         env = load_environment_dir(env_dir)
     except (ValueError, OSError) as exc:
@@ -182,7 +194,16 @@ def _run_checks(env_dir: Path, dg: DeepGym) -> list[QACheck]:
         except SyntaxError as exc:
             details = f'verifier.py with its support files prepended: line {exc.lineno}: {exc.msg}'
             return [QACheck(name='load', status='fail', details=details)]
-        results = episode_results(env, env.reference_actions or [], dg, _RERUNS)
+        if env.reference_actions is None:
+            details = (
+                f'this env ships no {REFERENCE_ACTIONS}: '
+                'an agent has to drive it, not a script to replay'
+            )
+            return [QACheck(name='reference_passes', status='skip', details=details)]
+        if env.desktop and dg.backend != 'daytona':
+            details = 'a computer-use env needs a desktop: run with --mode daytona'
+            return [QACheck(name='reference_passes', status='skip', details=details)]
+        results = episode_results(env, env.reference_actions, dg, _RERUNS)
         return [*run_verdicts(results, runs), protocol_check(results)]
     results = single_turn_results(env, env.reference_solution or '', dg, _RERUNS)
     return [*single_turn_verdicts(results, _RERUNS), protocol_check(results)]

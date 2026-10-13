@@ -468,6 +468,48 @@ def test_check_rejects_invalid_reference_actions(tmp_path: Path, local_dg: DeepG
     assert check.details.startswith('reference_actions.json: ')
 
 
+def test_check_skips_the_reference_a_desktop_env_cannot_run(local_dg: DeepGym) -> None:
+    """A computer-use folder's reference episode drives a real desktop, so a local
+    session can't replay it: the run checks are a skip, not a failure."""
+    builtin = Path(__file__).resolve().parent.parent / 'src' / 'deepgym' / 'envs'
+    folder = builtin / 'computer_use' / 'signup_form'
+
+    checks = {check.name: check for check in check_env(folder, local_dg)}
+
+    assert checks['files'].status == 'pass'
+    assert checks['metadata'].status == 'pass'
+    assert checks['verifier_source'].status == 'pass'
+    assert checks['reference_passes'].status == 'skip'
+    assert 'desktop' in checks['reference_passes'].details
+
+
+def test_check_skips_a_desktop_env_with_no_reference_episode(
+    tmp_path: Path, local_dg: DeepGym
+) -> None:
+    """A desktop env an agent drives ships no episode to replay: the run checks are a
+    skip, not a failure over a missing reference_actions.json."""
+    shared = Path(__file__).resolve().parent.parent / 'src' / 'deepgym' / 'envs' / 'computer_use'
+    root = tmp_path / 'computer_use'
+    folder = root / 'calc_task'
+    folder.mkdir(parents=True)
+    (root / '_checks.py').write_text(
+        (shared / '_checks.py').read_text(encoding='utf-8'), encoding='utf-8'
+    )
+    shutil.copytree(shared / '_shared', root / '_shared')
+    (folder / 'task.md').write_text('Do the thing.', encoding='utf-8')
+    (folder / 'verifier.py').write_text('report(1.0, {})\n', encoding='utf-8')
+    (folder / 'variants.json').write_text('[{}]', encoding='utf-8')
+    (folder / 'metadata.json').write_text(
+        '{"name": "calc_task", "type": "computer-use"}', encoding='utf-8'
+    )
+
+    checks = {check.name: check for check in check_env(folder, local_dg)}
+
+    assert checks['files'].status == 'pass'
+    assert checks['reference_passes'].status == 'skip'
+    assert 'an agent has to drive it' in checks['reference_passes'].details
+
+
 def test_check_skips_image_based_repo_patch_folders(tmp_path: Path, local_dg: DeepGym) -> None:
     (tmp_path / 'test_patch.diff').write_text('', encoding='utf-8')
 
