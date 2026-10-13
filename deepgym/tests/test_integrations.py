@@ -1,17 +1,25 @@
 """Tests for deepgym.integrations -- TRL, verl, DAPO, OpenRLHF integration wrappers."""
 
 import asyncio
+import logging
+import math
 import threading
 import time
 from pathlib import Path
+from typing import Literal
 
 import httpx
 import pytest
+from anyio import to_thread
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from deepgym.async_core import AsyncDeepGym
 from deepgym.core import DeepGym
+from deepgym.exceptions import NoVerdictError, SandboxError, VerifierError
+from deepgym.exceptions import TimeoutError as DeepGymTimeout
+from deepgym.integrations import openrlhf
+from deepgym.integrations import verl as verl_module
 from deepgym.integrations.dapo import (
     generate_dapo_reward_module,
     generate_dapo_verl_config,
@@ -24,7 +32,12 @@ from deepgym.integrations.openrlhf import (
     OpenRLHFRewardResponse,
     create_openrlhf_router,
 )
-from deepgym.integrations.reward import AsyncRewardFunction, RewardFunction
+from deepgym.integrations.reward import (
+    MASKED_BATCH,
+    AsyncRewardFunction,
+    MaskedRate,
+    RewardFunction,
+)
 from deepgym.integrations.trl import make_trl_async_reward_fn, make_trl_reward_fn
 from deepgym.integrations.verl import (
     compute_score,
@@ -33,7 +46,7 @@ from deepgym.integrations.verl import (
     make_verl_reward_fn,
     verl_rows,
 )
-from deepgym.models import Environment
+from deepgym.models import Environment, RunResult
 
 ENVS_DIR = Path(__file__).resolve().parent.parent / 'src' / 'deepgym' / 'envs'
 REVERSE_DIR = ENVS_DIR / 'reverse_string'
@@ -139,11 +152,61 @@ class TestVerlIntegration:
         fn = make_verl_compute_score(env=env)
         assert callable(fn)
 
-    def test_verl_compute_score_returns_float(self, env: Environment, local_dg: DeepGym) -> None:
+    def test_verl_compute_score_returns_what_compute_score_does(
+        self, env: Environment, local_dg: DeepGym
+    ) -> None:
         fn = make_verl_compute_score(env=env, dg=local_dg)
-        score = fn('dataset', GOOD_SOLUTION, '')
-        assert isinstance(score, float)
-        assert score >= 0.5
+        assert fn('dataset', GOOD_SOLUTION, '') == {'score': 1.0, 'passed': 1.0, 'error': 0.0}
+
+    def test_no_verdict_never_reaches_verl_as_a_reward(
+        self, local_dg: DeepGym, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """verl's reward functions can't mark a sample unscored, so a failed run raises.
+
+        verl's v1 trainer then drops the sample; the batch function marks it None.
+        """
+        monkeypatch.setattr(verl_module, '_environment', lambda name, variant: MIXED)
+        monkeypatch.setattr(verl_module, '_client', lambda mode: local_dg)
+        fixed = make_verl_compute_score(MIXED, local_dg)
+
+        judged_zero = {'score': 0.0, 'passed': 0.0, 'error': 0.0}
+        assert fixed('ds', 'wrong') == compute_score('ds', 'wrong') == judged_zero
+        for score in (fixed, compute_score):
+            with pytest.raises(NoVerdictError, match='runtime_error') as raised:
+                score('ds', 'boom')
+            # verl's legacy trainer stops on the raise; the message says what to use instead.
+            assert 'deepgym_single_turn' in str(raised.value)
+        batch = make_verl_reward_fn(MIXED, local_dg)({'responses': ['right', 'wrong', 'boom']})
+        assert batch == [1.0, 0.0, None]
+
+    def test_a_solution_that_hangs_is_a_judged_zero(
+        self, local_dg: DeepGym, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A hang is the policy's fault, so the bare reward functions score it 0.
+
+        They raise only for a run without a verdict, which would stop verl's legacy
+        trainer; a policy must not be able to cause that by hanging.
+        """
+        hangs = Environment(
+            task='Return 42 from solve().',
+            verifier_code=(
+                'from deepgym_solution import load_solution\n\n'
+                'def verify(solution_path, test_cases_path=None):\n'
+                '    try:\n'
+                '        return float(load_solution(solution_path).solve() == 42)\n'
+                '    except Exception:  # the solution failed: here it ran out of time\n'
+                '        return 0.0\n'
+            ),
+            verifier_mode='verify_function',
+            case_timeout=1,
+        )
+        monkeypatch.setattr(verl_module, '_environment', lambda name, variant: hangs)
+        monkeypatch.setattr(verl_module, '_client', lambda mode: local_dg)
+        solution = 'def solve():\n    while True:\n        pass\n'
+        judged_zero = {'score': 0.0, 'passed': 0.0, 'error': 0.0}
+
+        assert compute_score('ds', solution) == judged_zero
+        assert make_verl_compute_score(hangs, local_dg)('ds', solution) == judged_zero
 
     def test_make_verl_reward_fn_returns_callable(self, env: Environment) -> None:
         fn = make_verl_reward_fn(env=env)
@@ -170,7 +233,7 @@ class TestVerlIntegration:
             extra_info={},
             reward_router_address=None,
         )
-        assert score >= 0.5
+        assert score['score'] >= 0.5
 
     def test_extract_code_takes_last_block_or_whole_text(self) -> None:
         assert extract_code('a\n```python\nx = 1\n```\nb\n```\ny = 2\n```') == 'y = 2\n'
@@ -197,7 +260,7 @@ class TestVerlIntegration:
         self, env: Environment, local_dg: DeepGym
     ) -> None:
         trl = make_trl_reward_fn(env=env, dg=local_dg)(completions=[f'{GOOD_SOLUTION}</s>'])
-        verl = make_verl_compute_score(env=env, dg=local_dg)('ds', f'{GOOD_SOLUTION}<|eot_id|>')
+        verl = make_verl_compute_score(env, local_dg)('ds', f'{GOOD_SOLUTION}<|eot_id|>')['score']
         query = f'{OPENRLHF_PROMPT}{GOOD_SOLUTION}<|im_end|>'
         openrlhf = _openrlhf_score(env, local_dg, [query])['rewards']
 
@@ -210,7 +273,7 @@ class TestVerlIntegration:
         scores = {
             'trl': make_trl_reward_fn(env=env, dg=local_dg)(completions=[FENCED]),
             'dapo': make_dapo_reward_fn(env, local_dg)(completions=[FENCED]),
-            'verl': [make_verl_compute_score(env, local_dg)('ds', FENCED)],
+            'verl': [make_verl_compute_score(env, local_dg)('ds', FENCED)['score']],
             'verl_batch': make_verl_reward_fn(env, local_dg)({'responses': [FENCED]}),
             'reward_function': RewardFunction(env, local_dg)([FENCED]),
             'openrlhf': _openrlhf_score(env, local_dg, [OPENRLHF_PROMPT + FENCED])['rewards'],
@@ -290,9 +353,9 @@ class TestDAPOIntegration:
     def test_generate_dapo_verl_config_contains_expected_fields(self) -> None:
         config = generate_dapo_verl_config(train_files='data/train.parquet')
         assert 'adv_estimator: grpo' in config
-        assert 'reward:\n  reward_manager:\n    name: dapo\n' in config
         assert '    path: pkg://deepgym.integrations.verl\n    name: compute_score\n' in config
         assert 'actor_rollout_ref:\n  rollout:\n    n: 8\n' in config
+        assert '      default_agent_loop: deepgym_single_turn\n' in config
 
     def test_generate_dapo_reward_module_defines_per_sample_compute_score(self) -> None:
         module_text = generate_dapo_reward_module('coin_change')
@@ -340,6 +403,23 @@ class TestRewardFunction:
         assert rf.per_test_rewards(outputs) == [{'overall': 1.0}, None]
 
 
+def test_masked_rate_warns_when_a_batch_passes_five_percent(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A policy that finds a way to get masked must show up, not escape quietly."""
+    rate = MaskedRate('test trainer')
+
+    with caplog.at_level(logging.WARNING, logger='deepgym.integrations.reward'):
+        for i in range(MASKED_BATCH):
+            rate.record(masked=i < 5)  # 5%: fine
+        assert not caplog.records
+        for i in range(MASKED_BATCH):
+            rate.record(masked=i < 6)
+
+    assert f'test trainer: 6 of the last {MASKED_BATCH} samples got no verdict' in caplog.text
+    assert f'(11 of {2 * MASKED_BATCH} this run)' in caplog.text
+
+
 OPENRLHF_CONTEXT = '<|im_start|>user\n' + 'Strings are sequences of characters. ' * 12
 OPENRLHF_PROMPT = (
     f'{OPENRLHF_CONTEXT}\nWrite reverse_string(s). For example:\n'
@@ -361,10 +441,76 @@ def _openrlhf_score(env: Environment, dg: DeepGym, queries: list[str]) -> dict:
         'labels': [None] * len(queries),
     }
     app = FastAPI()
-    app.include_router(create_openrlhf_router(env, dg))
+    app.include_router(create_openrlhf_router(env, dg, infra_failure_score='zero'))
     response = TestClient(app).post('/reward/score', json=payload)
     assert response.status_code == 200, response.text
     return response.json()
+
+
+def _post(
+    env: Environment,
+    dg: DeepGym,
+    payload: dict,
+    infra_failure_score: Literal['zero', 'nan'] = 'zero',
+    max_parallel: int = 32,
+) -> dict:
+    """POST *payload* to a fresh reward router; the request must succeed."""
+    app = FastAPI()
+    router = create_openrlhf_router(
+        env, dg, infra_failure_score=infra_failure_score, max_parallel=max_parallel
+    )
+    app.include_router(router)
+    response = TestClient(app).post('/reward/score', json=payload)
+    assert response.status_code == 200, response.text
+    return response.json()  # json.loads, which reads NaN as OpenRLHF's client does
+
+
+class _ScriptedDeepGym(DeepGym):
+    """A client that runs nothing: each run of an output does the next step of its script.
+
+    A step that is an exception is raised; a number is seconds to wait before judging.
+    Every run first waits *seconds*. A judged output scores 1.0 if it says 'right', else
+    0.0. The client records each run's output, the most runs going at once, and when the
+    first run started.
+    """
+
+    def __init__(
+        self, script: dict[str, list[BaseException | float]] | None = None, seconds: float = 0.0
+    ) -> None:
+        super().__init__(mode='local')
+        self.script = {output: list(steps) for output, steps in (script or {}).items()}
+        self.seconds = seconds
+        self.calls: list[str] = []
+        self.running = self.most_running = 0
+        self.started = threading.Event()
+        self._lock = threading.Lock()
+
+    def run(self, env: Environment, model_output: str, **kwargs: object) -> RunResult:
+        with self._lock:
+            self.calls.append(model_output)
+            steps = self.script.get(model_output)
+            step = steps.pop(0) if steps else 0.0
+            self.running += 1
+            self.most_running = max(self.most_running, self.running)
+        self.started.set()
+        try:
+            time.sleep(self.seconds)
+            if isinstance(step, BaseException):
+                raise step
+            time.sleep(step)
+            judged = 'right' in model_output
+            return RunResult(
+                score=float(judged),
+                passed=judged,
+                output='',
+                stderr='',
+                exit_code=0,
+                execution_time_ms=0.0,
+                sandbox_id='fake',
+            )
+        finally:
+            with self._lock:
+                self.running -= 1
 
 
 class _GatedDeepGym(DeepGym):
@@ -376,26 +522,40 @@ class _GatedDeepGym(DeepGym):
         self.other_scored = threading.Event()
         self.finished: list[str] = []
 
-    def run_batch(self, env: Environment, outputs: list[str], **kwargs: object) -> object:
-        if outputs == ['slow']:
+    def run(self, env: Environment, model_output: str, **kwargs: object) -> RunResult:
+        if model_output == 'slow':
             self.slow_started.set()
             self.other_scored.wait(timeout=10)
-        batch = super().run_batch(env, outputs, **kwargs)
-        self.finished.extend(outputs)
-        if outputs != ['slow']:
+        result = super().run(env, model_output, **kwargs)
+        self.finished.append(model_output)
+        if model_output != 'slow':
             self.other_scored.set()
-        return batch
+        return result
 
 
 class TestOpenRLHFIntegration:
     """Verify OpenRLHF router creation and endpoint."""
 
     def test_create_router_returns_api_router(self, env: Environment, local_dg: DeepGym) -> None:
-        router = create_openrlhf_router(env, local_dg)
+        router = create_openrlhf_router(env, local_dg, infra_failure_score='nan')
         assert router is not None
 
+    @pytest.mark.parametrize(
+        'kwargs', [{}, {'infra_failure_score': 'skip'}], ids=['unset', 'other']
+    )
+    def test_infra_failure_score_is_a_choice_made_at_setup(
+        self, env: Environment, local_dg: DeepGym, kwargs: dict
+    ) -> None:
+        """No default: what OpenRLHF trains on for our failures is decided by whoever sets it up."""
+        with pytest.raises(ValueError, match='infra_failure_score') as refused:
+            create_openrlhf_router(env, local_dg, **kwargs)
+
+        assert "'nan' (recommended)" in str(refused.value)
+        assert '--algo.dynamic_filtering_enable' in str(refused.value)
+        assert "'zero' trains on it as a failed answer" in str(refused.value)
+
     def test_score_endpoint(self, env: Environment, local_dg: DeepGym) -> None:
-        router = create_openrlhf_router(env, local_dg)
+        router = create_openrlhf_router(env, local_dg, infra_failure_score='zero')
         app = FastAPI()
         app.include_router(router)
         client = TestClient(app)
@@ -425,20 +585,172 @@ class TestOpenRLHFIntegration:
     ) -> None:
         """A too-long prompt loses tokens from its front, but OpenRLHF sends the whole string.
 
-        The response starts after the prompt's tail; a query that doesn't contain its
-        prompt at all is not scored.
+        The response starts after the prompt's tail.
         """
         truncated = OPENRLHF_PROMPT[len(OPENRLHF_CONTEXT) // 2 :]
         queries = [
             truncated + 'No idea.<|im_end|>',
             truncated + f'```python\n{GOOD_SOLUTION}```<|im_end|>',
-            'A query that lost its prompt entirely. No idea.',
         ]
 
         data = _openrlhf_score(env, local_dg, queries)
 
-        assert data['rewards'] == [0.0, 1.0, 0.0]
-        assert data['error_types'] == [None, None, 'prompt_mismatch']
+        assert data == {'rewards': [0.0, 1.0], 'error_types': [None, None]}
+
+    def test_failures_the_model_triggers_never_fail_the_request(self, local_dg: DeepGym) -> None:
+        """A failed request stops OpenRLHF's training step, so no output may cause one.
+
+        The verifier crashes on 'boom', and the last query lost its prompt: each scores 0.
+        """
+        payload = {
+            'prompts': [OPENRLHF_PROMPT] * 3,
+            'query': [OPENRLHF_PROMPT + 'right', OPENRLHF_PROMPT + 'boom', 'A lost prompt.'],
+        }
+
+        data = _post(MIXED, local_dg, payload)
+
+        assert data == {
+            'rewards': [1.0, 0.0, 0.0],
+            'error_types': [None, 'runtime_error', 'prompt_mismatch'],
+        }
+
+    def test_only_provider_failures_get_nan(self, local_dg: DeepGym) -> None:
+        """NaN drops the sample's group; a verifier the model's output broke must score 0."""
+        payload = {'prompts': ['p'], 'outputs': ['boom']}
+
+        data = _post(MIXED, local_dg, payload, infra_failure_score='nan')
+
+        assert data == {'rewards': [0.0], 'error_types': ['runtime_error']}
+
+    @pytest.mark.parametrize(
+        'failure',
+        [ConnectionError('provider unavailable'), TimeoutError('provider call timed out')],
+        ids=['unavailable', 'call_timed_out'],
+    )
+    def test_a_provider_failure_is_graded_once_more(
+        self, monkeypatch: pytest.MonkeyPatch, failure: Exception
+    ) -> None:
+        """A failure is_infrastructure_failure calls ours gets one more grading of the response.
+
+        A provider call that times out raises the built-in TimeoutError, which since Python
+        3.11 is also what waiting too long for a run raises; it's still graded again.
+        """
+        monkeypatch.setattr(openrlhf, '_RETRY_DELAY_S', 0.0)
+        dg = _ScriptedDeepGym({'right': [failure]})
+
+        data = _post(MIXED, dg, {'prompts': ['p'] * 2, 'outputs': ['right', 'wrong']})
+
+        assert data == {'rewards': [1.0, 0.0], 'error_types': [None, None]}
+        assert sorted(dg.calls) == ['right', 'right', 'wrong']
+
+    @pytest.mark.parametrize(
+        'failure',
+        [
+            SandboxError('Sandbox 7f3a is not running'),
+            DeepGymTimeout('Command exceeded 30s timeout'),
+            VerifierError('Verifier did not produce valid JSON'),
+            asyncio.CancelledError(),
+        ],
+        ids=['sandbox_killed', 'hung', 'verifier_failed', 'sdk_cancelled'],
+    )
+    def test_a_failure_the_model_may_have_caused_is_never_graded_again(
+        self, monkeypatch: pytest.MonkeyPatch, failure: BaseException
+    ) -> None:
+        """It scores 0, even with NaN asked for: a second grading could hand it a pass.
+
+        So does asyncio's CancelledError, which a provider SDK running its own event loop can
+        raise and which isn't an Exception: it never fails the request.
+        """
+        monkeypatch.setattr(openrlhf, '_RETRY_DELAY_S', 0.0)
+        dg = _ScriptedDeepGym({'right': [failure]})
+
+        data = _post(MIXED, dg, {'prompts': ['p'], 'outputs': ['right']}, infra_failure_score='nan')
+
+        assert data['rewards'] == [0.0]
+        assert dg.calls == ['right']
+
+    @pytest.mark.parametrize('infra_failure_score', ['zero', 'nan'])
+    @pytest.mark.parametrize(
+        ('second', 'budget'),
+        [(ConnectionError('still unavailable'), 150.0), (2.0, 0.5)],
+        ids=['fails_too', 'out_of_time'],
+    )
+    def test_a_second_grading_that_fails_gets_the_infrastructure_score(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        infra_failure_score: str,
+        second: BaseException | float,
+        budget: float,
+    ) -> None:
+        """Failing again, or passing too late (2 s against 0.5 s), is never a pass or an error.
+
+        0 in zero mode; NaN in nan mode, which OpenRLHF's dynamic filtering drops.
+        """
+        monkeypatch.setattr(openrlhf, '_RETRY_DELAY_S', 0.0)
+        monkeypatch.setattr(openrlhf, '_REQUEST_BUDGET_S', budget)
+        dg = _ScriptedDeepGym({'right': [ConnectionError('provider unavailable'), second]})
+        payload = {'prompts': ['p'], 'outputs': ['right']}
+
+        with caplog.at_level(logging.WARNING, logger='deepgym.integrations.openrlhf'):
+            data = _post(MIXED, dg, payload, infra_failure_score=infra_failure_score)
+
+        (reward,) = data['rewards']
+        assert (reward == 0.0) if infra_failure_score == 'zero' else math.isnan(reward)
+        assert data['error_types'] == ['unknown_error']
+        assert dg.calls == ['right', 'right']
+        assert 'no verdict (unknown_error)' in caplog.text
+
+    def test_second_gradings_take_the_same_slots(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Every run, first or second, waits for one of max_parallel slots: never more."""
+        monkeypatch.setattr(openrlhf, '_RETRY_DELAY_S', 0.0)
+        outputs = [f'right {i}' for i in range(4)]
+        dg = _ScriptedDeepGym({o: [ConnectionError('unavailable')] for o in outputs}, 0.05)
+
+        data = _post(MIXED, dg, {'prompts': outputs, 'outputs': outputs}, max_parallel=2)
+
+        assert data['rewards'] == [1.0] * 4
+        assert len(dg.calls) == 8
+        assert dg.most_running == 2
+
+    def test_a_run_its_request_gave_up_on_keeps_its_slot(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Answering at the deadline never frees a slot the run still holds.
+
+        The run still going scores 0, as the model's code may be what slows it. The next
+        request's run can't start at all, so it gets the infrastructure score (NaN here).
+        """
+        monkeypatch.setattr(openrlhf, '_REQUEST_BUDGET_S', 0.3)
+        dg = _ScriptedDeepGym({'right': [1.0]})
+        app = FastAPI()
+        app.include_router(
+            create_openrlhf_router(MIXED, dg, infra_failure_score='nan', max_parallel=1)
+        )
+        client = TestClient(app)
+
+        first = client.post('/reward/score', json={'prompts': ['p'], 'outputs': ['right']})
+        second = client.post('/reward/score', json={'prompts': ['p'], 'outputs': ['wrong']})
+
+        assert first.json() == {'rewards': [0.0], 'error_types': ['deadline_exceeded']}
+        assert math.isnan(second.json()['rewards'][0])
+        assert second.json()['error_types'] == ['deadline_exceeded']
+        assert dg.calls == ['right']
+        assert dg.most_running == 1
+
+    def test_lasting_failures_count_toward_the_masked_rate_warning(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setattr(openrlhf, '_RETRY_DELAY_S', 0.0)
+        failing = [f'right {i} outage' for i in range(6)]
+        outputs = failing + ['right'] * (MASKED_BATCH - 6)
+        down = [ConnectionError('down'), ConnectionError('down')]
+        dg = _ScriptedDeepGym({output: list(down) for output in failing})
+
+        with caplog.at_level(logging.WARNING, logger='deepgym.integrations.reward'):
+            _post(MIXED, dg, {'prompts': outputs, 'outputs': outputs})
+
+        assert f'6 of the last {MASKED_BATCH} samples got no verdict' in caplog.text
 
     async def test_a_slow_verification_does_not_hold_up_other_requests(
         self, env: Environment
@@ -450,7 +762,7 @@ class TestOpenRLHFIntegration:
         """
         dg = _GatedDeepGym()
         app = FastAPI()
-        app.include_router(create_openrlhf_router(env, dg))
+        app.include_router(create_openrlhf_router(env, dg, infra_failure_score='zero'))
         transport = httpx.ASGITransport(app=app)
 
         async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
@@ -464,8 +776,78 @@ class TestOpenRLHFIntegration:
         assert fast.json()['rewards'] == [1.0]
         assert dg.finished == [extract_code(FENCED), 'slow']
 
+    async def test_a_request_holds_no_worker_thread_while_it_is_graded(self) -> None:
+        """Requests are graded together even with one worker thread, so none waits for one.
+
+        A request's 150 s would only start once it got a thread, and OpenRLHF gives up at 180.
+        """
+        to_thread.current_default_thread_limiter().total_tokens = 1
+        dg = _ScriptedDeepGym(seconds=0.5)
+        app = FastAPI()
+        app.include_router(
+            create_openrlhf_router(MIXED, dg, infra_failure_score='nan', max_parallel=2)
+        )
+        transport = httpx.ASGITransport(app=app)
+        payload = {'prompts': ['p'], 'outputs': ['right']}
+
+        async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
+            replies = await asyncio.gather(
+                *(client.post('/reward/score', json=payload) for _ in range(2))
+            )
+
+        assert [reply.json()['rewards'] for reply in replies] == [[1.0], [1.0]]
+        assert dg.most_running == 2
+
+    async def test_runs_score_as_they_stood_at_the_deadline_however_late_it_is_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A busy event loop that reads the outcomes late changes none of them.
+
+        With one slot and the loop held past the 0.3 s deadline, the first run ends after it
+        and scores 0, and the second, whose slot only came after it, never starts.
+        """
+        monkeypatch.setattr(openrlhf, '_REQUEST_BUDGET_S', 0.3)
+        dg = _ScriptedDeepGym(seconds=0.6)
+        app = FastAPI()
+        app.include_router(
+            create_openrlhf_router(MIXED, dg, infra_failure_score='nan', max_parallel=1)
+        )
+        transport = httpx.ASGITransport(app=app)
+        payload = {'prompts': ['p', 'p'], 'outputs': ['right', 'right too']}
+
+        async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
+            reply = asyncio.create_task(client.post('/reward/score', json=payload))
+            assert await asyncio.to_thread(dg.started.wait, 5)
+            time.sleep(1.0)  # holds the event loop past the deadline and both slots' turns
+            data = (await reply).json()
+
+        assert data['rewards'][0] == 0.0
+        assert math.isnan(data['rewards'][1])
+        assert data['error_types'] == ['deadline_exceeded', 'deadline_exceeded']
+        assert dg.calls == ['right']
+
+    async def test_a_cancelled_request_starts_none_of_its_waiting_runs(self) -> None:
+        """A request cancelled while it's graded, as at shutdown, leaves no run queued."""
+        dg = _ScriptedDeepGym(seconds=0.2)
+        app = FastAPI()
+        app.include_router(
+            create_openrlhf_router(MIXED, dg, infra_failure_score='nan', max_parallel=1)
+        )
+        transport = httpx.ASGITransport(app=app)
+        payload = {'prompts': ['p', 'p'], 'outputs': ['first', 'waiting']}
+
+        async with httpx.AsyncClient(transport=transport, base_url='http://test') as client:
+            reply = asyncio.create_task(client.post('/reward/score', json=payload))
+            assert await asyncio.to_thread(dg.started.wait, 5)
+            reply.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await reply
+            await asyncio.sleep(0.4)
+
+        assert dg.calls == ['first']
+
     def test_score_endpoint_empty(self, env: Environment, local_dg: DeepGym) -> None:
-        router = create_openrlhf_router(env, local_dg)
+        router = create_openrlhf_router(env, local_dg, infra_failure_score='zero')
         app = FastAPI()
         app.include_router(router)
         client = TestClient(app)
@@ -508,7 +890,7 @@ class TestUntrustedInputSize:
         from deepgym.integrations.openrlhf import MAX_TEXT_CHARS
 
         app = FastAPI()
-        app.include_router(create_openrlhf_router(env, local_dg))
+        app.include_router(create_openrlhf_router(env, local_dg, infra_failure_score='zero'))
         too_long = 'x' * (MAX_TEXT_CHARS + 1)
 
         response = TestClient(app).post(

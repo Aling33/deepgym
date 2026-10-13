@@ -1,5 +1,48 @@
 """DeepGym exception hierarchy."""
 
+import builtins
+import re
+import sys
+
+_E2B_STATUS = re.compile(r'(\d{3}): ')
+"""How e2b's envd client words an HTTP status it has no exception class for."""
+
+_TRANSPORT_ERRORS = (
+    ('httpx', ('TransportError',)),
+    (
+        'urllib3.exceptions',
+        ('ProtocolError', 'NewConnectionError', 'MaxRetryError', 'TimeoutError'),
+    ),
+    ('requests.exceptions', ('ConnectionError', 'Timeout')),
+    ('aiohttp', ('ClientConnectionError',)),
+    ('daytona', ('DaytonaConnectionError', 'DaytonaSpotEvictedError', 'DaytonaQueueTimeoutError')),
+    (
+        'e2b.exceptions',
+        ('SandboxUnreachableException', 'ServiceBusyException', 'RateLimitException'),
+    ),
+    ('pyqwest', ('ReadError', 'WriteError', 'StreamError')),  # e2b's RPC transport
+    (
+        'modal.exception',
+        (
+            'ConnectionError',
+            'InternalError',
+            'InternalFailure',
+            'ResourceExhaustedError',
+            'ServiceError',
+        ),
+    ),
+)
+"""Exception classes, by module, that mean the network or the sandbox provider failed.
+
+A module that was never imported can't have raised one, so none is imported here.
+"""
+
+_SANDBOX_GONE_ERRORS = (('e2b.exceptions', ('SandboxNotRunningException',)),)
+"""Exception classes, by module, of a provider confirming the sandbox stopped.
+
+e2b raises one with the dropped connection that led it to check as its cause.
+"""
+
 
 class DeepGymError(Exception):
     """Base exception for all DeepGym errors."""
@@ -25,6 +68,19 @@ class ActionError(DeepGymError):
     """Raise when the environment rejects an agent's action (not allowed, unknown key)."""
 
 
+class NoVerdictError(DeepGymError):
+    """Raise when a run got no verdict (its sandbox or verifier failed), so it has no reward.
+
+    Args:
+        reason: What failed, kept as ``reason``.
+        advice: What the caller can do about it, added to the message.
+    """
+
+    def __init__(self, reason: str, advice: str = '') -> None:
+        super().__init__(f'{reason} {advice}'.strip())
+        self.reason = reason
+
+
 def error_type_for(exc: BaseException) -> str:
     """Name the failure for a zero-score result."""
     if isinstance(exc, TimeoutError):
@@ -36,3 +92,60 @@ def error_type_for(exc: BaseException) -> str:
     if isinstance(exc, DeepGymError):
         return 'verifier_error'
     return 'unknown_error'
+
+
+def is_infrastructure_failure(exc: BaseException) -> bool:
+    """Return True if *exc* is a failure of the network or the sandbox provider.
+
+    That is a connection or transport error, a provider call timing out, a provider HTTP
+    5xx or 429, or the provider evicting the sandbox, anywhere along the exception's
+    ``__cause__`` chain. Such a run got no verdict, and trainers keep it out of training.
+
+    Anything else is the policy's doing and is scored: a command or verifier that ran out
+    of time, a sandbox the provider reports gone or stopped after the policy acted, a
+    failed write, garbage output. DeepGym's ``TimeoutError`` and a provider confirming the
+    sandbox stopped end the walk, whatever their causes.
+
+    ponytail: a provider 5xx caused by a policy that exhausted its sandbox still reads as
+    infrastructure; the masked-rate warning in :mod:`deepgym.integrations.reward` shows it.
+    """
+    gone = _loaded(_SANDBOX_GONE_ERRORS)
+    transport = _loaded(_TRANSPORT_ERRORS)
+    while exc is not None:
+        if isinstance(exc, (TimeoutError, *gone)):
+            return False
+        if isinstance(exc, (ConnectionError, builtins.TimeoutError, *transport)):
+            return True
+        status = _status_code(exc)
+        if status is not None and (status >= 500 or status == 429):
+            return True
+        exc = exc.__cause__
+    return False
+
+
+def _loaded(table: tuple[tuple[str, tuple[str, ...]], ...]) -> tuple[type, ...]:
+    """Return the classes *table* names from modules already imported."""
+    return tuple(
+        error
+        for module, names in table
+        if module in sys.modules
+        for name in names
+        if isinstance(error := getattr(sys.modules[module], name, None), type)
+    )
+
+
+def _status_code(exc: BaseException) -> int | None:
+    """Return the HTTP status *exc* carries, as provider SDK, httpx and aiohttp errors do.
+
+    e2b gives an envd status it has no class for (a 503, say) only in the message.
+    """
+    response = getattr(exc, 'response', None)
+    for status in (getattr(exc, 'status_code', None), getattr(response, 'status_code', None)):
+        if isinstance(status, int):
+            return status
+    status = getattr(exc, 'status', None)  # aiohttp
+    if isinstance(status, int):
+        return status
+    if type(exc).__module__.startswith('e2b') and (match := _E2B_STATUS.match(str(exc))):
+        return int(match.group(1))
+    return None
