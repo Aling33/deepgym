@@ -13,11 +13,13 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+import deepgym
 from deepgym import ComputerUseEnvironment, DeepGym
 from deepgym.console.episode_store import EpisodeStore, record_episode
 from deepgym.exceptions import ActionError, DeepGymError, SandboxError, VerifierError
 from deepgym.models import Action, MultiTurnEnvironment, RunResult, Trajectory
-from deepgym.session import LocalBackend, Session
+from deepgym.sandboxes import SandboxImage
+from deepgym.session import LOCAL_IMAGE, LocalBackend, Session
 from deepgym.traces import (
     AgentMeta,
     EnvFingerprint,
@@ -28,9 +30,12 @@ from deepgym.traces import (
     TraceStep,
     export_traces,
     load_trace,
+    merge_copies,
+    rl_row,
 )
 from deepgym.traces.capture import UNFINISHED
-from deepgym.traces.schema import environment_sha256, json_text
+from deepgym.traces.checkout import deepgym_checkout, git_checkout
+from deepgym.traces.schema import NOT_RESOLVED, environment_sha256, json_text
 from tests.trace_samples import ENV, crashed_trace, graded_trace, unjudged_trace
 
 SRC = Path(__file__).resolve().parent.parent / 'src'
@@ -184,7 +189,7 @@ class TestSchema:
         with pytest.raises(ValidationError, match='step indexes'):
             trace.model_validate({**trace.model_dump(), 'steps': trace.model_dump()['steps'][::-1]})
 
-    def test_to_trajectory_skips_steps_without_observation(self) -> None:
+    def test_to_trajectory_skips_rejected_steps(self) -> None:
         trace = graded_trace()
 
         trajectory = trace.to_trajectory()
@@ -193,6 +198,77 @@ class TestSchema:
         assert trajectory.steps[0][0] == trace.initial_observation
         assert trajectory.final_observation == trace.steps[2].observation
         assert trajectory.step_rewards == [0.5, 0.5]
+
+    def test_merge_copies_keeps_the_furthest_and_refuses_disagreement(self) -> None:
+        graded = graded_trace()
+        unfinished = {'finished_at': None}
+        unstarted = graded.model_copy(
+            update={'initial_observation': None, 'steps': (), 'result': None, **unfinished}
+        )
+        snapshot = graded.model_copy(update={'result': None, **unfinished})
+        crashed = snapshot.model_copy(update={'error': UNFINISHED})
+        failed = graded.result.model_copy(update={'score': 0.0, 'passed': False})
+        regraded = graded.model_copy(update={'prior_results': (graded.result,), 'result': failed})
+
+        # A traced episode takes no action once graded, nor a grade once finished, and it
+        # never clears an error, though a later one may replace it.
+        graded_early = graded.model_copy(update={'steps': graded.steps[:1], **unfinished})
+        erred = snapshot.model_copy(update={'error': 'VerifierError: invalid final output'})
+        erred_again = graded.model_copy(update={'error': 'VerifierError: timed out'})
+
+        assert merge_copies([unstarted, graded, snapshot]) == [graded]
+        assert merge_copies([snapshot, crashed]) == [crashed]
+        assert merge_copies([crashed, erred]) == [erred]  # a real error over a guessed crash
+        assert merge_copies([graded.model_copy(update=unfinished), regraded]) == [regraded]
+        assert merge_copies([erred, erred_again]) == [erred_again]
+        for copies in (
+            [graded, regraded],
+            [graded, graded_early],
+            [graded, graded.model_copy(update={'task': 'other'})],
+            [erred, graded],
+            [erred, erred.model_copy(update={'error': 'VerifierError: timed out'})],
+            # Graded after the error, then crashed: the log's copy can't show the error.
+            [erred, graded.model_copy(update={**unfinished, 'error': UNFINISHED})],
+        ):
+            with pytest.raises(ValueError, match='trace0001'):
+                merge_copies(copies)
+
+    def test_merge_copies_fills_a_1_0_console_copy_from_its_event_log(self) -> None:
+        # Schema 1.0 logged every grade but kept only the last in memory, so in the console.
+        graded = graded_trace().model_copy(update={'schema_version': '1.0'})
+        failed = graded.result.model_copy(update={'score': 0.0, 'passed': False})
+        logged = graded.model_copy(update={'prior_results': (failed,)})
+        snapshot = graded.model_copy(update={'result': failed, 'finished_at': None})
+        other = graded.result.model_copy(update={'score': 0.5})
+
+        assert merge_copies([graded, logged]) == [logged]
+        assert merge_copies([snapshot, logged]) == [logged]
+        with pytest.raises(ValueError, match='trace0001'):
+            merge_copies([graded.model_copy(update={'result': other}), logged])
+
+    def test_only_schema_1_1_continues_a_turn_without_messages(self) -> None:
+        trace = graded_trace()
+        bare = trace.steps[1].model_copy(update={'messages': ()})
+        current = trace.model_copy(update={'steps': (trace.steps[0], bare, trace.steps[2])})
+        # In schema 1.0 a step without messages had none recorded: it joins no turn.
+        legacy = current.model_copy(update={'schema_version': '1.0'})
+
+        assert current.turns == [[1, 2], [3]]
+        assert legacy.turns == [[1], [2], [3]]
+        assert rl_row(current) is not None and rl_row(legacy) is None
+
+    def test_to_trajectory_adds_rewards_as_the_session_does(self) -> None:
+        first, _, last = graded_trace().steps
+        steps = (
+            first.model_copy(update={'reward': 0.1}),
+            first.model_copy(update={'index': 2, 'reward': 0.2}),
+            last.model_copy(update={'reward': 0.3}),
+        )
+
+        trajectory = graded_trace().model_copy(update={'steps': steps}).to_trajectory()
+
+        # A running total, as Session keeps; sum() gives 0.6 here from Python 3.12 on.
+        assert trajectory.total_reward == 0.1 + 0.2 + 0.3
 
     def test_to_trajectory_never_moves_a_reward_to_another_step(self) -> None:
         trace = graded_trace()
@@ -256,6 +332,85 @@ class TestProvenance:
         desktop = ComputerUseEnvironment(task='t')
 
         assert environment_sha256(shell) != environment_sha256(desktop)
+
+    def test_trace_records_code_and_image_identity(self, dg: DeepGym, tmp_path: Path) -> None:
+        pq = pytest.importorskip('pyarrow.parquet')
+        with dg.trace(WRITE_ENV, AGENT) as tr:
+            tr.start()
+        trace = load_trace(tr.path)
+        export_traces([trace], 'jsonl', tmp_path / 'traces.jsonl')
+        export_traces([trace], 'parquet', tmp_path / 'traces.parquet')
+        export_traces([trace], 'atif', tmp_path / 'atif')
+
+        provenance = trace.provenance
+        head = subprocess.run(['git', '-C', str(SRC), 'rev-parse', 'HEAD'], capture_output=True)
+        assert trace.schema_version == '1.1'
+        assert provenance.deepgym_version == deepgym.__version__
+        assert provenance.deepgym_commit == (head.stdout.decode().strip() or None)
+        assert (provenance.deepgym_commit, provenance.deepgym_dirty) == deepgym_checkout()
+        assert (provenance.env.image, provenance.env.image_digest) == (None, None)
+        assert provenance.env.digest_unavailable == LOCAL_IMAGE.unavailable
+        (jsonl,) = [
+            json.loads(line) for line in (tmp_path / 'traces.jsonl').read_text().splitlines()
+        ]
+        (parquet,) = pq.read_table(tmp_path / 'traces.parquet').to_pylist()
+        atif = json.loads((tmp_path / 'atif' / f'{trace.trace_id}.json').read_text())
+        for exported in (jsonl, json.loads(parquet['trace']), atif['extra']['deepgym']):
+            assert exported['schema_version'] == '1.1'
+            assert Provenance.model_validate(exported['provenance']) == provenance
+
+    def test_git_checkout(self, tmp_path: Path) -> None:
+        package = tmp_path / 'repo' / 'pkg'
+        package.mkdir(parents=True)
+        (package / '__init__.py').write_text('x = 1\n')
+
+        def git(*args: str) -> str:
+            config = (
+                'user.name=t', 'user.email=t@t', 'commit.gpgsign=false', 'core.hooksPath=/dev/null'
+            )  # fmt: skip
+            options = [part for setting in config for part in ('-c', setting)]
+            command = ['git', '-C', str(package), *options, *args]
+            return subprocess.run(command, check=True, capture_output=True, text=True).stdout
+
+        assert git_checkout(package) == (None, None)  # not in a repository
+        git('init', '--quiet')
+        assert git_checkout(package) == (None, None)  # untracked: some other project's checkout
+        git('add', '.')
+        git('commit', '--quiet', '-m', 'first')
+        head = git('rev-parse', 'HEAD').strip()
+        assert git_checkout(package) == (head, False)
+        # Rewritten after it was loaded: git sees no change, but the loaded code may differ.
+        loaded = (package / '__init__.py').stat().st_mtime
+        assert git_checkout(package, since=loaded) == (head, False)
+        os.utime(package / '__init__.py', (loaded + 5, loaded + 5))
+        assert git_checkout(package, since=loaded) == (head, True)
+        (package / 'new.py').write_text('y = 2\n')
+        assert git_checkout(package) == (head, True)
+        git('config', 'status.showUntrackedFiles', 'no')  # must not hide the new module
+        assert git_checkout(package) == (head, True)
+        (package / 'new.py').unlink()
+        (package / '__init__.py').write_text('x = 2\n')
+        assert git_checkout(package) == (head, True)
+
+    def test_booted_image_takes_only_the_providers_digest(self) -> None:
+        pinned = 'python:3.12-slim@sha256:' + 'cd' * 32
+        env = WRITE_ENV.model_copy(update={'image': pinned})
+
+        unbooted = EnvFingerprint.of(env.model_copy(update={'image': 'python:3.12-slim'}))
+        resolved = unbooted.booted(
+            SandboxImage('docker.io/library/python:3.12-slim', 'sha256:ab', None)
+        )
+        # Built on top of the pinned image: the pin doesn't identify what booted.
+        built = EnvFingerprint.of(env).booted(SandboxImage(pinned, None, 'built, no digest'))
+
+        assert (unbooted.image_digest, unbooted.digest_unavailable) == (None, NOT_RESOLVED)
+        assert EnvFingerprint.of(env).image_digest == 'sha256:' + 'cd' * 32
+        assert (resolved.image, resolved.image_digest, resolved.digest_unavailable) == (
+            'docker.io/library/python:3.12-slim', 'sha256:ab', None
+        )  # fmt: skip
+        assert (built.image, built.image_digest, built.digest_unavailable) == (
+            pinned, None, 'built, no digest'
+        )  # fmt: skip
 
 
 class TestCapture:
@@ -401,6 +556,29 @@ class TestCapture:
         trace = load_trace(tr.path)
         assert len(trace.steps) == 1 and trace.has_verdict
 
+    def test_every_grade_is_kept(self, dg: DeepGym, tmp_path: Path) -> None:
+        # A flaky final verifier: fails the first time it grades, passes after.
+        flaky = (
+            'import json, pathlib\n'
+            'again = pathlib.Path("graded").exists()\n'
+            'pathlib.Path("graded").write_text("x")\n'
+            'print(json.dumps({"score": float(again), "passed": again}))\n'
+        )
+        env = WRITE_ENV.model_copy(update={'final_verifier_code': flaky})
+
+        with dg.trace(env, AGENT) as tr:
+            tr.start()
+            tr.step(Action(action_type='done'))
+            first, second = tr.score(), tr.score()
+        export_traces([load_trace(tr.path)], 'jsonl', tmp_path / 'out.jsonl')
+
+        trace = load_trace(tr.path)
+        assert (first.passed, second.passed) == (False, True)
+        assert (trace.prior_results, trace.result) == ((first,), second)
+        assert trace == tr.trace
+        (row,) = [json.loads(line) for line in (tmp_path / 'out.jsonl').read_text().splitlines()]
+        assert Trace.model_validate(row) == trace
+
     def test_nan_verifier_output_stays_strict_json(self, dg: DeepGym, tmp_path: Path) -> None:
         env = WRITE_ENV.model_copy(
             update={'step_verifier_code': 'print(\'{"score": 0.5, "metrics": {"x": NaN}}\')'}
@@ -535,6 +713,18 @@ class TestCapture:
         assert step.applied and step.observation is None
         assert (step.reward, step.step_verifier['details']) == (0.5, 'step 1')
         assert step.error == 'SandboxError: screenshot failed'
+
+    def test_replay_keeps_an_action_whose_screenshot_failed(self, tmp_path: Path) -> None:
+        tr = _desktop_trace(WRITE_ENV, screenshots=1, path=tmp_path / 't.jsonl')
+        with tr:
+            tr.start()
+            with pytest.raises(SandboxError, match='screenshot failed'):
+                tr.step(Action(action_type='bash', content='echo hello > out.txt'))
+
+        trajectory = load_trace(tr.path).to_trajectory()
+
+        assert trajectory == tr._session.trajectory
+        assert (len(trajectory.steps), trajectory.step_rewards) == (1, [0.5])
 
     def test_failed_step_verifier_never_reuses_an_earlier_verdict(self, tmp_path: Path) -> None:
         verifier = 'import os\nprint(0.5 if os.environ["STEP_NUMBER"] == "1" else "garbage")\n'

@@ -25,10 +25,10 @@ from deepgym.exceptions import DeepGymError, SandboxError, VerifierError
 from deepgym.judge import JudgeJob
 from deepgym.models import Action, Environment, MultiTurnEnvironment
 from deepgym.sandbox import build_run_result, run_judge_in_sandbox, split_wrapped_output
-from deepgym.sandboxes import ExecResult, SandboxTimeoutError, open_sandbox
+from deepgym.sandboxes import ExecResult, SandboxImage, SandboxTimeoutError, open_sandbox
 from deepgym.sandboxes.apple import AppleContainer
 from deepgym.sandboxes.cli import DEFAULT_IMAGE
-from deepgym.sandboxes.daytona import cleanup_sandbox
+from deepgym.sandboxes.daytona import cleanup_sandbox, snapshot_digest
 from deepgym.sandboxes.docker import DockerContainer
 from deepgym.session import SandboxBackend
 
@@ -206,6 +206,64 @@ def test_cli_delete_fails_only_while_the_container_still_runs(
     assert box.delete() is True
 
 
+def _answering(monkeypatch: pytest.MonkeyPatch, answers: dict[str, tuple[int, str]]) -> None:
+    """Fake the CLI: each command whose argv contains a key gets that (exit code, stdout)."""
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        code, out = next((v for k, v in answers.items() if k in ' '.join(argv)), (0, ''))
+        return subprocess.CompletedProcess(argv, code, out.encode(), b'inspect failed')
+
+    monkeypatch.setattr(subprocess, 'run', fake_run)
+
+
+_DIGEST = 'sha256:' + 'a6' * 32
+
+
+def test_apple_reports_the_digest_its_container_booted(monkeypatch: pytest.MonkeyPatch) -> None:
+    image = {'reference': 'docker.io/library/python:3.12-slim', 'descriptor': {'digest': _DIGEST}}
+    _answering(monkeypatch, {'inspect': (0, json.dumps([{'configuration': {'image': image}}]))})
+
+    booted = AppleContainer(image='python:3.12-slim').booted_image()
+
+    assert booted == SandboxImage('docker.io/library/python:3.12-slim', _DIGEST, None)
+
+
+def test_docker_reports_the_registry_digest_of_its_containers_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_id = 'sha256:' + 'cc' * 32
+    _answering(monkeypatch, {
+        '{{.Image}}': (0, f'{image_id}\n'),
+        f'RepoDigests}}}} {image_id}': (0, json.dumps([f'python@{_DIGEST}'])),
+    })  # fmt: skip
+    pulled = DockerContainer(image='python:3.12-slim').booted_image()
+    _answering(monkeypatch, {'{{.Image}}': (0, f'{image_id}\n'), 'RepoDigests': (0, '[]')})
+    built = DockerContainer(image='deepgym-build:abc').booted_image()
+
+    assert pulled == SandboxImage('python:3.12-slim', _DIGEST, None)
+    assert (built.name, built.digest) == ('deepgym-build:abc', None)
+    assert image_id in built.unavailable
+
+
+def test_cli_image_lookup_failure_is_recorded_not_raised(monkeypatch: pytest.MonkeyPatch) -> None:
+    _answering(monkeypatch, {'inspect': (1, '')})
+
+    booted = AppleContainer().booted_image()
+
+    assert (booted.name, booted.digest) == (DEFAULT_IMAGE, None)
+    assert 'inspect failed' in booted.unavailable
+
+
+def test_daytona_snapshot_ref_carries_the_image_digest() -> None:
+    hexdigest = 'ed' * 32
+
+    assert snapshot_digest(f'cr.app.daytona.io/sbox/daytona-{hexdigest}:daytona') == (
+        f'sha256:{hexdigest}'
+    )
+    assert snapshot_digest('cr.app.daytona.io/sbox/daytona-abc:daytona') is None
+    assert snapshot_digest(None) is None
+
+
 def test_unknown_provider_is_rejected() -> None:
     with pytest.raises(DeepGymError, match='Unknown sandbox provider'):
         open_sandbox('nope')  # type: ignore[arg-type]
@@ -269,8 +327,10 @@ def test_modal_blocks_network_and_maps_results(monkeypatch: pytest.MonkeyPatch) 
     assert created['execs'][-1][:2] == ('/bin/sh', '-c')
     assert 'mkdir -p /a/b' in created['execs'][-1][2]
     assert created['w'] == '/a/b/c.txt' and created['terminated']
-    module.ModalSandbox('python:3.11-slim')
+    registry = module.ModalSandbox('python:3.11-slim')
     assert created['image'] == 'reg:python:3.11-slim'
+    for booted, name in ((box.booted_image(), None), (registry.booted_image(), 'python:3.11-slim')):
+        assert (booted.name, booted.digest) == (name, None) and booted.unavailable
 
     def refuse() -> None:
         raise RuntimeError('Modal is unavailable')
@@ -305,6 +365,7 @@ def test_e2b_runs_as_root_offline_and_maps_errors(monkeypatch: pytest.MonkeyPatc
     class Client:
         sandbox_id = 'e2b-1'
         commands = Commands()
+        default_template = 'base'
 
         @staticmethod
         def create(**kwargs: object) -> 'Client':
@@ -337,8 +398,10 @@ def test_e2b_runs_as_root_offline_and_maps_errors(monkeypatch: pytest.MonkeyPatc
     assert seen['timeout'] > 1
     with pytest.raises(SandboxError, match='not reachable'):
         box.exec('gone', timeout=1)
-    module.E2BSandbox('my-template')
+    named = module.E2BSandbox('my-template')
     assert seen['create']['template'] == 'my-template'
+    assert [box.booted_image().name, named.booted_image().name] == ['base', 'my-template']
+    assert box.booted_image().digest is None and box.booted_image().unavailable
     assert box.delete() is True
     seen['kill_fails'] = True
     assert box.delete() is False
