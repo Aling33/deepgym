@@ -5,6 +5,7 @@ import os
 import pytest
 
 from deepgym import Action, DeepGym, load_environment
+from deepgym.exceptions import SandboxError
 from tests.computer_use_trajectories import DONE, REFERENCE, variants
 from tests.test_sandboxes_live import _SPY
 
@@ -45,6 +46,19 @@ _ESCAPES = {
     ),
     'custom_actions': 'test -r /usr/lib/x86_64-linux-gnu/thunarx-3/thunar-uca.so && echo ESCAPED',
     'vnc_remote': 'timeout 10 x11vnc -display :0 -Q ping 2>&1 | grep -q ans=ping && echo ESCAPED',
+    # The managed Chromium policy is in every one of the three Chromium-family dirs, readable
+    # and root-owned, and the agent can write neither the file nor its folder.
+    'chromium_policy': (
+        'for d in /etc/chromium/policies/managed /etc/opt/chrome/policies/managed '
+        '/etc/chromium-browser/policies/managed; do [ -r "$d/deepgym.json" ] && '
+        '[ "$(stat -c %u "$d/deepgym.json")" = 0 ] && '
+        '! [ -w "$d/deepgym.json" ] && ! [ -w "$d" ] || echo ESCAPED; done'
+    ),
+    # launch_app.sh runs the pin, which is what setup's own PATH (this one) finds.
+    'browser_pin': (
+        '[ "$(readlink /usr/local/bin/deepgym-chromium)" = "$(command -v chromium)" ] '
+        '|| echo ESCAPED'
+    ),
     # The desktop runs as the agent, not as the sudoer that runs Daytona's daemon (pid 1).
     'desktop_user': (
         'u=$(ps -o user= -C xfce4-session | head -1); '
@@ -69,6 +83,50 @@ def test_a_shell_out_of_the_desktop_is_the_unprivileged_agent(dg: DeepGym) -> No
         result = session.score()
     assert not [name for name, out in escaped.items() if 'ESCAPED' in out], escaped
     assert result.score == 0.0, 'the spy must not forge the untouched desktop to a pass'
+
+
+def test_chromium_is_the_unprivileged_agent(dg: DeepGym) -> None:
+    """--no-sandbox is safe only while every Chromium process is the agent's, with
+    no-new-privs, and nothing hides the flag."""
+    env = load_environment('settings_tabs')
+    env = env.model_copy(update={'allowed_actions': env.allowed_actions | {'bash'}})
+    # The [m] keeps this probe's own command line out of pgrep's matches.
+    probe = (
+        'pids=$(pgrep -f \'/usr/lib/chromium/chromiu[m]\'); [ -n "$pids" ] || echo ESCAPED; '
+        'for p in $pids; do [ "$(stat -c %u /proc/$p)" = "$(id -u)" ] && '
+        "grep -q 'NoNewPrivs:[[:space:]]*1' /proc/$p/status || echo ESCAPED; "
+        "tr '\\0' ' ' < /proc/$p/cmdline | grep -q -e --test-type && echo ESCAPED; done"
+    )
+    with dg.session(env) as session:
+        session.start()
+        out = session.step(Action(action_type='bash', content=probe)).observation.content
+    assert 'ESCAPED' not in out, out
+
+
+# Each makes the image differ from what the lockdown expects, so the desktop must not start.
+_SABOTAGE = {
+    # Daytona's daemon would find the real session ahead of the wrapper, and run it as itself.
+    'session_as_sudoer': (
+        "dir=$(tr '\\0' '\\n' < /proc/1/environ | sed -n 's/^PATH=//p' | cut -d: -f1) && "
+        'mkdir -p "$dir" && ln -s /usr/bin/xfce4-session "$dir/xfce4-session"'
+    ),
+    'no_open_with_helper': 'mv "$(find /usr -name gio-launch-desktop)" /root/',
+    'x11vnc_skips_its_options': (
+        'mkdir /opt/real && mv /usr/bin/x11vnc /opt/real/x11vnc && '
+        'printf \'#!/bin/sh\\nexec /opt/real/x11vnc -norc "$@"\\n\' > /usr/bin/x11vnc && '
+        'chmod 755 /usr/bin/x11vnc'
+    ),
+}
+
+
+@pytest.mark.parametrize('sabotage', _SABOTAGE.values(), ids=list(_SABOTAGE))
+def test_desktop_refuses_to_start_unless_locked_down(dg: DeepGym, sabotage: str) -> None:
+    session = dg.session(load_environment('file_manager'))
+    with session:
+        broken = session._backend._sandbox.exec(sabotage, timeout=30)  # as root
+        assert broken.exit_code == 0, broken.output
+        with pytest.raises(SandboxError, match='desktop'):
+            session.start()
 
 
 # Root-side stand-in for any loopback service outside the agent's network namespace.

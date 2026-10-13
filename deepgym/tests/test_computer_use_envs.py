@@ -4,6 +4,7 @@ Runs each verifier locally against hand-built end states, so no Daytona needed.
 """
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -194,6 +195,35 @@ def test_setup_needs_no_root(name: str) -> None:
     env = load_environment(name)
     scripts = [env.setup_script, *(t for rel, t in env.files.items() if rel.endswith('.sh'))]
     assert not any('sudo' in script for script in scripts)
+
+
+# Every flag launch_app.sh may start Chromium with. --no-sandbox is the one documented
+# exception (see the script); nothing else that weakens the sandbox or hides it gets in.
+CHROMIUM_FLAGS = {
+    '--no-first-run', '--no-default-browser-check', '--disable-gpu', '--disable-features',
+    '--password-store', '--kiosk', '--no-sandbox', '--remote-debugging-port', '--user-data-dir',
+}  # fmt: skip
+
+
+def test_chromium_flags_stay_on_the_allowlist() -> None:
+    script = load_environment('settings_tabs').files['_shared/launch_app.sh']
+    command = script[script.index('nohup "$browser"') : script.index('http://')]
+    assert set(re.findall(r'--[a-z-]+', command)) == CHROMIUM_FLAGS
+
+
+def test_launch_runs_the_pinned_browser_or_falls_back_to_chromium(tmp_path: Path) -> None:
+    """launch_app.sh runs exactly the browser the desktop lockdown pinned (the link's target),
+    so the launch is that binary; with no pin it runs `chromium` from its PATH, as before."""
+    script = load_environment('settings_tabs').files['_shared/launch_app.sh']
+    assert 'nohup "$browser" ' in script and not re.search(r'nohup chromium\b', script)
+    select = script[script.index('browser=chromium') : script.index('(setsid nohup python3')]
+    link = tmp_path / 'pin'
+    for pinned in (None, '/opt/chromium/chromium'):
+        if pinned:
+            link.symlink_to(pinned)
+        code = select.replace('/usr/local/bin/deepgym-chromium', str(link)) + 'echo "$browser"'
+        out = subprocess.run(['/bin/sh', '-c', code], capture_output=True, text=True).stdout
+        assert out.strip() == (pinned or 'chromium')
 
 
 def test_computer_use_suite_is_separate() -> None:

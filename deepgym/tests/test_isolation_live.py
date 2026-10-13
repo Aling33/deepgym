@@ -4,8 +4,9 @@ import os
 
 import pytest
 
-from deepgym import DeepGym, load_environment
-from deepgym.models import Environment
+from deepgym import Action, DeepGym, load_environment
+from deepgym.models import Environment, MultiTurnEnvironment
+from deepgym.session import _IDS_ARE_EXCLUSIVE
 from tests.test_isolation import LOOPBACK_PROBE, LOOPBACK_PROBE_VERIFIER, WRONG, _env
 from tests.test_session import ALWAYS_EQUAL, FIXED, debug_fix_score
 
@@ -128,6 +129,48 @@ def test_setsid_daemon_dies_with_its_script(dg: DeepGym) -> None:
 def test_session_verifier_loads_agent_code_as_another_user(dg: DeepGym) -> None:
     for buggy, expected in ((FIXED, 1.0), (ALWAYS_EQUAL, 0.0)):
         assert debug_fix_score(dg, buggy) == expected
+
+
+_SOLVER_PROBE_VERIFIER = """
+import json, subprocess
+from deepgym_solution import load_solution
+
+solution = load_solution('probe.py')
+nnp = 'NoNewPrivs:\\t1' in solution.status()
+# No supplementary groups: sudo must not restore an image group membership for the solver.
+nogroups = solution.groups() == []
+# The verifier's sudo must start nothing as the solver directly (the rule runs as root).
+pinned = subprocess.run(['sudo', '-n', '-u', 'dgsolver', '--', 'id'], capture_output=True)
+pinned = pinned.returncode != 0
+ok = nnp and nogroups and pinned
+print(json.dumps({'score': float(ok), 'passed': ok,
+                  'details': f'nnp={nnp} nogroups={nogroups} pinned={pinned}'}))
+"""
+
+
+def test_session_solution_cannot_gain_privileges(dg: DeepGym) -> None:
+    """Agent code a session verifier loads runs as the solver with no-new-privs and no
+    groups, so no setuid binary and no image group lifts it past the agent's rights."""
+    env = MultiTurnEnvironment(task='t', final_verifier_code=_SOLVER_PROBE_VERIFIER, max_steps=2)
+    probe = 'import os\ndef status():\n    return open("/proc/self/status").read()\n'
+    probe += 'def groups():\n    return os.getgroups()\n'
+    actions = iter([
+        Action(action_type='write_file', path='probe.py', content=probe),
+        Action(action_type='done'),
+    ])  # fmt: skip
+    _, result = dg.run_episode(env, lambda obs: next(actions))
+    assert result.passed, result.output
+
+
+def test_session_users_hold_ids_no_other_account_has(dg: DeepGym) -> None:
+    """The setup check passes for the fresh session users, and fails once any other
+    account shares the agent's uid."""
+    with dg.session(MultiTurnEnvironment(task='t')) as session:
+        backend = session._backend
+        assert backend.exec_trusted(_IDS_ARE_EXCLUSIVE, 30).exit_code == 0
+        shared = 'useradd -o -M -u "$(id -u dgagent)" dgshared'
+        assert backend.exec_trusted(shared, 30).exit_code == 0
+        assert backend.exec_trusted(_IDS_ARE_EXCLUSIVE, 30).exit_code != 0
 
 
 def test_judge_temp_files_are_private(dg: DeepGym) -> None:
