@@ -10,6 +10,7 @@ import {
 } from '@/components/base/segmented-control/segmented-control';
 import { Select, SelectItem } from '@/components/base/select/select';
 import { Textarea } from '@/components/base/textarea/textarea';
+import { ActionError } from '@/components/ui/action-error';
 import { Modal } from '@/components/ui/overlay';
 import { api, errorText, useApi } from '@/lib/api';
 import { formatDuration } from '@/lib/format';
@@ -21,7 +22,9 @@ interface NewRunDialogProps {
   open: boolean;
   /** Environment to preselect, e.g. from an environment's "New run" button. */
   initialEnv: string | null;
+  /** Cancel: close without starting anything. */
   onClose: () => void;
+  /** The started runs. The parent navigates to them, which also closes the dialog. */
   onCreated: (runs: RunSummary[]) => void;
 }
 
@@ -47,11 +50,10 @@ function NewRunForm({ initialEnv, onClose, onCreated }: Omit<NewRunDialogProps, 
     setError(undefined);
     try {
       const body = { environments: [...selected], mode, solution: source === 'custom' ? solution : null };
+      // Stays submitting: onCreated's navigation closes the dialog, so it can't start the runs twice.
       onCreated(await api<RunSummary[]>('/runs', { method: 'POST', body: JSON.stringify(body) }));
-      onClose();
     } catch (caught) {
       setError(errorText(caught));
-    } finally {
       setSubmitting(false);
     }
   };
@@ -110,14 +112,7 @@ function NewRunForm({ initialEnv, onClose, onCreated }: Omit<NewRunDialogProps, 
           {mode === 'auto' && ' Auto runs locally unless DAYTONA_API_KEY is set.'}
         </p>
       )}
-      {error && (
-        <p
-          role="alert"
-          className="rounded-2lg bg-background-tertiary-error px-3 py-2 text-body-2-medium text-text-error-primary"
-        >
-          {error}
-        </p>
-      )}
+      {error && <ActionError>{error}</ActionError>}
       <div className="flex flex-wrap items-center justify-end gap-2 border-t border-separator-border pt-4">
         <p className="me-auto min-w-0 flex-1 basis-60 text-caption-1-medium text-text-tertiary">
           {KEEPS_GOING}
