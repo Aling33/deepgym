@@ -17,7 +17,7 @@ from types import ModuleType
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
-from deepgym.exceptions import SandboxError
+from deepgym.exceptions import SandboxDiedError, SandboxError
 from deepgym.models import Environment, MultiTurnEnvironment
 from deepgym.sandboxes.protocol import (
     TRUSTED_PATH,
@@ -241,6 +241,7 @@ class DaytonaSandbox:
 
         Raises:
             SandboxTimeoutError: If the command outruns *timeout* seconds.
+            SandboxDiedError: If the sandbox stopped during the command.
         """
         try:
             response = self._sandbox.process.exec(
@@ -252,8 +253,29 @@ class DaytonaSandbox:
         except Exception as exc:
             if is_timeout(exc):
                 raise SandboxTimeoutError(f'command exceeded {timeout}s') from exc
+            self._raise_if_stopped(exc)
             raise
         return ExecResult(response.exit_code, response.result)
+
+    def _raise_if_stopped(self, exc: Exception) -> None:
+        """Raise what a call that failed with *exc* means if the sandbox stopped: Daytona's
+        own error when its record says it evicted the sandbox or timed it out in its queue (a
+        provider failure, whatever the call raised), else :class:`SandboxDiedError`. Return
+        if it still runs or Daytona can't say."""
+        try:
+            self._sandbox.refresh_data()
+        except Exception:
+            return
+        from daytona import DaytonaQueueTimeoutError, DaytonaSpotEvictedError
+
+        if self._sandbox.spot_evicted_at:
+            raise DaytonaSpotEvictedError(f'Daytona evicted sandbox {self.id}: {exc}') from exc
+        if self._sandbox.queue_timed_out_at:
+            message = f'Daytona timed out sandbox {self.id} in its queue: {exc}'
+            raise DaytonaQueueTimeoutError(message) from exc
+        provider_did_it = isinstance(exc, DaytonaSpotEvictedError | DaytonaQueueTimeoutError)
+        if self._sandbox.state != 'started' and not provider_did_it:
+            raise SandboxDiedError(f'Daytona sandbox {self.id} stopped: {exc}') from exc
 
     def upload(self, content: bytes, path: str) -> None:
         """Write *content* to *path* as root, creating parent directories.

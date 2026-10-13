@@ -31,6 +31,7 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -49,12 +50,39 @@ SANDBOX_ROOT = '/opt/deepgym'
 """Where judge, runtime and solution files go in a sandbox (see :data:`SANDBOX_SETUP`)."""
 SOLVER_USER = 'dgsolver'
 
+
+def ids_are_exclusive(*users: str) -> str:
+    """Return a shell check that each of *users* that exists holds ids no other account has.
+
+    A user's uid and gid must be nonzero, that account's alone, and its only group, so
+    dropping to them grants that account's rights and nobody else's. Ruling out root isn't
+    enough: a uid or primary gid shared with any other account, or a supplementary group
+    the image put the user in (a stray ``shadow:x:42:dgsolver`` line), would carry that
+    account's or group's rights too. The passwd gid check catches an account whose primary
+    gid has no group entry. The check prints the first user that fails and exits 1.
+    """
+    return (
+        f'for u in {shlex.join(users)}; do '
+        'id "$u" >/dev/null 2>&1 || continue; '
+        'uid=$(id -u "$u"); gid=$(id -g "$u"); '
+        '[ "$uid" != 0 ] && [ "$gid" != 0 ] && '
+        '[ "$(getent passwd | cut -d: -f3 | grep -Fcx "$uid")" = 1 ] && '
+        '[ "$(getent passwd | cut -d: -f4 | grep -Fcx "$gid")" = 1 ] && '
+        '[ "$(getent group | cut -d: -f3 | grep -Fcx "$gid")" = 1 ] && '
+        '[ "$(id -Gn "$u")" = "$u" ] '
+        '|| { echo "$u is root or shares an id or a group with another account"; exit 1; }; '
+        'done'
+    )
+
+
 # Run once per sandbox (Daytona or Apple container), as its default user (root or a sudoer).
+# A solver account the image already has is used only if its ids are its own.
 SANDBOX_SETUP = f"""
 set -e
 if [ "$(id -u)" = 0 ]; then SUDO=; else SUDO="sudo -n"; fi
 id {SOLVER_USER} >/dev/null 2>&1 || \\
   $SUDO useradd --system --no-create-home --shell /usr/sbin/nologin {SOLVER_USER}
+{ids_are_exclusive(SOLVER_USER)}
 $SUDO mkdir -p {SANDBOX_ROOT}/judge {SANDBOX_ROOT}/runtime {SANDBOX_ROOT}/solution \\
   {SANDBOX_ROOT}/tmp
 $SUDO chown -R "$(id -u):$(id -g)" {SANDBOX_ROOT}
@@ -86,6 +114,10 @@ class JudgeJob(BaseModel):
     timeout: int = Field(default=30, ge=1)
     case_timeout: int = Field(default=10, ge=1)
     env_vars: dict[str, str] | None = None
+    consulted_mark: str = Field(default_factory=lambda: uuid4().hex)
+    """A token the judge prints on stdout once the solution's output is in play (it read
+    the solution or started it), so a run that then times out or loses its sandbox is
+    the solution's doing. Random per run, so the solution can't print it first."""
 
     @classmethod
     def for_environment(cls, env: Environment, model_output: str) -> JudgeJob:
@@ -107,14 +139,19 @@ class JudgeJob(BaseModel):
             files['test_cases.json'] = json.dumps(self.test_cases, ensure_ascii=False)
         return files
 
-    def runtime_env(self, isolation: dict, runtime_path: str, python: str) -> dict[str, str]:
-        """Variables telling deepgym_solution how to launch and bound the solution."""
+    def runtime_env(
+        self, isolation: dict, runtime_path: str, python: str, solution_dir: str
+    ) -> dict[str, str]:
+        """Variables telling deepgym_solution how to launch and bound the solution, and the
+        verifier's crash guard where the solution is and how to announce consulting it."""
         return {
             **(self.env_vars or {}),
             'DEEPGYM_ISOLATION': json.dumps(isolation),
             'DEEPGYM_RUNTIME': runtime_path,
             'DEEPGYM_PYTHON': python,
             'DEEPGYM_CASE_TIMEOUT': str(self.case_timeout),
+            'DEEPGYM_POLICY_DIR': solution_dir,
+            'DEEPGYM_CONSULTED': self.consulted_mark,
         }
 
     def verifier_args(self, judge_dir: str, solution_path: str) -> list[str]:
@@ -237,7 +274,7 @@ def local_judge(
                 raise SandboxError('confining the judge needs sandbox-exec or bwrap')
             env = {
                 'PATH': os.environ.get('PATH', os.defpath),
-                **job.runtime_env(outer, runtime_path, sys.executable),
+                **job.runtime_env(outer, runtime_path, sys.executable, solution_dir),
                 **deadline,
             }
             confine = [sys.executable, '-I', '-B', runtime_path, '--confine', tmp_dir]
@@ -245,7 +282,8 @@ def local_judge(
             return
         isolation = local_isolation([runtime_dir, solution_dir])
         # Verifier temp files (and solution scratch dirs) stay inside this run.
-        env = {**os.environ, **job.runtime_env(isolation, runtime_path, sys.executable), **deadline}
+        runtime_env = job.runtime_env(isolation, runtime_path, sys.executable, solution_dir)
+        env = {**os.environ, **runtime_env, **deadline}
         yield judge, env, judge_dir
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
@@ -278,9 +316,14 @@ def sandbox_isolation(setup_output: str, *, require_offline: bool = False) -> tu
     no host). ``own_network`` in the spec says it got one.
 
     Raises:
-        SandboxError: If *require_offline* is set but the sandbox can't make that namespace.
+        SandboxError: If the solver's uid or gid is root or unreadable, or if
+            *require_offline* is set but the sandbox can't make that namespace.
     """
     judge_uid, uid, gid, python, netns = setup_output.split()[-5:]
+    # SANDBOX_SETUP proved the ids exclusive; this guards the parse before it reaches setpriv.
+    # Only sandbox_judge_by_name passes the solver's name instead.
+    if not all(v == SOLVER_USER or (v.isdecimal() and int(v) > 0) for v in (uid, gid)):
+        raise SandboxError(f'Refusing to run the solution as root or an unknown id: {uid}:{gid}')
     if require_offline and netns != '1':
         raise SandboxError(
             'Cannot cut the solution off the network here; the image needs util-linux '
@@ -326,7 +369,8 @@ def sandbox_judge(
         f'umask 077 && cd {judge_dir} && DEEPGYM_DEADLINE=$(( $(date +%s) + {job.timeout} )) '
         f'exec {shlex.quote(python)} {shlex.join(args)}'
     )
-    env = job.runtime_env(isolation, f'{SANDBOX_ROOT}/runtime/{RUNTIME_FILE}', python)
+    runtime_path = f'{SANDBOX_ROOT}/runtime/{RUNTIME_FILE}'
+    env = job.runtime_env(isolation, runtime_path, python, f'{SANDBOX_ROOT}/solution')
     # Private temp dir + umask 077: the judge's own temp files stay unreadable to the
     # solution; run_solution shares only the directories it hands over.
     env['TMPDIR'] = f'{SANDBOX_ROOT}/tmp'

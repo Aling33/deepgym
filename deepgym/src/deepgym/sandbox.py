@@ -10,10 +10,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
 import json
 import logging
+import os
 import re
 import shlex
+import signal
 import subprocess
 from uuid import uuid4
 
@@ -33,7 +36,7 @@ from deepgym.judge import (
     sandbox_uploads,
 )
 from deepgym.models import RunResult, VerifierResult, checked_score
-from deepgym.sandboxes import TRUSTED_PATH, Sandbox, SandboxTimeoutError
+from deepgym.sandboxes import TRUSTED_PATH, Sandbox, SandboxDiedError, SandboxTimeoutError
 
 logger = logging.getLogger(__name__)
 
@@ -218,12 +221,46 @@ def parse_wrapped_output(output: str, marker: str, exit_code: int) -> ExecutionR
     )
 
 
+def _judged_zero(details: str, error_type: str) -> ExecutionResult:
+    """Return a judged 0 with the model fault *error_type* (see ``MODEL_FAULT_ERRORS``)."""
+    verdict = VerifierResult(score=0.0, passed=False, details=details, error_type=error_type)
+    return ExecutionResult(verdict, exit_code=1)
+
+
+def policy_sandbox_failure(exc: BaseException) -> ExecutionResult:
+    """Return the judged 0 of a run whose sandbox died after the solution started.
+
+    The solution is the only untrusted code in the sandbox, so it killed or exhausted the
+    sandbox: a model fault (``policy_sandbox_failure``), or breaking the sandbox would
+    dodge the score. A sandbox that dies before then (creation, setup, uploads, the
+    verifier loading its own fixtures) is a :class:`~deepgym.exceptions.SandboxError`,
+    with no verdict.
+    """
+    return _judged_zero(f'The sandbox died while the solution ran: {exc}', 'policy_sandbox_failure')
+
+
+def solution_timeout(timeout: int) -> ExecutionResult:
+    """Return the judged 0 of a run that outran its time limit after the solution started:
+    the verifier was busy with what the solution gave it (a regex it made backtrack, say)."""
+    return _judged_zero(f'The run exceeded {timeout}s after the solution ran', 'solution_timeout')
+
+
+def _printed(output: bytes | str | None) -> str:
+    """What a stopped command printed, as text."""
+    if isinstance(output, bytes):
+        return output.decode('utf-8', 'replace')
+    return output or ''
+
+
 def run_judge_in_sandbox(sandbox: Sandbox, job: JudgeJob) -> ExecutionResult:
     """Run *job*'s verifier in *sandbox*.
 
     The solution runs as a separate, unprivileged user with no capabilities and no
     network: the provider blocks it, or the solution gets its own offline network
-    namespace.
+    namespace. A sandbox that dies, or a run that times out, after the judge announced
+    the solution's start (``job.consulted_mark`` in what it printed) is the solution's
+    doing (see :func:`policy_sandbox_failure` and :func:`solution_timeout`). Before that,
+    or where the provider returns nothing the judge printed, it has no verdict.
 
     Raises:
         SandboxError: If setting up users or uploading files fails, if the solution
@@ -247,7 +284,13 @@ def run_judge_in_sandbox(sandbox: Sandbox, job: JudgeJob) -> ExecutionResult:
     try:
         response = sandbox.exec(command, env=env, timeout=job.timeout + DEADLINE_GRACE_S)
     except SandboxTimeoutError as exc:
+        if job.consulted_mark in exc.output:
+            return solution_timeout(job.timeout)
         raise TimeoutError(f'Verifier exceeded {job.timeout}s') from exc
+    except SandboxDiedError as exc:
+        if job.consulted_mark in exc.output:
+            return policy_sandbox_failure(exc)
+        raise
     except SandboxError:
         raise
     except Exception as exc:
@@ -319,26 +362,41 @@ class LocalExecutor:
     def run(self, job: JudgeJob) -> ExecutionResult:
         """Run *job*'s verifier as a local subprocess.
 
+        If the run times out or is interrupted, the verifier and its process group are
+        killed, and the verifier reaped, as :class:`AsyncLocalExecutor` does. A timeout
+        after the judge announced the solution's start is a judged 0 (see
+        :func:`solution_timeout`).
+
         Raises:
-            TimeoutError: If the verifier outruns its time budget.
+            TimeoutError: If the verifier outruns its time budget before the solution starts.
             VerifierError: If the verifier prints no protocol JSON.
         """
         _validate_env_vars(job.env_vars)
         with local_judge(job, confined=self.confined) as (argv, env, cwd):
+            proc = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=cwd,
+                env=env,
+                start_new_session=True,
+            )
             try:
-                proc = subprocess.run(
-                    argv,
-                    capture_output=True,
-                    text=True,
-                    timeout=job.timeout + DEADLINE_GRACE_S,
-                    cwd=cwd,
-                    env=env,
-                )
-            except subprocess.TimeoutExpired as exc:
+                stdout, stderr = proc.communicate(timeout=job.timeout + DEADLINE_GRACE_S)
+            except BaseException as exc:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=DEADLINE_GRACE_S)
+                if not isinstance(exc, subprocess.TimeoutExpired):
+                    raise
+                if job.consulted_mark in _printed(exc.stdout):
+                    return solution_timeout(job.timeout)
                 raise TimeoutError(f'Local verifier exceeded {job.timeout}s') from exc
-        stderr = proc.stderr.strip()
+        stderr = stderr.strip()
         return ExecutionResult(
-            parse_verifier_output(proc.stdout.strip(), f'stderr: {stderr!r}'),
+            parse_verifier_output(stdout.strip(), f'stderr: {stderr!r}'),
             stderr=stderr,
             exit_code=proc.returncode,
         )
@@ -350,8 +408,12 @@ class AsyncLocalExecutor:
     async def run(self, job: JudgeJob) -> ExecutionResult:
         """Run *job*'s verifier as a local subprocess without blocking the event loop.
 
+        If the run times out or is cancelled, the verifier and its process group are killed
+        first, and the verifier reaped. A timeout after the judge announced the solution's
+        start is a judged 0 (see :func:`solution_timeout`).
+
         Raises:
-            TimeoutError: If the verifier outruns its time budget.
+            TimeoutError: If the verifier outruns its time budget before the solution starts.
             VerifierError: If the verifier prints no protocol JSON.
         """
         _validate_env_vars(job.env_vars)
@@ -362,14 +424,32 @@ class AsyncLocalExecutor:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
                 env=env,
+                start_new_session=True,
             )
+            # Read as it comes, so what the judge printed is at hand if it times out.
+            stdout, stderr = bytearray(), bytearray()
+
+            async def read(stream: asyncio.StreamReader, into: bytearray) -> None:
+                while chunk := await stream.read(65536):
+                    into += chunk
+
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=job.timeout + DEADLINE_GRACE_S
+                reads = read(proc.stdout, stdout), read(proc.stderr, stderr)
+                await asyncio.wait_for(
+                    asyncio.gather(*reads, proc.wait()), timeout=job.timeout + DEADLINE_GRACE_S
                 )
-            except asyncio.TimeoutError as exc:
-                proc.kill()
-                await proc.wait()
+            except BaseException as exc:
+                # The whole group: a child still holding the verifier's output pipes would
+                # keep the reads pending. One that left the group can still hold them, so
+                # the wait is bounded; the verifier itself is reaped as soon as it dies.
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(proc.wait(), DEADLINE_GRACE_S)
+                if not isinstance(exc, asyncio.TimeoutError):
+                    raise
+                if job.consulted_mark in _printed(bytes(stdout)):
+                    return solution_timeout(job.timeout)
                 raise TimeoutError(f'Async local verifier exceeded {job.timeout}s') from exc
         stderr_text = stderr.decode('utf-8', errors='replace').strip()
         return ExecutionResult(

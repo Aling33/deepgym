@@ -60,6 +60,20 @@ class SandboxError(DeepGymError):
     """Raise when sandbox creation or execution fails."""
 
 
+class SandboxDiedError(SandboxError):
+    """Raise when the sandbox itself stopped during a command (terminated, killed, out of
+    memory), as opposed to the provider failing to answer. Code running in it may be why.
+
+    Args:
+        message: What happened.
+        output: What the command printed first, where the provider returns it, else ''.
+    """
+
+    def __init__(self, message: str, output: str = '') -> None:
+        super().__init__(message)
+        self.output = output
+
+
 class TimeoutError(DeepGymError):
     """Raise when execution exceeds the configured timeout."""
 
@@ -104,7 +118,8 @@ def is_infrastructure_failure(exc: BaseException) -> bool:
     Anything else is the policy's doing and is scored: a command or verifier that ran out
     of time, a sandbox the provider reports gone or stopped after the policy acted, a
     failed write, garbage output. DeepGym's ``TimeoutError`` and a provider confirming the
-    sandbox stopped end the walk, whatever their causes.
+    sandbox stopped (:class:`SandboxDiedError`, or the provider's own exception) end the
+    walk, whatever their causes.
 
     ponytail: a provider 5xx caused by a policy that exhausted its sandbox still reads as
     infrastructure; the masked-rate warning in :mod:`deepgym.integrations.reward` shows it.
@@ -112,7 +127,7 @@ def is_infrastructure_failure(exc: BaseException) -> bool:
     gone = _loaded(_SANDBOX_GONE_ERRORS)
     transport = _loaded(_TRANSPORT_ERRORS)
     while exc is not None:
-        if isinstance(exc, (TimeoutError, *gone)):
+        if isinstance(exc, (TimeoutError, SandboxDiedError, *gone)):
             return False
         if isinstance(exc, (ConnectionError, builtins.TimeoutError, *transport)):
             return True

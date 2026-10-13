@@ -50,7 +50,16 @@ class SandboxImage(NamedTuple):
 
 
 class SandboxTimeoutError(TimeoutError):
-    """Raised when a sandbox command outruns its timeout."""
+    """Raised when a sandbox command outruns its timeout.
+
+    Args:
+        message: What happened.
+        output: What the command printed first, where the provider returns it, else ''.
+    """
+
+    def __init__(self, message: str, output: str = '') -> None:
+        super().__init__(message)
+        self.output = output
 
 
 class Sandbox(Protocol):
@@ -78,6 +87,7 @@ class Sandbox(Protocol):
 
         Raises:
             SandboxTimeoutError: If the command outruns *timeout* seconds.
+            SandboxDiedError: If the sandbox itself stopped during the command.
         """
         ...
 

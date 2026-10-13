@@ -418,6 +418,8 @@ class AsyncDeepGym:
         except Exception as exc:
             if is_timeout(exc):
                 raise TimeoutError(f'Verifier exceeded {job.timeout}s') from exc
+            # Daytona returns nothing the verifier printed, so even a sandbox that died
+            # can't be shown to have died after the solution started: no verdict.
             raise SandboxError(f'Verifier execution failed: {exc}') from exc
         return parse_wrapped_output(response.result, marker, response.exit_code)
 

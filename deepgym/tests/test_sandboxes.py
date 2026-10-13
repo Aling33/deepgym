@@ -21,11 +21,27 @@ from pathlib import Path
 import pytest
 
 from deepgym import ComputerUseEnvironment, DeepGym
-from deepgym.exceptions import DeepGymError, SandboxError, VerifierError
+from deepgym.exceptions import (
+    DeepGymError,
+    SandboxError,
+    VerifierError,
+    is_infrastructure_failure,
+)
 from deepgym.judge import JudgeJob
 from deepgym.models import Action, Environment, MultiTurnEnvironment
-from deepgym.sandbox import build_run_result, run_judge_in_sandbox, split_wrapped_output
-from deepgym.sandboxes import ExecResult, SandboxImage, SandboxTimeoutError, open_sandbox
+from deepgym.sandbox import (
+    build_run_result,
+    error_result,
+    run_judge_in_sandbox,
+    split_wrapped_output,
+)
+from deepgym.sandboxes import (
+    ExecResult,
+    SandboxDiedError,
+    SandboxImage,
+    SandboxTimeoutError,
+    open_sandbox,
+)
 from deepgym.sandboxes.apple import AppleContainer
 from deepgym.sandboxes.cli import DEFAULT_IMAGE
 from deepgym.sandboxes.daytona import cleanup_sandbox, snapshot_digest
@@ -349,6 +365,9 @@ def test_e2b_runs_as_root_offline_and_maps_errors(monkeypatch: pytest.MonkeyPatc
     class GoneError(SlowError):
         pass
 
+    class UnreachableError(SlowError):
+        pass
+
     seen: dict = {}
 
     class Commands:
@@ -360,6 +379,8 @@ def test_e2b_runs_as_root_offline_and_maps_errors(monkeypatch: pytest.MonkeyPatc
                 raise SlowError()
             if cmd.endswith('gone'):
                 raise GoneError()
+            if cmd.endswith('unreachable'):
+                raise UnreachableError()
             return types.SimpleNamespace(exit_code=0, stdout='ok', stderr='')
 
     class Client:
@@ -382,7 +403,7 @@ def test_e2b_runs_as_root_offline_and_maps_errors(monkeypatch: pytest.MonkeyPatc
         'CommandExitException': ExitError,
         'TimeoutException': SlowError,
         'SandboxNotRunningException': GoneError,
-        'SandboxUnreachableException': GoneError,
+        'SandboxUnreachableException': UnreachableError,
     })  # fmt: skip
     monkeypatch.delitem(sys.modules, 'deepgym.sandboxes.e2b.sandbox', raising=False)
     module = importlib.import_module('deepgym.sandboxes.e2b.sandbox')
@@ -396,8 +417,11 @@ def test_e2b_runs_as_root_offline_and_maps_errors(monkeypatch: pytest.MonkeyPatc
     # The sandbox kills the command at its deadline; the SDK only waits a little longer.
     assert seen['cmd'] == '/usr/bin/timeout --kill-after=2 1 /bin/sh -c slow'
     assert seen['timeout'] > 1
-    with pytest.raises(SandboxError, match='not reachable'):
+    with pytest.raises(SandboxDiedError, match='stopped running'):
         box.exec('gone', timeout=1)
+    with pytest.raises(SandboxError, match='not reachable') as unreachable:
+        box.exec('unreachable', timeout=1)
+    assert not isinstance(unreachable.value, SandboxDiedError)
     named = module.E2BSandbox('my-template')
     assert seen['create']['template'] == 'my-template'
     assert [box.booted_image().name, named.booted_image().name] == ['base', 'my-template']
@@ -815,6 +839,308 @@ def test_async_daytona_judge_provider_failure_is_a_sandbox_error() -> None:
     client = AsyncDeepGym(mode='local')
     with pytest.raises(SandboxError, match='unreachable'):
         asyncio.run(client._run_judge(_async_daytona_box(Process()), _JOB))
+
+
+# ---------------------------------------------------------------------------
+# A sandbox that dies: the solution's doing only once it started, else no verdict
+# ---------------------------------------------------------------------------
+
+# Where a sandbox dies (judge setup, or the verifier run), whether the judge had announced
+# the solution's start by then (its consulted mark in what the provider returned), and what
+# that must give. Before the start, say while the verifier loads its own fixtures, a death
+# isn't the solution's.
+_DEATHS = pytest.mark.parametrize(
+    ('phase', 'announced', 'expected'),
+    [
+        ('useradd', False, 'no_verdict'),
+        ('DEEPGYM_DEADLINE', False, 'no_verdict'),
+        ('DEEPGYM_DEADLINE', True, 'policy_sandbox_failure'),
+    ],
+    ids=['during_setup', 'before_the_solution_starts', 'after_the_solution_starts'],
+)
+# A provider that returns nothing the judge printed when the sandbox dies (Daytona, E2B, a
+# Modal call that raises) can't date the death against the solution's start: no verdict.
+_UNDATED_DEATHS = pytest.mark.parametrize(
+    'phase', ['useradd', 'DEEPGYM_DEADLINE'], ids=['during_setup', 'during_the_verifier_run']
+)
+_SETUP_OUTPUT = '0 999 987 /usr/bin/python3 1'
+
+
+def _printed(announced: bool) -> str:
+    """What a verifier printed before its sandbox died: its fixtures, then maybe the mark."""
+    return 'loading fixtures\n' + (f'{_JOB.consulted_mark}\n' if announced else '')
+
+
+def _judged(run: object) -> str:
+    """Run *run* (the judge) as core.run does and name its outcome."""
+    try:
+        executed = run()
+    except DeepGymError as exc:
+        result = error_result(exc)
+    else:
+        verdict = executed.verifier_result
+        result = build_run_result(verdict, 1.0, 'box', exit_code=executed.exit_code)
+    if not result.has_verdict:
+        return 'no_verdict'
+    return result.error_type if result.score == 0.0 else str(result)
+
+
+@pytest.mark.parametrize('failure', ['timeout', 'death'])
+@pytest.mark.parametrize('announced', [False, True], ids=['before_the_start', 'after_the_start'])
+def test_a_verifier_run_cut_short_is_the_solutions_only_after_it_started(
+    failure: str, announced: bool
+) -> None:
+    box = FakeSandbox(network_blocked=True, answers=[_JUDGE_SETUP])
+    answer = box.exec
+
+    def exec_(command: str, **kwargs: object) -> ExecResult:
+        if 'DEEPGYM_DEADLINE' in command:
+            error = SandboxTimeoutError if failure == 'timeout' else SandboxDiedError
+            raise error('cut short', _printed(announced))
+        return answer(command, **kwargs)
+
+    box.exec = exec_  # type: ignore[method-assign]
+    fault = 'solution_timeout' if failure == 'timeout' else 'policy_sandbox_failure'
+    expected = fault if announced else 'no_verdict'
+
+    assert _judged(lambda: run_judge_in_sandbox(box, _JOB)) == expected
+
+
+def test_a_cli_timeout_keeps_what_the_command_printed(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        if argv[1] == 'exec':
+            raise subprocess.TimeoutExpired(argv, 16, output=b'printed', stderr=b' first')
+        return subprocess.CompletedProcess(argv, 0, b'', b'')
+
+    monkeypatch.setattr(subprocess, 'run', fake_run)
+
+    with pytest.raises(SandboxTimeoutError) as raised:
+        DockerContainer().exec('sleep 9', timeout=1)
+    assert raised.value.output == 'printed first'
+
+
+@pytest.mark.parametrize('cls', [DockerContainer, AppleContainer])
+@_DEATHS
+def test_cli_container_that_dies(
+    monkeypatch: pytest.MonkeyPatch, cls: type, phase: str, announced: bool, expected: str
+) -> None:
+    died: list[bool] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        command = ' '.join(argv)
+        if argv[1] == 'exec' and phase in command:
+            died.append(True)
+            return subprocess.CompletedProcess(argv, 137, _printed(announced).encode(), b'')
+        if argv[1] == 'exec' and 'false' in command:  # fails, but the container still runs
+            return subprocess.CompletedProcess(argv, 1, b'', b'')
+        output = _SETUP_OUTPUT.encode() if 'useradd' in command else b''
+        return subprocess.CompletedProcess(argv, 0, output, b'')
+
+    monkeypatch.setattr(subprocess, 'run', fake_run)
+    box = cls()
+    # The listing holds running containers only.
+    monkeypatch.setattr(box, 'running', lambda: [] if died else [types.SimpleNamespace(id=box.id)])
+
+    assert box.exec('false') == ExecResult(1, '')
+    assert _judged(lambda: run_judge_in_sandbox(box, _JOB)) == expected
+
+
+def _dying_modal_box(
+    monkeypatch: pytest.MonkeyPatch, phase: str, report: str, printed: str
+) -> object:
+    """A Modal sandbox that stops when a command containing *phase* runs, which Modal
+    reports as *report*: an exit with what the command printed, or an error."""
+
+    class Error(Exception):
+        pass
+
+    class TerminatedError(Error):
+        pass
+
+    class NotFoundError(Error):
+        pass
+
+    died: list[bool] = []
+
+    def process(output: str, exit_code: int = 0) -> types.SimpleNamespace:
+        return types.SimpleNamespace(
+            stdout=types.SimpleNamespace(read=lambda: output),
+            stderr=types.SimpleNamespace(read=lambda: ''),
+            wait=lambda: exit_code,
+        )
+
+    class Sandbox:
+        object_id = 'sb-dies'
+        filesystem = types.SimpleNamespace(write_bytes=lambda data, path: None)
+
+        @staticmethod
+        def create(*args: str, **kwargs: object) -> 'Sandbox':
+            return Sandbox()
+
+        def exec(self, *args: str, **kwargs: object) -> types.SimpleNamespace:
+            if 'false' in args[-1]:  # fails, but the sandbox still runs
+                return process('', 1)
+            if phase in args[-1]:
+                died.append(True)
+                if report == 'terminated':
+                    raise TerminatedError('Sandbox terminated (out of memory)')
+                if report == 'not_found':
+                    raise NotFoundError('Sandbox not found')
+                return process(printed, 137)
+            return process(_SETUP_OUTPUT if 'useradd' in args[-1] else '')
+
+        def poll(self) -> int | None:
+            return 137 if died else None
+
+    exceptions = types.SimpleNamespace(
+        Error=Error, SandboxTerminatedError=TerminatedError, NotFoundError=NotFoundError
+    )
+    _install(monkeypatch, 'modal', {
+        'App': types.SimpleNamespace(lookup=lambda name, create_if_missing: name),
+        'Image': types.SimpleNamespace(debian_slim=lambda python_version: 'image'),
+        'Sandbox': Sandbox,
+        'exception': exceptions,
+    })  # fmt: skip
+    monkeypatch.delitem(sys.modules, 'deepgym.sandboxes.modal.sandbox', raising=False)
+    box = importlib.import_module('deepgym.sandboxes.modal.sandbox').ModalSandbox()
+    assert box.exec('false') == ExecResult(1, '')
+    return box
+
+
+@_DEATHS
+def test_modal_sandbox_that_dies(
+    monkeypatch: pytest.MonkeyPatch, phase: str, announced: bool, expected: str
+) -> None:
+    box = _dying_modal_box(monkeypatch, phase, 'failed_exit', _printed(announced))
+
+    assert _judged(lambda: run_judge_in_sandbox(box, _JOB)) == expected
+
+
+@pytest.mark.parametrize('report', ['terminated', 'not_found'])
+@_UNDATED_DEATHS
+def test_modal_sandbox_that_dies_mid_call(
+    monkeypatch: pytest.MonkeyPatch, phase: str, report: str
+) -> None:
+    box = _dying_modal_box(monkeypatch, phase, report, _printed(True))
+
+    assert _judged(lambda: run_judge_in_sandbox(box, _JOB)) == 'no_verdict'
+
+
+@_UNDATED_DEATHS
+def test_e2b_sandbox_that_dies(monkeypatch: pytest.MonkeyPatch, phase: str) -> None:
+    class SlowError(Exception):
+        pass
+
+    class NotRunningError(SlowError):
+        pass
+
+    class Commands:
+        def run(self, cmd: str, **kwargs: object) -> object:
+            if phase in cmd:
+                raise NotRunningError('sandbox is not running')
+            stdout = _SETUP_OUTPUT if 'useradd' in cmd else ''
+            return types.SimpleNamespace(exit_code=0, stdout=stdout, stderr='')
+
+    class Client:
+        sandbox_id = 'e2b-dies'
+        commands = Commands()
+        files = types.SimpleNamespace(write=lambda path, content, user: None)
+
+        @staticmethod
+        def create(**kwargs: object) -> 'Client':
+            return Client()
+
+    _install(monkeypatch, 'e2b', {
+        'Sandbox': Client,
+        'CommandExitException': type('ExitError', (Exception,), {}),
+        'TimeoutException': SlowError,
+        'SandboxNotRunningException': NotRunningError,
+        'SandboxUnreachableException': type('UnreachableError', (SlowError,), {}),
+    })  # fmt: skip
+    monkeypatch.delitem(sys.modules, 'deepgym.sandboxes.e2b.sandbox', raising=False)
+    box = importlib.import_module('deepgym.sandboxes.e2b.sandbox').E2BSandbox()
+
+    assert _judged(lambda: run_judge_in_sandbox(box, _JOB)) == 'no_verdict'
+
+
+def _dying_daytona_box(
+    phase: str, error: Exception, evicted_at: str | None = None
+) -> types.SimpleNamespace:
+    """A stand-in Daytona sandbox that stops when a command containing *phase* runs, marked
+    evicted at *evicted_at* if given."""
+    box = types.SimpleNamespace(
+        id='daytona-dies', state='started', spot_evicted_at=None, queue_timed_out_at=None
+    )
+
+    def exec_(command: str, **kwargs: object) -> types.SimpleNamespace:
+        if phase in command:
+            box.state, box.spot_evicted_at = 'stopped', evicted_at
+            raise error
+        output = _SETUP_OUTPUT if 'useradd' in command else 'root' if 'id -u' in command else ''
+        return types.SimpleNamespace(exit_code=0, result=output)
+
+    box.process = types.SimpleNamespace(exec=exec_)
+    box.fs = types.SimpleNamespace(upload_file=lambda data, path: None)
+    box.refresh_data = lambda: None
+    return box
+
+
+@_UNDATED_DEATHS
+def test_daytona_sandbox_that_dies(phase: str) -> None:
+    daytona_sdk = pytest.importorskip('daytona')
+    from deepgym.sandboxes.daytona import DaytonaSandbox
+
+    daytona = types.SimpleNamespace(
+        create=lambda params, timeout: _dying_daytona_box(phase, daytona_sdk.DaytonaError('502')),
+        delete=lambda sandbox, timeout=60, wait=False: None,
+    )
+    box = DaytonaSandbox(daytona, Environment(task='t', verifier_code='return 1.0'))
+
+    assert _judged(lambda: run_judge_in_sandbox(box, _JOB)) == 'no_verdict'
+
+
+@pytest.mark.parametrize('reported_by', ['the_error', 'a_queue_timeout', 'the_sandbox_record'])
+def test_daytona_evicting_a_sandbox_is_not_the_solutions_doing(reported_by: str) -> None:
+    daytona_sdk = pytest.importorskip('daytona')
+    from deepgym.sandboxes.daytona import DaytonaSandbox
+
+    if reported_by == 'the_error':
+        error = daytona_sdk.DaytonaSpotEvictedError('evicted')
+        evicted = _dying_daytona_box('DEEPGYM_DEADLINE', error)
+    elif reported_by == 'a_queue_timeout':
+        error = daytona_sdk.DaytonaQueueTimeoutError('queue')
+        evicted = _dying_daytona_box('DEEPGYM_DEADLINE', error)
+    else:  # the call fails some other way; the refreshed record says why
+        error = daytona_sdk.DaytonaError('gone')
+        evicted = _dying_daytona_box('DEEPGYM_DEADLINE', error, '2026-10-14T00:00Z')
+    daytona = types.SimpleNamespace(create=lambda params, timeout: evicted, delete=print)
+    box = DaytonaSandbox(daytona, Environment(task='t', verifier_code='return 1.0'))
+
+    assert _judged(lambda: run_judge_in_sandbox(box, _JOB)) == 'no_verdict'
+    # A session reads the error itself: it must say the provider failed, not the policy.
+    with pytest.raises(daytona_sdk.DaytonaError) as raised:
+        box.exec('echo DEEPGYM_DEADLINE')
+    assert is_infrastructure_failure(raised.value)
+
+
+@_UNDATED_DEATHS
+def test_async_daytona_sandbox_that_dies(phase: str) -> None:
+    daytona_sdk = pytest.importorskip('daytona')
+    from deepgym.async_core import AsyncDeepGym
+
+    box = _dying_daytona_box(phase, daytona_sdk.DaytonaError('502'))
+    exec_ = box.process.exec
+
+    async def exec_async(command: str, **kwargs: object) -> types.SimpleNamespace:
+        return exec_(command, **kwargs)
+
+    async def upload(content: bytes, path: str) -> None:
+        pass
+
+    box.process, box.fs.upload_file = types.SimpleNamespace(exec=exec_async), upload
+    client = AsyncDeepGym(mode='local')
+
+    assert _judged(lambda: asyncio.run(client._run_judge(box, _JOB))) == 'no_verdict'
 
 
 # ---------------------------------------------------------------------------

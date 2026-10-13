@@ -20,13 +20,22 @@ logger = logging.getLogger(__name__)
 SCORE_TOLERANCE = 1e-6
 
 MODEL_FAULT_ERRORS = frozenset(
-    {'invalid_patch', 'patch_apply_failed', 'test_infra_tampering', 'policy_sandbox_failure'}
+    {
+        'invalid_patch',
+        'patch_apply_failed',
+        'test_infra_tampering',
+        'policy_sandbox_failure',
+        'solution_timeout',
+        'solution_error',
+    }
 )
 """error_type values that are the model's own fault (a patch that is malformed, doesn't
 apply, or touches test infrastructure; code it wrote that killed the grading harness once
 its tests ran, or a sandbox it broke, hung or exhausted, see
-:func:`~deepgym.exceptions.is_infrastructure_failure`): a real 0 to learn from, not a
-missing verdict."""
+:func:`~deepgym.exceptions.is_infrastructure_failure`; a solution that ran past its time
+limit, or failed or broke the verifier any other way once its output was in play): a real 0
+to learn from, not a missing verdict. A timeout on DeepGym's side is
+``timeout``, which has no verdict."""
 
 
 def is_verdict(exit_code: int | None, error_type: str | None) -> bool:
