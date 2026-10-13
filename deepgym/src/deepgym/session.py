@@ -430,6 +430,7 @@ class Session:
         self._obs: Observation | None = None
         self._step = 0
         self._done = False
+        self._step_verdict: dict[str, object] | None = None
         # One sandbox, one actor at a time: concurrent step/score/close calls queue up.
         self._lock = threading.Lock()
 
@@ -442,6 +443,16 @@ class Session:
     def trajectory(self) -> Trajectory:
         """Everything that happened so far."""
         return self._trajectory
+
+    @property
+    def step_verdict(self) -> dict[str, object] | None:
+        """The step verifier output of the last step (score, passed, details, ...).
+
+        None before any step verifier ran, or if the last one failed.
+
+        ``exit_code`` is the verifier's exit code, in place of any key it printed by that name.
+        """
+        return self._step_verdict
 
     @property
     def sandbox_id(self) -> str:
@@ -524,6 +535,7 @@ class Session:
                 exit_code=0,
                 execution_time_ms=0.0,
                 sandbox_id=self.sandbox_id,
+                error_type='no_verifier',
             )
         with self._lock:
             start = time.perf_counter()
@@ -607,6 +619,7 @@ class Session:
             VerifierError: If the step verifier times out, prints neither a float nor
                 JSON with a score, or doesn't exit cleanly (see :func:`check_exit`).
         """
+        self._step_verdict = None
         self._backend.write_file(_STEP_OUTPUT, output.encode('utf-8'))
         try:
             exit_code, stdout = self._backend.verify(
@@ -628,6 +641,7 @@ class Session:
             ) from exc
         score = checked_score(value)
         check_exit(exit_code, score, data.get('passed'))
+        self._step_verdict = {**data, 'exit_code': exit_code}
         return score
 
 

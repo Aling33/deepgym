@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS episodes (
     passed INTEGER,
     frames TEXT NOT NULL,
     result TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    trace TEXT
 );
 CREATE INDEX IF NOT EXISTS episodes_created_at ON episodes (created_at);
 CREATE TABLE IF NOT EXISTS screenshots (
@@ -57,6 +58,11 @@ def init_db(path: Path) -> None:
     with connect(path) as conn:
         conn.execute('PRAGMA journal_mode=WAL')
         conn.executescript(_SCHEMA)
+        # Databases from before traces were stored lack the column. Holding the write lock
+        # makes check-then-add atomic when two processes open an old database at once.
+        conn.execute('BEGIN IMMEDIATE')
+        if 'trace' not in {row['name'] for row in conn.execute('PRAGMA table_info(episodes)')}:
+            conn.execute('ALTER TABLE episodes ADD COLUMN trace TEXT')
 
 
 @contextmanager

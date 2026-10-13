@@ -162,32 +162,34 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     bench_p.add_argument('--json', action='store_true', help='Print machine-readable JSON only')
 
-    # ── generate-prm ───────────────────────────────────────────────────
-    prm_p = sub.add_parser(
-        'generate-prm',
-        help='Generate PRM stepwise-supervision dataset from DeepGym environments',
+    # ── traces ────────────────────────────────────────────────────────
+    traces_p = sub.add_parser('traces', help='Export recorded agent traces as training data')
+    traces_sub = traces_p.add_subparsers(dest='traces_command', required=True)
+    export_p = traces_sub.add_parser(
+        'export',
+        help='Write traces as JSONL, Parquet or ATIF',
+        description='Reads the console database and the traces directory unless --db or '
+        '--traces names the sources. Traces without a verdict are exported flagged '
+        'has_verdict=false, or left out with --only-valid.',
     )
-    prm_p.add_argument('--env', required=True, help='Built-in environment name (e.g. coin_change)')
-    prm_p.add_argument(
-        '--solutions-dir',
-        required=True,
-        help='Directory containing .py solution files to score',
+    export_p.add_argument('--format', required=True, choices=['jsonl', 'parquet', 'atif'])
+    export_p.add_argument('--out', required=True, help='Output file (a directory for atif)')
+    export_p.add_argument(
+        '--rows',
+        default='trace',
+        choices=['trace', 'rl'],
+        help="'trace': whole traces (default); 'rl': one SFT/RL conversation per trace",
     )
-    prm_p.add_argument('-o', '--output', required=True, help='Output path for .jsonl dataset file')
-    prm_p.add_argument('--step-separator', default='\n\n', help='Step separator for PRM records')
-    prm_p.add_argument('--max-parallel', type=int, default=32, help='Max concurrent sandbox runs')
-    prm_p.add_argument(
-        '--include-metadata', action='store_true', help='Include solution metadata in output'
+    export_p.add_argument(
+        '--only-valid', action='store_true', help='Leave out traces without a verdict'
     )
-    prm_p.add_argument(
-        '--axolotl-config',
+    export_p.add_argument('--db', default=None, help='Console database (~/.deepgym/console.db)')
+    export_p.add_argument(
+        '--traces',
+        nargs='+',
         default=None,
-        help='Also generate an Axolotl PRM YAML config at this path',
-    )
-    prm_p.add_argument(
-        '--base-model',
-        default='Qwen/Qwen3.5-Coder-7B',
-        help='Base model for generated Axolotl config',
+        metavar='PATH',
+        help='Trace files or directories (~/.deepgym/traces or $DEEPGYM_TRACES_DIR)',
     )
 
     # ── serve ─────────────────────────────────────────────────────────
@@ -458,66 +460,56 @@ def _cmd_benchmark_audit(args: argparse.Namespace) -> None:
     _print_benchmark_audit(report)
 
 
-def _cmd_generate_prm(args: argparse.Namespace) -> None:
-    from deepgym.core import DeepGym
-    from deepgym.integrations.axolotl import (
-        generate_axolotl_config,
-        generate_prm_dataset,
-        write_prm_dataset,
-    )
-    from deepgym.registry import load_environment
+def _cmd_traces(args: argparse.Namespace) -> None:
+    from deepgym.console.db import DEFAULT_DB_PATH
+    from deepgym.console.episode_store import EpisodeStore
+    from deepgym.traces import Trace, export_traces, is_trace_file, load_trace, traces_dir
 
-    env = load_environment(args.env)
+    if args.db is None and args.traces is None:
+        db = DEFAULT_DB_PATH if DEFAULT_DB_PATH.exists() else None
+        paths = [path for path in [traces_dir()] if path.exists()]
+    else:
+        db = Path(args.db) if args.db else None
+        paths = [Path(path) for path in args.traces or []]
+        missing = [str(path) for path in [db, *paths] if path and not path.exists()]
+        if missing:
+            print(f'Error: not found: {", ".join(missing)}', file=sys.stderr)
+            sys.exit(1)
 
-    solutions_dir = Path(args.solutions_dir)
-    if not solutions_dir.is_dir():
-        print(f'Error: {solutions_dir} is not a directory', file=sys.stderr)
+    # In a directory, read only trace files: an export written there must not break the next.
+    found = [sorted(path.glob('*.jsonl')) if path.is_dir() else [path] for path in paths]
+    files = [file for path, group in zip(paths, found) for file in group
+             if not path.is_dir() or is_trace_file(file)]  # fmt: skip
+    others = sum(map(len, found)) - len(files)
+    out = Path(args.out)
+    if out.exists() and any(out.samefile(source) for source in [db, *files] if source):
+        print(f'Error: {out} is one of the inputs; write the export elsewhere', file=sys.stderr)
         sys.exit(1)
 
-    solution_files = sorted(solutions_dir.glob('*.py'))
-    if not solution_files:
-        print(f'Error: no .py files found in {solutions_dir}', file=sys.stderr)
+    traces, untraced = EpisodeStore(db).traces() if db else ([], 0)
+    traces += [load_trace(file) for file in files]
+    # A trace can be both on disk and in the console: keep the copy that got furthest.
+    unique: dict[str, Trace] = {}
+    for trace in sorted(traces, key=lambda t: (t.result is not None, len(t.steps))):
+        unique[trace.trace_id] = trace
+    if not unique:
+        print('Error: no traces found', file=sys.stderr)
         sys.exit(1)
 
-    solutions = [f.read_text(encoding='utf-8') for f in solution_files]
-    print(f'Loaded {len(solutions)} solutions from {solutions_dir}')
-
-    dg = DeepGym()
-    start = time.perf_counter()
-    records = generate_prm_dataset(
-        env=env,
-        solutions=solutions,
-        dg=dg,
-        max_parallel=args.max_parallel,
-        step_separator=args.step_separator,
+    report = export_traces(
+        sorted(unique.values(), key=lambda trace: trace.provenance.started_at),
+        args.format,
+        out,
+        rows=args.rows,
+        only_valid=args.only_valid,
     )
-    elapsed = time.perf_counter() - start
-
-    output_path = Path(args.output)
-    written = write_prm_dataset(records, output_path, include_metadata=args.include_metadata)
-
-    print(f'\n{"=" * 50}')
-    print('  PRM Dataset Generated')
-    print(f'  Solutions scored:  {len(solutions)}')
-    print(f'  Records written:   {written}')
-    print(f'  Skipped:           {len(solutions) - written}')
-    print(f'  Output:            {output_path}')
-    print(f'  Time:              {elapsed:.2f}s')
-    print(f'{"=" * 50}')
-
-    if args.axolotl_config:
-        config_path = Path(args.axolotl_config)
-        config = generate_axolotl_config(
-            base_model=args.base_model,
-            method='prm',
-            dataset_path=str(output_path),
-            step_separator=args.step_separator.encode('unicode_escape').decode('ascii'),
-            config_filename=config_path.name,
-        )
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(config, encoding='utf-8')
-        print(f'\n  Axolotl config:    {config_path}')
-        print(f'  Train with:        axolotl train {config_path}')
+    print(f'Wrote {report.written} of {len(unique)} traces to {args.out}')
+    for reason, count in report.skipped.items():
+        print(f'  skipped {count}: {reason}')
+    if untraced:
+        print(f'  {untraced} console episodes were recorded without a trace and not read')
+    if others:
+        print(f'  {others} .jsonl files in the traces directories are not traces and were not read')
 
 
 def _cmd_console(args: argparse.Namespace) -> None:
@@ -690,7 +682,6 @@ def _parse_split_overrides(values: list[str]) -> dict[str, str]:
 _COMMANDS = {
     'audit': _cmd_audit,
     'benchmark-audit': _cmd_benchmark_audit,
-    'generate-prm': _cmd_generate_prm,
     'qa': _cmd_qa,
     'run': _cmd_run,
     'run-batch': _cmd_run_batch,
@@ -699,6 +690,7 @@ _COMMANDS = {
     'serve': _cmd_serve,
     'console': _cmd_console,
     'web': _cmd_console,
+    'traces': _cmd_traces,
 }
 
 
