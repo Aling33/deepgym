@@ -151,7 +151,7 @@ def build_exploit_record(
     return ExploitRecord(
         verifier_id=verifier_id,
         benchmark=benchmark,
-        exploitable=not report.is_robust,
+        exploitable=report.exploits_found > 0,
         patterns=patterns,
         num_attacks=report.attacks_run,
         num_exploits=report.exploits_found,
@@ -161,6 +161,7 @@ def build_exploit_record(
                 'strategy': r.strategy,
                 'score': r.score,
                 'exploited': r.exploited,
+                'inconclusive': r.inconclusive,
                 'details': r.details,
             }
             for r in report.results
@@ -205,7 +206,8 @@ class RewardAuditor:
         if persist:
             db, should_close = self._open_db(db_path)
             try:
-                db.save(
+                # False for an inconclusive audit: it never judged the verifier.
+                stored = db.save(
                     build_exploit_record(
                         verifier_id=resolved_verifier_id,
                         benchmark=benchmark,
@@ -214,7 +216,6 @@ class RewardAuditor:
                         report=report,
                     )
                 )
-                stored = True
             finally:
                 if should_close:
                     db.close()
@@ -224,7 +225,7 @@ class RewardAuditor:
             benchmark=benchmark,
             attack_type='white-box',
             verifier_hash=verifier_hash,
-            exploitable=not report.is_robust,
+            exploitable=report.exploits_found > 0,
             risk_score=risk_score,
             risk_level=risk_level_for_score(risk_score),
             patterns=patterns,

@@ -1,0 +1,107 @@
+"""api_request scores what the solution fetches and prints, not what its source says."""
+
+import importlib.util
+import re
+import sys
+
+import pytest
+
+from deepgym import DeepGym, load_environment, solution_runtime
+
+ENV = load_environment('api_request')
+REFERENCE = ENV.verifier_path.with_name('reference_solution.py').read_text(encoding='utf-8')
+
+HTTP_CLIENT = """
+import http.client, json, sys, urllib.parse
+
+url = urllib.parse.urlsplit(sys.argv[1])
+conn = http.client.HTTPConnection(url.hostname, url.port, timeout=10)
+conn.request('GET', url.path)
+print(json.loads(conn.getresponse().read())['slideshow']['title'])
+"""
+
+HARDCODED = """
+# Fetch https://httpbin.org/json with urllib.request, parse the json response
+# and print the slideshow title.
+print('Sample Slide Show')
+"""
+
+KEYWORDS = """
+import json, urllib.request  # requests httpx urlopen http.client .json()
+# data['slideshow']['title']
+print('title')
+"""
+
+FIRST_TITLE_IN_BODY = """
+import re, sys, urllib.request
+
+body = urllib.request.urlopen(sys.argv[1], timeout=10).read().decode()
+print(re.search(r'"title": "([^"]*)"', body).group(1))
+"""
+
+LAST_TITLE_IN_BODY = FIRST_TITLE_IN_BODY.replace(
+    """re.search(r'"title": "([^"]*)"', body).group(1)""",
+    """re.findall(r'"title": "([^"]*)"', body)[-1]""",
+)
+
+TITLES = re.compile(r'"title": "([^"]*)"')
+
+FIRST_SLIDE_TITLE = REFERENCE.replace(
+    "['slideshow']['title']", "['slideshow']['slides'][0]['title']"
+)
+
+
+@pytest.fixture(scope='module')
+def dg() -> DeepGym:
+    return DeepGym(mode='local')
+
+
+@pytest.mark.parametrize('solution', [REFERENCE, HTTP_CLIENT], ids=['urllib', 'http_client'])
+def test_solutions_that_fetch_and_extract_score_full(dg: DeepGym, solution: str) -> None:
+    result = dg.run(ENV, solution)
+
+    assert result.score == 1.0, result.output
+
+
+def test_documents_change_every_run_so_a_lookup_table_fails(dg: DeepGym) -> None:
+    """Paths and titles seen in one run tell a solution nothing about the next."""
+    first, second = (dg.run(ENV, REFERENCE) for _ in range(2))
+    table = {case.input_summary: case.expected_summary for case in first.cases}
+    lookup = (
+        'import sys, urllib.parse\n'
+        f'TABLE = {table!r}\n'
+        "print(TABLE.get(urllib.parse.urlsplit(sys.argv[1]).path, ''))\n"
+    )
+
+    assert dg.run(ENV, lookup).score == 0.0
+    assert (first.score, second.score) == (1.0, 1.0)
+    assert first.seed != second.seed
+
+
+@pytest.mark.parametrize(
+    'solution',
+    [HARDCODED, KEYWORDS, FIRST_TITLE_IN_BODY, LAST_TITLE_IN_BODY, FIRST_SLIDE_TITLE],
+    ids=['hardcoded_print', 'keyword_stuffing', 'first_title', 'last_title', 'wrong_field'],
+)
+def test_shortcuts_fail(dg: DeepGym, solution: str) -> None:
+    result = dg.run(ENV, solution)
+
+    assert (result.passed, result.score < 1.0) == (False, True), result.output
+
+
+def test_every_seed_puts_a_decoy_title_before_and_after_the_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Printing the first or the last "title" in the body never gets full credit, on any seed."""
+    monkeypatch.setitem(sys.modules, 'deepgym_solution', solution_runtime)
+    spec = importlib.util.spec_from_file_location('api_request_verifier', ENV.verifier_path)
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+
+    for seed in range(2000):
+        documents = verifier.documents(seed)
+        titles = [(TITLES.findall(body), title) for _, title, body in documents]
+
+        assert len({path for path, _, _ in documents}) == verifier.DOCUMENTS, seed
+        assert not all(found[0] == title for found, title in titles), seed
+        assert not all(found[-1] == title for found, title in titles), seed

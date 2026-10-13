@@ -1,5 +1,6 @@
 """Tests for deepgym.integrations -- TRL, verl, OpenRLHF integration wrappers."""
 
+import time
 from pathlib import Path
 
 import pytest
@@ -79,6 +80,29 @@ class TestTRLIntegration:
         fn = make_trl_async_reward_fn(env=env)
         assert callable(fn)
 
+    async def test_trl_reward_fns_score_every_completion_format_alike(
+        self, env: Environment, local_dg: DeepGym
+    ) -> None:
+        """Plain, fenced, conversational and tool-calling completions of one answer score alike."""
+        fenced = f'Here you go:\n```python\n{GOOD_SOLUTION}```'
+        tool_call = {'type': 'function', 'function': {'name': 'run', 'arguments': {}}}
+        completions = [
+            GOOD_SOLUTION,
+            fenced,
+            [{'role': 'assistant', 'content': GOOD_SOLUTION}],
+            [{'role': 'assistant', 'content': [{'type': 'text', 'text': fenced}]}],
+            [
+                {'role': 'assistant', 'content': '', 'tool_calls': [tool_call]},
+                {'role': 'tool', 'name': 'run', 'content': 'ok'},
+                {'role': 'assistant', 'content': fenced},
+            ],
+        ]
+
+        sync_scores = make_trl_reward_fn(env=env, dg=local_dg)(completions=completions)
+        async_scores = await make_trl_async_reward_fn(env=env, dg=local_dg)(completions=completions)
+
+        assert sync_scores == async_scores == [1.0] * len(completions)
+
 
 class TestVerlIntegration:
     """Verify verl reward function wrappers."""
@@ -123,6 +147,33 @@ class TestVerlIntegration:
     def test_extract_code_takes_last_block_or_whole_text(self) -> None:
         assert extract_code('a\n```python\nx = 1\n```\nb\n```\ny = 2\n```') == 'y = 2\n'
         assert extract_code('def f(): pass') == 'def f(): pass'
+
+    @pytest.mark.parametrize(
+        'tokens',
+        [
+            '<|im_end|>',
+            '<|endoftext|>',
+            '</s>',
+            '<|eot_id|>',
+            '<|eot_id|>\n<|end_of_text|>',
+            '<end_of_turn>',
+            '<｜end▁of▁sentence｜>',
+        ],
+    )
+    def test_extract_code_drops_trailing_special_tokens(self, tokens: str) -> None:
+        """Decoding with skip_special_tokens=False leaves EOS tokens after unfenced code."""
+        assert extract_code(f'{GOOD_SOLUTION}{tokens}\n') == GOOD_SOLUTION
+        assert extract_code(f'```python\n{GOOD_SOLUTION}```\n{tokens}') == GOOD_SOLUTION
+
+    def test_unfenced_code_before_an_eos_token_scores_in_every_adapter(
+        self, env: Environment, local_dg: DeepGym
+    ) -> None:
+        trl = make_trl_reward_fn(env=env, dg=local_dg)(completions=[f'{GOOD_SOLUTION}</s>'])
+        verl = make_verl_compute_score(env=env, dg=local_dg)('ds', f'{GOOD_SOLUTION}<|eot_id|>')
+        query = f'{OPENRLHF_PROMPT}{GOOD_SOLUTION}<|im_end|>'
+        openrlhf = _openrlhf_score(env, local_dg, [query])['rewards']
+
+        assert (trl, verl, openrlhf) == ([1.0], 1.0, [1.0])
 
     def test_package_compute_score_picks_env_per_row(self) -> None:
         reference = (
@@ -223,6 +274,33 @@ class TestRewardFunction:
         assert batch.total == 1
 
 
+OPENRLHF_CONTEXT = '<|im_start|>user\n' + 'Strings are sequences of characters. ' * 12
+OPENRLHF_PROMPT = (
+    f'{OPENRLHF_CONTEXT}\nWrite reverse_string(s). For example:\n'
+    f'```python\n{GOOD_SOLUTION}```<|im_end|>\n<|im_start|>assistant\n'
+)
+"""A chat-templated prompt whose fenced example would pass if it were ever scored."""
+
+
+def _openrlhf_score(env: Environment, dg: DeepGym, queries: list[str]) -> dict:
+    """POST *queries* as OpenRLHF's SingleTurnAgentExecutor._fetch_rewards_via_http does.
+
+    openrlhf/utils/agent.py sends {'query', 'prompts', 'labels'}, where each query is
+    ``hf_tokenizer.decode(prompt_ids + action_ids, skip_special_tokens=False)``: the
+    templated prompt and the response decoded together, special tokens included.
+    """
+    payload = {
+        'query': queries,
+        'prompts': [OPENRLHF_PROMPT] * len(queries),
+        'labels': [None] * len(queries),
+    }
+    app = FastAPI()
+    app.include_router(create_openrlhf_router(env, dg))
+    response = TestClient(app).post('/reward/score', json=payload)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
 class TestOpenRLHFIntegration:
     """Verify OpenRLHF router creation and endpoint."""
 
@@ -246,6 +324,36 @@ class TestOpenRLHFIntegration:
         assert len(data['rewards']) == 1
         assert data['rewards'][0] >= 0.5
 
+    def test_score_endpoint_accepts_the_official_agent_payload(
+        self, env: Environment, local_dg: DeepGym
+    ) -> None:
+        responses = [f'Sure:\n```python\n{GOOD_SOLUTION}```<|im_end|>', 'No idea.<|im_end|>']
+
+        data = _openrlhf_score(env, local_dg, [OPENRLHF_PROMPT + r for r in responses])
+
+        # The second response has no code; the example in its prompt must not be scored.
+        assert data['rewards'] == [1.0, 0.0]
+
+    def test_score_endpoint_never_scores_prompt_text(
+        self, env: Environment, local_dg: DeepGym
+    ) -> None:
+        """A too-long prompt loses tokens from its front, but OpenRLHF sends the whole string.
+
+        The response starts after the prompt's tail; a query that doesn't contain its
+        prompt at all is not scored.
+        """
+        truncated = OPENRLHF_PROMPT[len(OPENRLHF_CONTEXT) // 2 :]
+        queries = [
+            truncated + 'No idea.<|im_end|>',
+            truncated + f'```python\n{GOOD_SOLUTION}```<|im_end|>',
+            'A query that lost its prompt entirely. No idea.',
+        ]
+
+        data = _openrlhf_score(env, local_dg, queries)
+
+        assert data['rewards'] == [0.0, 1.0, 0.0]
+        assert data['error_types'] == [None, None, 'prompt_mismatch']
+
     def test_score_endpoint_empty(self, env: Environment, local_dg: DeepGym) -> None:
         router = create_openrlhf_router(env, local_dg)
         app = FastAPI()
@@ -258,6 +366,47 @@ class TestOpenRLHFIntegration:
         )
         assert response.status_code == 200
         assert response.json()['rewards'] == []
+
+
+class TestUntrustedInputSize:
+    """The reward server takes untrusted bodies: matching and extraction stay linear and capped."""
+
+    def test_one_megabyte_prompt_and_query_match_fast(self) -> None:
+        size = 1_000_000
+        repetitive = OpenRLHFRewardRequest(prompts=['a' * size + 'c'], query=['a' * size + 'b'])
+        prompt = 'ab' * (size // 2)
+        cut = OpenRLHFRewardRequest(prompts=[prompt], query=[prompt[size // 2 :] + 'answer'])
+
+        start = time.perf_counter()
+        responses = repetitive.responses + cut.responses
+        elapsed = time.perf_counter() - start
+
+        assert responses == [None, 'answer']
+        assert elapsed < 0.5
+
+    def test_one_megabyte_of_trailing_tokens_extracts_fast(self) -> None:
+        start = time.perf_counter()
+        code = extract_code('x = 1\n' + '<|im_end|> ' * 100_000)
+        elapsed = time.perf_counter() - start
+
+        assert code == 'x = 1\n'
+        assert elapsed < 0.5
+
+    def test_oversized_texts_are_rejected_before_matching(
+        self, env: Environment, local_dg: DeepGym
+    ) -> None:
+        from deepgym.integrations.openrlhf import MAX_TEXT_CHARS
+
+        app = FastAPI()
+        app.include_router(create_openrlhf_router(env, local_dg))
+        too_long = 'x' * (MAX_TEXT_CHARS + 1)
+
+        response = TestClient(app).post(
+            '/reward/score', json={'query': [too_long], 'prompts': ['p'], 'labels': [None]}
+        )
+
+        assert response.status_code == 422
+        assert 'at most' in response.text
 
 
 class TestOpenRLHFModels:

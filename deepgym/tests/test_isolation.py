@@ -4,7 +4,15 @@ Runs locally. File-isolation checks need sandbox-exec (macOS) or bwrap (Linux)
 and are skipped where neither works.
 """
 
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
 import time
+from pathlib import Path
 
 import pytest
 
@@ -598,6 +606,117 @@ except Exception:
         assert dg.run(Environment(task='t', verifier_code=verifier), solution).passed
 
 
+LOOPBACK_PROBE_VERIFIER = """
+import socket
+import subprocess
+import sys
+from deepgym_solution import run_solution
+
+def verify(solution_path):
+    allowed, other = socket.create_server(('127.0.0.1', 0)), socket.create_server(('127.0.0.1', 0))
+    ports = [str(server.getsockname()[1]) for server in (allowed, other)]
+    out = ' '.join(run_solution(solution_path, ports, loopback_port=int(ports[0])).stdout.split())
+    return {'score': float(out == 'open closed closed'), 'passed': True, 'details': out}
+"""
+
+LOOPBACK_PROBE = """
+import socket, sys
+
+for host, port in [('127.0.0.1', sys.argv[1]), ('127.0.0.1', sys.argv[2]), ('1.1.1.1', 80)]:
+    try:
+        socket.create_connection((host, int(port)), timeout=3).close()
+        print('open')
+    except OSError:
+        print('closed')
+"""
+
+
+@needs_sandbox
+def test_solution_reaches_only_the_judges_loopback_port(dg: DeepGym) -> None:
+    """loopback_port opens that one judge port; other ports and egress stay shut."""
+    env = Environment(task='t', verifier_code=LOOPBACK_PROBE_VERIFIER)
+
+    assert dg.run(env, LOOPBACK_PROBE).output == 'open closed closed'
+
+
+def test_overlapping_loopback_setups_in_a_shared_workdir_stay_judge_owned(monkeypatch) -> None:
+    """Two overlapping calls sharing a workdir with a planted symlink and directory each get
+    their own unpredictable, judge-owned socket that relays to their own port, and neither
+    loosens the judge's umask nor chmods anything by path.
+    """
+    from deepgym import solution_runtime
+
+    base = Path(tempfile.mkdtemp(dir='/tmp'))  # AF_UNIX paths must stay short
+    servers = [socket.create_server(('127.0.0.1', 0)) for _ in range(2)]
+    try:
+        target = base / 'socket.py'  # stands in for a module root imports
+        target.write_text('# root imports this')
+        target.chmod(0o644)
+        runtime = base / 'runtime' / 'deepgym_solution.py'
+        runtime.parent.mkdir()
+        runtime.write_text('')
+        work = base / 'work'
+        work.mkdir()
+        (work / 'loopback.sock').symlink_to(target)
+        (work / 'tmpplanted').mkdir()
+        planted = sorted(p.name for p in work.iterdir())
+
+        calls: list[tuple[str, object]] = []
+        umask, chmod = os.umask, os.chmod
+        monkeypatch.setattr(os, 'umask', lambda m: calls.append(('umask', m)) or umask(m))
+        monkeypatch.setattr(
+            os, 'chmod', lambda *a, **k: calls.append(('chmod', a)) or chmod(*a, **k)
+        )
+        isolation = {'kind': 'user', 'prefix': [], 'own_network': True}
+        monkeypatch.setenv('DEEPGYM_ISOLATION', json.dumps(isolation))
+        monkeypatch.setenv('DEEPGYM_RUNTIME', str(runtime))
+        ports = [server.getsockname()[1] for server in servers]
+
+        with (
+            solution_runtime._loopback(ports[0]) as first,
+            solution_runtime._loopback(ports[1]) as second,
+        ):
+            paths = [Path(first[-1]), Path(second[-1])]
+            assert paths[0].parent != paths[1].parent
+            for path, server in zip(paths, servers):
+                assert path.parent.parent == runtime.parent
+                assert oct(path.parent.stat().st_mode & 0o777) == oct(0o711)
+                assert oct(path.stat().st_mode & 0o777) == oct(0o777)
+                server.settimeout(5)
+                with socket.socket(socket.AF_UNIX) as client:
+                    client.connect(str(path))
+                    server.accept()[0].close()  # relayed to this call's own port
+
+        assert calls == []
+        assert not any(path.parent.exists() for path in paths)
+        assert oct(target.stat().st_mode & 0o777) == oct(0o644)
+        assert sorted(p.name for p in work.iterdir()) == planted
+    finally:
+        for server in servers:
+            server.close()
+        shutil.rmtree(base)
+
+
+def test_root_loopback_bootstrap_ignores_modules_planted_in_cwd_or_env(tmp_path) -> None:
+    from deepgym.judge import _LOOPBACK_UP_THEN_EXEC
+
+    marker = tmp_path / 'pwned'
+    for name in ('socket', 'fcntl', 'struct', 'sitecustomize'):
+        (tmp_path / f'{name}.py').write_text(f'open({str(marker)!r}, "w").write("{name}")\n')
+    env = {**os.environ, 'PYTHONPATH': str(tmp_path), 'PYTHONSTARTUP': str(tmp_path / 'fcntl.py')}
+
+    # Not root (and maybe not Linux), so the ioctl fails; any planted import would run first.
+    subprocess.run(
+        [sys.executable, '-I', '-S', '-c', _LOOPBACK_UP_THEN_EXEC, 'true'],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        check=False,
+    )
+
+    assert not marker.exists()
+
+
 def test_sharing_a_workdir_never_follows_symlinks(tmp_path) -> None:
     from deepgym.solution_runtime import _share_with_solution
 
@@ -622,6 +741,9 @@ def test_sharing_a_workdir_never_follows_symlinks(tmp_path) -> None:
 def test_sandbox_isolation_goes_offline_or_fails_closed() -> None:
     offline = sandbox_isolation('0 999 987 /usr/bin/python3 1')[0]['prefix']
     assert offline[:3] == ['unshare', '--net', '--']
+    # Root brings loopback up from the solution's cwd: no cwd, site or env on its path.
+    assert offline[3:7] == ['/usr/bin/python3', '-I', '-S', '-c']
+    assert "{'PATH': '/usr/sbin:/usr/bin:/sbin:/bin'}" in offline[7]
     assert '--bounding-set=-all' in offline
     assert sandbox_isolation('0 999 987 /usr/bin/python3 0')[0]['prefix'][0] == 'setpriv'
     with pytest.raises(SandboxError, match='network'):

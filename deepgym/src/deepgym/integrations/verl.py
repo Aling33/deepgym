@@ -39,10 +39,35 @@ from deepgym.registry import load_environment
 from deepgym.sandboxes import Provider
 
 _FENCED_BLOCK = re.compile(r'```[\w+-]*\n(.*?)```', re.DOTALL)
+# End-of-turn/EOS tokens a decoder leaves when it keeps special tokens: <|im_end|>,
+# <|endoftext|>, <|eot_id|>, <|end|>, </s>, <eos>, <end_of_turn>, DeepSeek's <｜...｜>.
+_SPECIAL_TOKEN = re.compile(r'<\|[\w.-]+\|>|<｜[^｜<>]+｜>|</s>|<eos>|<end_of_turn>')
+
+
+def _drop_trailing_special_tokens(response: str) -> str:
+    """Return *response* without the special tokens (and whitespace) at its end.
+
+    Walks back by index, so it stays linear in the response length however many
+    tokens there are.
+    """
+    cut = None
+    end = len(response.rstrip())
+    while (start := response.rfind('<', 0, end)) != -1 and _SPECIAL_TOKEN.fullmatch(
+        response, start, end
+    ):
+        cut = end = start
+        while end and response[end - 1].isspace():
+            end -= 1
+    return response if cut is None else response[:cut]
 
 
 def extract_code(response: str) -> str:
-    """Return the last fenced code block in *response*, or *response* unchanged if none."""
+    """Return the last fenced code block in *response*, or the whole response if none.
+
+    Special tokens at the end (e.g. ``<|im_end|>``, ``</s>``), which decoding with
+    ``skip_special_tokens=False`` leaves, are dropped first.
+    """
+    response = _drop_trailing_special_tokens(response)
     blocks = _FENCED_BLOCK.findall(response)
     return blocks[-1] if blocks else response
 
@@ -55,11 +80,6 @@ def _client(mode: str) -> DeepGym:
 @functools.cache
 def _environment(name: str, variant: int) -> Environment:
     return load_environment(name, variant=variant)  # type: ignore[return-value]
-
-
-# The model's own fault (a patch that is malformed or doesn't apply): a real 0 to train on,
-# not a missing verdict, so these samples must never be masked out of the loss.
-_MODEL_FAULTS = frozenset({'invalid_patch', 'patch_apply_failed'})
 
 
 def _score_one(dg: DeepGym, env: Environment, response: str) -> RunResult:
@@ -93,8 +113,9 @@ def compute_score(
     Returns:
         The same keys for every row, as verl requires to batch them: ``score``,
         ``passed`` (1.0 or 0.0), and ``error``, which is 1.0 when no verdict was
-        produced (sandbox or verifier failure, timeout, invalid score). The score is
-        then 0.0; :mod:`deepgym.integrations.verl_mask` masks such samples out of the loss.
+        produced (sandbox or verifier failure, timeout, invalid score; see
+        ``RunResult.has_verdict``). The score is then 0.0;
+        :mod:`deepgym.integrations.verl_mask` masks such samples out of the loss.
         A patch that is malformed or doesn't apply is the model's fault, so it scores
         0.0 with ``error`` 0.0 and is trained on.
 
@@ -107,7 +128,7 @@ def compute_score(
     return {
         'score': result.score,
         'passed': float(result.passed),
-        'error': float(result.error_type not in (None, *_MODEL_FAULTS)),
+        'error': float(not result.has_verdict),
     }
 
 

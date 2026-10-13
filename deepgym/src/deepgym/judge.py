@@ -228,13 +228,26 @@ def local_judge(job: JudgeJob) -> Iterator[tuple[list[str], dict[str, str], str]
 # ---------------------------------------------------------------------------
 
 
+# Runs as root in the solution's fresh network namespace: bring loopback up (it starts
+# down and slim images have no `ip`), then exec the rest of the command, which drops root.
+# Its working directory is the solution's, so it runs with `python -I -S` (no cwd, site
+# or PYTHON* variables on the import path) and execs with a fixed PATH and nothing else.
+_LOOPBACK_UP_THEN_EXEC = """
+import fcntl, os, socket, struct, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+flags = struct.unpack('16sH', fcntl.ioctl(s, 0x8913, struct.pack('16sH', b'lo', 0)))[1]
+fcntl.ioctl(s, 0x8914, struct.pack('16sH', b'lo', flags | 1))
+os.execvpe(sys.argv[1], sys.argv[1:], {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin'})
+"""
+
+
 def sandbox_isolation(setup_output: str, *, require_offline: bool = False) -> tuple[dict, str]:
     """Turn SANDBOX_SETUP's output into (isolation spec, python path).
 
     The solution runs as the unprivileged solver user with every capability
     dropped and no-new-privs (a setuid binary can't regain root) and, where the
-    sandbox allows it, in its own network namespace
-    (loopback only: no internet, no host).
+    sandbox allows it, in its own network namespace (loopback only: no internet,
+    no host). ``own_network`` in the spec says it got one.
 
     Raises:
         SandboxError: If *require_offline* is set but the sandbox can't make that namespace.
@@ -247,14 +260,16 @@ def sandbox_isolation(setup_output: str, *, require_offline: bool = False) -> tu
         )
     drop = ['setpriv', f'--reuid={uid}', f'--regid={gid}', '--clear-groups']
     drop += ['--inh-caps=-all', '--bounding-set=-all', '--no-new-privs', '--']
-    offline = ['unshare', '--net', '--'] if netns == '1' else []
+    offline: list[str] = []
+    if netns == '1':
+        offline = ['unshare', '--net', '--', python, '-I', '-S', '-c', _LOOPBACK_UP_THEN_EXEC]
     if judge_uid == '0':
         prefix = [*offline, *drop]
     elif offline:
         prefix = ['sudo', '-n', *offline, *drop]
     else:
         prefix = ['sudo', '-n', '-u', SOLVER_USER, '--']
-    return {'kind': 'user', 'prefix': prefix}, python
+    return {'kind': 'user', 'prefix': prefix, 'own_network': netns == '1'}, python
 
 
 def sandbox_uploads(job: JudgeJob) -> list[tuple[bytes, str]]:

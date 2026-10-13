@@ -9,6 +9,7 @@ from deepgym.core import DeepGym
 from deepgym.exploit_db import ExploitDB
 from deepgym.models import Environment
 from deepgym.reward_qa import RewardAuditor, fingerprint_verifier
+from tests.test_adversarial import CRASHING_VERIFIER
 
 STANDALONE_PASSING_VERIFIER = (
     'import sys, json\n'
@@ -46,6 +47,31 @@ class TestRewardAuditor:
         assert 'few-test-cases' in report.patterns
         assert report.recommendations
         assert report.stored is False
+
+    def test_attacks_that_cannot_run_are_not_exploits(self, dg: DeepGym) -> None:
+        env = Environment(task='Do anything', verifier_code=CRASHING_VERIFIER)
+
+        report = RewardAuditor(dg).audit(env, strategies=['empty'])
+
+        assert report.exploitable is False
+        assert (report.report.is_robust, report.report.inconclusive) == (False, 1)
+
+    def test_inconclusive_audits_are_never_stored_as_tested(
+        self, tmp_path: Path, dg: DeepGym
+    ) -> None:
+        """Otherwise a provider failure marks the verifier tested and later scans skip it."""
+        env = Environment(task='Do anything', verifier_code=CRASHING_VERIFIER)
+        db_path = tmp_path / 'audits.db'
+
+        report = RewardAuditor(dg).audit(
+            env, verifier_id='flaky', strategies=['empty'], persist=True, db_path=db_path
+        )
+
+        db = ExploitDB(db_path=db_path)
+        try:
+            assert (report.stored, db.get('flaky', 'white-box')) == (False, None)
+        finally:
+            db.close()
 
     def test_audit_persists_to_exploit_db(self, tmp_path: Path, dg: DeepGym) -> None:
         env = Environment(task='Do anything', verifier_code=STANDALONE_PASSING_VERIFIER)
