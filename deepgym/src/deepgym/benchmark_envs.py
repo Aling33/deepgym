@@ -245,6 +245,25 @@ def _execute_runner(
     return build_run_result(result, elapsed_ms, sandbox_id, exit_code=exit_code)
 
 
+def _vendored_toml_source() -> str:
+    """Return a self-contained TOML parser to inline in the runner.
+
+    The runner executes in the task image's interpreter, where ``tomllib`` (Python 3.11+)
+    may be absent, so a config comparison that imported it would fail closed on every
+    older image. ``vendored_toml.txt`` is CPython's ``tomllib`` (the ``tomli`` package
+    verbatim) concatenated into one module, so the runner parses ``pyproject.toml``/
+    ``Cargo.toml`` exactly as the tools that consume them do -- dotted keys, inline tables,
+    duplicate-key and table-redefinition rejection -- independent of the image's Python.
+    It ships as package data and is read as text, not rebuilt from this host's modules
+    with ``inspect.getsource``, which fails when the host's ``tomllib``/``tomli`` is
+    compiled or installed without its ``.py`` source.
+
+    Returns:
+        Python source defining ``loads`` and ``TOMLDecodeError`` at module scope.
+    """
+    return Path(__file__).with_name('vendored_toml.txt').read_text(encoding='utf-8')
+
+
 class PatchVerifier:
     """Reusable repo-level patch verifier."""
 
@@ -255,11 +274,21 @@ class PatchVerifier:
 
     @staticmethod
     def build_runner_script() -> str:
-        """Return the self-contained patch runner script."""
-        return textwrap.dedent(
+        """Return the self-contained patch runner script.
+
+        A vendored TOML parser is inlined as ``_VENDORED_TOML`` and exec'd only when the
+        image's Python lacks ``tomllib`` (3.10), so the config comparison matches the tools
+        either way; see :func:`_vendored_toml_source`. The runner itself needs Python 3.10+:
+        its annotations (``Path | None``) are evaluated as each function is defined, so on an
+        older image the whole runner fails at load, before it emits a result.
+        """
+        return f'_VENDORED_TOML = {_vendored_toml_source()!r}\n\n' + textwrap.dedent(
             """
+            import fnmatch
             import json
             import os
+            import posixpath
+            import re
             import shutil
             import subprocess
             import sys
@@ -279,6 +308,35 @@ class PatchVerifier:
                 return text[-limit:]
 
 
+            def _path_verdict(error_type: str, summary: str, flagged: dict) -> int:
+                # Score 0 with one case per flagged path and its reason.
+                return _emit(
+                    {
+                        'schema_version': '1.0',
+                        'score': 0.0,
+                        'passed': False,
+                        'details': summary + _tail(', '.join(flagged)),
+                        'reward_components': {'apply': 0.0, 'tests': 0.0},
+                        'metrics': {'pass_fraction': 0.0, 'tests_run': 0},
+                        'truncated': False,
+                        'error_type': error_type,
+                        'cases': [
+                            {
+                                'id': rel,
+                                'passed': False,
+                                'score': 0.0,
+                                'input_summary': 'patched path',
+                                'actual_summary': reason,
+                                'error': f'{rel}: {reason}',
+                                'execution_time_ms': 0.0,
+                            }
+                            for rel, reason in flagged.items()
+                        ],
+                    },
+                    1,
+                )
+
+
             def _run(command: str, *, cwd: Path | None = None, timeout: int = 300) -> subprocess.CompletedProcess[str]:
                 return subprocess.run(
                     command,
@@ -290,9 +348,368 @@ class PatchVerifier:
                 )
 
 
-            def _hidden_paths(repo_dir: Path, patch_file: Path, timeout: int) -> list[str] | None:
-                # Every path the hidden test patch reads or writes, as git's own parser sees
-                # it: --numstat names each post-image path, -R --numstat each pre-image one.
+            # Test infrastructure a model's diff must not touch outside the hidden test
+            # patch's own paths (those are put back anyway): the tests, their helpers,
+            # data and snapshots, everything a test runner or interpreter loads by name
+            # or from its config, and the installed test harness and dependencies.
+            #
+            # This is a stopgap denylist and can never be complete: there will always be
+            # another file a runner autoloads, and it cannot stop a diff to the code under
+            # test that forces an exit (os._exit / atexit at import), which the exit-code
+            # reward still trusts. Do not keep growing it indefinitely. The real defence is
+            # the per-test report gate (verdict from the runner's own report, fail closed),
+            # which supersedes this; add new frameworks there, not here.
+            # Directories whose *executable* contents a runner collects or loads. A data
+            # fixture here (.yml, .json, .golden) is not refused -- real fixes edit those,
+            # and weakening a data oracle is a separate problem the report gate addresses.
+            # 'testing' is left out: it is as often a shipped package (django.test, @proton/
+            # testing) as a test dir, and refusing it gives correct fixes a false zero.
+            _TEST_DIRS = {
+                'test', 'tests', '__tests__', 'testdata', 'spec', 'specs',
+                '__snapshots__', '__mocks__',
+            }
+            _HARNESS_DIRS = {
+                'node_modules', 'site-packages', 'dist-packages', 'vendor', '.pytest_cache',
+                '.tox', '.nox', '_pytest', '.venv', 'venv', 'virtualenv', '.cargo',
+            }
+            # Build scripts and runner config that execute code: `make test`, a gradle/maven
+            # test task or a build.rs can be rewritten to exit 0 without running the tests, so
+            # any edit is refused. tox.ini/tox.toml (whose [testenv] commands are what `tox`
+            # runs) and go.work (which modules `go test` sees) are refused the same way. (A
+            # lockfile or go.sum cannot forge a pass on its own -- the stub package a repoint
+            # needs is caught by its own runner `bin` -- so those stay allowed, as a real
+            # dependency fix updates them.)
+            _INFRA_FILES = {
+                'conftest.py', 'pytest.py', 'pytest.ini', '.pytest.ini', 'pytest.toml',
+                '.pytest.toml', 'tox.ini', 'noxfile.py', 'tests.py', 'sitecustomize.py',
+                'usercustomize.py', '.pythonrc', '.pythonrc.py', '.pythonstartup', '.rspec',
+                'phpunit.xml', 'phpunit.xml.dist', 'phpunit.dist.xml', 'pom.xml', 'build.gradle',
+                'build.gradle.kts', 'settings.gradle', 'settings.gradle.kts', 'build.rs',
+                'rakefile', 'makefile', 'gnumakefile', '.npmrc', '.yarnrc', '.yarnrc.yml',
+                'setup.py', 'tox.toml', 'go.work',
+            }
+            # Executable extensions: a code file inside a test directory can run at import or
+            # be imported by a test, so it is refused there; a data file is not.
+            _CODE_EXTS = {
+                'py', 'pyi', 'js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'mts', 'cts', 'go', 'rb',
+                'rs', 'java', 'kt', 'kts', 'php', 'sh', 'bash', 'c', 'cc', 'cpp', 'h', 'hpp',
+            }
+            _JS_TOOLS = {
+                'jest', 'vitest', 'vite', 'karma', 'babel', 'ava', 'playwright', 'cypress',
+                'mocha', 'nyc', 'wdio',
+            }
+            _JS_EXTS = {'js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'mts', 'cts'}
+            # package.json keys that configure a test runner, compared whole; scripts and bin are
+            # judged in _test_part_changed. The rest of the file, including the dependency ranges
+            # a real fix updates, is left alone.
+            _PACKAGE_KEYS = (
+                'jest', 'mocha', 'ava', 'babel', 'nyc', 'c8', 'vitest', 'tap', 'wdio', 'workspaces',
+            )
+            # Config files that are test infrastructure only in part; _config_tampered decides.
+            # The keys it compares are knowingly incomplete (a runner reads more than any list
+            # here); the per-test report gate supersedes this comparison.
+            _CONFIG_FILES = {'pyproject.toml', 'setup.cfg', 'package.json', 'cargo.toml', 'go.mod'}
+            _SYMLINK = b'\\0deepgym-symlink'
+            # An edit the guard can't classify with certainty is uncertain: the tests still run, a
+            # failure scores the normal 0, and only a pass (which can't be trusted) is masked.
+            # [workspace.package] keys known to be plain metadata members inherit; a change to any
+            # other key there is uncertain.
+            _WORKSPACE_METADATA = {
+                'version', 'description', 'authors', 'license', 'repository', 'homepage',
+                'documentation', 'readme', 'keywords', 'categories', 'rust-version',
+            }
+
+
+            def _components(rel: str) -> list[str]:
+                # Lowercased path components, dropping '' and '.' (git -z paths are raw, normalized).
+                return [part for part in rel.lower().split('/') if part not in ('', '.')]
+
+
+            def _is_test_file(name: str) -> bool:
+                # Whether *name* (lowercased basename) is itself a test, a test runner config,
+                # or an import hook a runner loads by name -- refused wherever it sits. A name
+                # that only shares a word with one is ordinary code: in Go only *_test.go is a
+                # test (testdata/ is in _TEST_DIRS), so cmd/test.go is not, nor is a jest.md doc.
+                # Whether a *.setup.* file is a test setup file depends on where it sits; see
+                # _infra_reason.
+                segments = name.split('.')
+                return (
+                    name in _INFRA_FILES
+                    or name.endswith(('_test.py', '_test.go', '_spec.rb', '.pth'))
+                    or (name.startswith('test_') and name.endswith('.py'))
+                    or (len(segments) > 2 and segments[-2] in ('test', 'spec', 'e2e') and segments[-1] in _JS_EXTS)
+                    or (len(segments) > 1 and segments[0] in _JS_TOOLS and segments[1] in ('config', 'conf', 'setup', 'workspace', 'preset'))
+                    or segments[0] == 'setuptests'
+                    or (len(segments) > 2 and segments[0] in ('jest', 'vitest') and segments[-1] in _JS_EXTS)
+                    or name.startswith(('.babelrc', '.mocharc', '.nycrc', '.c8rc'))
+                )
+
+
+            def _infra_reason(repo_root: Path, rel: str) -> str | None:
+                # Why *rel* is test infrastructure judging by its path alone, or None.
+                parts = _components(rel)
+                if not parts:
+                    return None
+                name, dirs = parts[-1], parts[:-1]
+                if any(
+                    part in _HARNESS_DIRS or part.endswith(('.egg-info', '.dist-info', '.egg'))
+                    for part in parts
+                ):
+                    return 'test harness or installed dependency'
+                raw = rel.split('/')
+                if any((repo_root / Path(*raw[:depth]) / 'pyvenv.cfg').is_file() for depth in range(len(raw))):
+                    return 'inside a virtualenv'
+                if _is_test_file(name):
+                    return 'test file or test configuration'
+                # A test setup file runs inside the test process, but ordinary modules are named
+                # *.setup.* too (src/i18n.setup.ts): refuse one named for a test tool or kept in
+                # a test directory.
+                segments = name.split('.')
+                if len(segments) > 2 and segments[-2] == 'setup' and segments[-1] in _JS_EXTS and (
+                    name.startswith(('test', 'jest', 'vitest', 'playwright'))
+                    or any(part in ('test', 'tests', '__tests__', 'e2e', 'spec') for part in dirs)
+                ):
+                    return 'test file or test configuration'
+                # In a test directory, refuse executable code (a helper a test imports, or a
+                # module that runs at import) and the package marker, but allow data fixtures.
+                if any(part in _TEST_DIRS for part in dirs):
+                    if name == '__init__.py':
+                        return 'test package marker'
+                    if name.rsplit('.', 1)[-1] in _CODE_EXTS and '.' in name:
+                        return 'code in a test directory'
+                return None
+
+
+            def _toml_table(value) -> dict:
+                # A parsed TOML value as a dict, or {} when it is some other shape.
+                return value if isinstance(value, dict) else {}
+
+
+            _TOML_LOADS = []
+
+
+            def _toml_loads(text: str) -> dict:
+                # Parse TOML with the image's stdlib tomllib if present, else the inlined copy.
+                # Raises on malformed TOML, which fails the check closed.
+                if not _TOML_LOADS:
+                    try:
+                        import tomllib
+
+                        _TOML_LOADS.append(tomllib.loads)
+                    except ModuleNotFoundError:
+                        namespace: dict = {}
+                        exec(compile(_VENDORED_TOML, 'vendored_toml', 'exec'), namespace)
+                        _TOML_LOADS.append(namespace['loads'])
+                return _TOML_LOADS[0](text)
+
+
+            def _test_part_changed(rel: str, old_text: str, new_text: str) -> bool | None:
+                # Whether the test-relevant part of config file *rel* changed, or None for a change
+                # it can't classify. Raises on anything it cannot parse or compare; the caller turns
+                # that into tampering (fails closed).
+                parts = _components(rel)
+                name = parts[-1]
+                if name == 'package.json':
+                    before = json.loads(old_text or '{}')
+                    after = json.loads(new_text or '{}')
+                    before = before if isinstance(before, dict) else {}
+                    after = after if isinstance(after, dict) else {}
+                    if any(before.get(key) != after.get(key) for key in _PACKAGE_KEYS):
+                        return True
+                    # A script named for tests (test, pretest, test:unit) is refused. One such a
+                    # script runs by name (npm run unit) may be the runner, and so may a nested
+                    # package's bin once a dependency is repointed to that package: uncertain. The
+                    # root package's own bin and any other script are a fix's business.
+                    scripts = [doc.get('scripts') if isinstance(doc.get('scripts'), dict) else {} for doc in (before, after)]
+                    keys = scripts[0].keys() | scripts[1].keys()
+                    changed = {key for key in keys if scripts[0].get(key) != scripts[1].get(key)}
+                    tests = {key for key in keys if 'test' in key}
+                    if changed & tests:
+                        return True
+                    related, frontier = set(), tests
+                    while frontier:
+                        text = ' '.join(str(script.get(key, '')) for script in scripts for key in frontier)
+                        frontier = {key for key in keys - tests - related if re.search(rf'(?<![\\w:.-]){re.escape(key)}(?![\\w:.-])', text)}
+                        related |= frontier
+                    related |= {key for key in keys if key[:3] == 'pre' and key[3:] in related or key[:4] == 'post' and key[4:] in related}
+                    nested_bin = len(parts) > 1 and before.get('bin') != after.get('bin')
+                    return None if changed & related or nested_bin else False
+                if name == 'setup.cfg':
+                    import configparser
+
+                    # interpolation=None: a '%(x)s' value must not raise; optionxform=str: pytest
+                    # reads option names case-sensitively, so a case-only change still counts.
+                    before, after = (configparser.ConfigParser(interpolation=None) for _ in range(2))
+                    before.optionxform = after.optionxform = str
+                    before.read_string(old_text)
+                    after.read_string(new_text)
+                    # [options] holds metadata, dependencies and entry points (console_scripts) a real
+                    # fix may change; only the pytest11 entry-point group registers pytest plugins.
+                    keys = ('tool:pytest', 'nosetests', 'tox:tox')
+
+                    def view(cfg):
+                        plugins = cfg.get('options.entry_points', 'pytest11', fallback=None)
+                        return {key: dict(cfg[key]) for key in cfg.sections() if key in keys}, plugins
+
+                    return view(before) != view(after)
+                # cargo.toml / pyproject.toml: _toml_loads parses exactly like the tools (dotted
+                # keys and inline tables normalize into these tables) and raises on a duplicate
+                # key, a redefined table or any syntax error, which fails closed above.
+                before, after = _toml_loads(old_text), _toml_loads(new_text)
+                if name == 'cargo.toml':
+                    # Every target table (with its `test` flag) and what only tests or build.rs
+                    # build with. [dependencies] is left out: a version bump there is a real fix.
+                    keys = ('lib', 'bin', 'test', 'bench', 'example', 'features',
+                            'dev-dependencies', 'build-dependencies')
+                    if any(before.get(key) != after.get(key) for key in keys):
+                        return True
+                    # [workspace] picks the crates that build and test (members, default-members,
+                    # exclude) and their shared dependencies; [workspace.package] is checked last.
+                    ws_before, ws_after = _toml_table(before.get('workspace')), _toml_table(after.get('workspace'))
+                    if dict(ws_before, package=None) != dict(ws_after, package=None):
+                        return True
+                    # Package-level auto-discovery and build script decide which tests cargo runs.
+                    auto = ('autotests', 'autobenches', 'autobins', 'autoexamples', 'autolib', 'build')
+                    pkg_before, pkg_after = _toml_table(before.get('package')), _toml_table(after.get('package'))
+                    if any(pkg_before.get(key) != pkg_after.get(key) for key in auto):
+                        return True
+                    # [workspace.package] is what members inherit (version.workspace = true): a listed
+                    # metadata key is a release bump; a change to any other key is uncertain.
+                    meta_before, meta_after = _toml_table(ws_before.get('package')), _toml_table(ws_after.get('package'))
+                    changed = {key for key in meta_before.keys() | meta_after.keys() if meta_before.get(key) != meta_after.get(key)}
+                    return None if changed - _WORKSPACE_METADATA else False
+                # [tool.tox] is compared whole, so its [testenv] commands count whether they sit
+                # in a legacy_tox_ini string or in env_run_base/env tables. Of the entry points, only
+                # the pytest11 group registers pytest plugins; console scripts are a fix's business.
+                tool_keys = ('pytest', 'coverage', 'tox', 'nose')
+                before_tool, after_tool = _toml_table(before.get('tool')), _toml_table(after.get('tool'))
+                plugins = [_toml_table(_toml_table(doc.get('project')).get('entry-points')).get('pytest11') for doc in (before, after)]
+                return (
+                    any(before_tool.get(key) != after_tool.get(key) for key in tool_keys)
+                    or before.get('build-system') != after.get('build-system')
+                    or plugins[0] != plugins[1]
+                )
+
+
+            def _config_tampered(rel: str, old: bytes | None, new: bytes | None) -> bool | None:
+                # Whether turning *old* into *new* changes the test-relevant part of config file
+                # *rel*, or None for a change it can't classify. Fails closed: a symlink, or anything
+                # that cannot be parsed and shown unchanged, counts as tampering, so a parse error
+                # becomes a trained zero, never a masked run.
+                parts = _components(rel)
+                name = parts[-1]
+                if _SYMLINK in (old, new):
+                    return True
+                if name == 'go.mod':
+                    # Adding or removing a go.mod below the root makes or merges a nested module,
+                    # which `go test ./...` skips or newly runs; editing one (a version bump) is a fix.
+                    return len(parts) > 1 and (old is None) != (new is None)
+                old_text = (old or b'').decode('utf-8', 'replace')
+                new_text = (new or b'').decode('utf-8', 'replace')
+                if old_text == new_text:
+                    return False
+                try:
+                    return _test_part_changed(rel, old_text, new_text)
+                except Exception:
+                    return True
+
+
+            def _mentioned(rel: str, text: str) -> bool:
+                # Whether the test command text may name *rel*. A wrong yes only masks a passing run,
+                # so a word naming rel's basename counts unless it plainly names another folder.
+                # Words are split at whitespace, quotes and shell punctuation (no shell parsing) and
+                # normalized like the patch paths; a glob matches as a glob. A relative word counts if
+                # rel may end with it (./ci.ini, sub/./ci.ini, sub/ci.ini after a cd), as does one
+                # whose folder is unknown (../, ~, $VAR, `cmd`); an absolute one only if it ends in
+                # /rel. So test/posts.js names another file than src/socket.io/posts.js, and
+                # test_calc.py is not calc.py. A Python file is also named by its module (-p plugin),
+                # under the same suffix rule. A value attached to a short flag (-cci.ini) is tried
+                # without the flag too; --opt=value is split at the '='.
+                base = rel.rsplit('/', 1)[-1]
+                stem = rel[:-3].removesuffix('/__init__') if rel.endswith('.py') else None
+                words = []
+                for word in filter(None, re.split(r'[\\s\\'"=:;,|&()<>]+', text)):
+                    words += [word, word[2:]] if re.match(r'-[A-Za-z].', word) else [word]
+                for word in words:
+                    if stem and re.fullmatch(r'[A-Za-z_][\\w.]*', word):
+                        module = word.replace('.', '/')
+                        if stem == module or stem.endswith('/' + module):
+                            return True
+                    norm = posixpath.normpath(word)
+                    if not fnmatch.fnmatchcase(base, norm.rsplit('/', 1)[-1]):
+                        continue
+                    if norm.startswith(('../', '~')) or '$' in norm or '`' in norm:
+                        return True
+                    if norm.startswith('/'):
+                        if re.search(r'[*?\\[]', norm) or norm.endswith('/' + rel):
+                            return True
+                    elif fnmatch.fnmatchcase(rel, norm) or fnmatch.fnmatchcase(rel, '*/' + norm):
+                        return True
+                return False
+
+
+            def _read_config(path: Path) -> bytes | None:
+                # A config file's bytes; a symlink reads as a sentinel no real file has.
+                if path.is_symlink():
+                    return _SYMLINK
+                return path.read_bytes() if path.is_file() else None
+
+
+            _MODE_RE = re.compile(r'^(old mode|new mode|new file mode|deleted file mode)\\s+([0-7]+)\\s*$')
+
+
+            def _mode_change_paths(patch_text: str) -> list[str]:
+                # The files that become or stop being symlinks, or change to a mode other than a
+                # plain file's 100644/100755. A symlink can aim a protected path at attacker content,
+                # so it is refused outright; an exec-bit flip (restoring bin/calc to 100755) is an
+                # ordinary fix unless the path itself is refused, which _infra_reason decides (git
+                # lists a mode-only change). The numeric mode is parsed so non-canonical git
+                # spellings (0120000, trailing space) cannot slip a symlink past an exact match.
+                flagged, current = [], '(file)'
+                for line in patch_text.splitlines():
+                    if line.startswith('diff --git '):
+                        current = line[len('diff --git ') :]
+                        continue
+                    match = _MODE_RE.match(line)
+                    if match is None:
+                        continue
+                    kind, mode = match.group(1), int(match.group(2), 8)
+                    plain = mode in (0o100644, 0o100755)
+                    if (mode & 0o170000) == 0o120000 or (kind in ('old mode', 'new mode') and not plain):
+                        flagged.append(current)
+                return list(dict.fromkeys(flagged))
+
+
+            def _git_root(repo_dir: Path, timeout: int) -> Path | None:
+                # The repository top-level: numstat reports paths relative to it, not to repo_dir.
+                # None when git cannot tell: guessing repo_dir (maybe a subdirectory) would check
+                # the wrong, missing files and grade a patch that edits the real ones.
+                # git appends exactly one newline, so strip only that -- a path may legitimately
+                # end in a space or '\\r', and either .strip() or text-mode newline translation
+                # would then name a different, missing directory. Read bytes and trim one '\\n'.
+                proc = subprocess.run(
+                    ['git', '-C', str(repo_dir), 'rev-parse', '--show-toplevel'],
+                    capture_output=True,
+                    timeout=timeout,
+                )
+                raw = proc.stdout[:-1] if proc.stdout.endswith(b'\\n') else proc.stdout
+                top = os.fsdecode(raw)
+                return Path(top) if proc.returncode == 0 and top else None
+
+
+            def _normalize(path: str) -> str | None:
+                # The one spelling every comparison uses: git's raw -z path through normpath, case
+                # as-is, so ./x, a/../x and x/ are all x. None when that is no plain path inside
+                # the repo (absolute, '..', empty); the caller treats such a path as uncertain.
+                norm = posixpath.normpath(path)
+                return None if norm.startswith(('/', '../')) or norm in ('.', '..') else norm
+
+
+            def _patch_paths(repo_dir: Path, patch_file: Path, timeout: int) -> list[str] | None:
+                # Every path a patch reads or writes, as git's own parser sees it: --numstat
+                # names each post-image path, -R --numstat each pre-image one, and -z emits raw
+                # (unquoted) bytes so non-ASCII names are not mis-parsed. Each is returned in its
+                # _normalize form, or raw if it has none.
                 paths = []
                 for reverse in ([], ['-R']):
                     proc = subprocess.run(
@@ -303,8 +720,15 @@ class PatchVerifier:
                     if proc.returncode != 0:
                         return None
                     records = proc.stdout.decode('utf-8', 'surrogateescape').split('\\0')
-                    paths += [record.split('\\t', 2)[2] for record in records if record]
-                return list(dict.fromkeys(paths))
+                    for record in records:
+                        fields = record.split('\\t', 2)
+                        # A path field present (3 fields, non-empty) is the changed path; a bare
+                        # record is a rename endpoint from the -z old/new form.
+                        if len(fields) == 3 and fields[2]:
+                            paths.append(fields[2])
+                        elif len(fields) == 1 and record:
+                            paths.append(record)
+                return list(dict.fromkeys(_normalize(path) or path for path in paths))
 
 
             def _snapshot(repo_dir: Path, paths: list[str]) -> dict:
@@ -465,7 +889,27 @@ class PatchVerifier:
                     # goes last, so no spelling of a path in the diff can change the tests.
                     test_patch_file = temp_dir / 'test_patch.diff'
                     test_patch_file.write_text(test_patch, encoding='utf-8')
-                    hidden = _hidden_paths(repo_dir, test_patch_file, timeout) if test_patch else []
+                    # Listing paths only parses the patches. If git stalls, the runner failed,
+                    # not the model, so there is no verdict and trainers mask the sample.
+                    try:
+                        hidden = _patch_paths(repo_dir, test_patch_file, timeout) if test_patch else []
+                        model_paths = _patch_paths(repo_dir, patch_path, timeout)
+                        repo_root = _git_root(repo_dir, timeout)
+                    except subprocess.TimeoutExpired:
+                        return _emit(
+                            {
+                                'schema_version': '1.0',
+                                'score': 0.0,
+                                'passed': False,
+                                'details': 'Listing the paths the patches touch timed out, so the patch was not scored.',
+                                'reward_components': {'apply': 0.0, 'tests': 0.0},
+                                'metrics': {'pass_fraction': 0.0, 'tests_run': 0},
+                                'truncated': False,
+                                'error_type': 'validation_timeout',
+                                'cases': [],
+                            },
+                            1,
+                        )
                     if hidden is None:
                         return _emit(
                             {
@@ -515,6 +959,53 @@ class PatchVerifier:
                             1,
                         )
 
+                    # Only the hidden test patch's own paths are put back below, so a diff
+                    # that touches any other test infrastructure is refused outright: a new
+                    # conftest.py, plugin, TestMain or runner config could make the tests
+                    # report a pass without running them.
+                    if model_paths is None:
+                        return _emit(
+                            {
+                                'schema_version': '1.0',
+                                'score': 0.0,
+                                'passed': False,
+                                'details': 'git cannot list the paths the patch touches.',
+                                'reward_components': {'apply': 0.0, 'tests': 0.0},
+                                'metrics': {'pass_fraction': 0.0, 'tests_run': 0},
+                                'truncated': False,
+                                'error_type': 'invalid_patch',
+                                'cases': [],
+                            },
+                            1,
+                        )
+                    if repo_root is None:
+                        # Without the top-level the paths can't be checked: no verdict, so
+                        # trainers mask the sample rather than grade an unchecked patch.
+                        return _emit(
+                            {
+                                'schema_version': '1.0',
+                                'score': 0.0,
+                                'passed': False,
+                                'details': 'git cannot find the repository top-level, so the patch was not scored.',
+                                'reward_components': {'apply': 0.0, 'tests': 0.0},
+                                'metrics': {'pass_fraction': 0.0, 'tests_run': 0},
+                                'truncated': False,
+                                'error_type': 'validation_error',
+                                'cases': [],
+                            },
+                            1,
+                        )
+                    hidden_set = set(hidden)
+                    exposed = [rel for rel in model_paths if rel not in hidden_set]
+                    tampered = {rel: _infra_reason(repo_root, rel) for rel in exposed}
+                    for flagged in _mode_change_paths(patch_text):
+                        tampered[flagged] = 'creates a symlink or a mode other than 100644/100755'
+                    configs = {
+                        rel: _read_config(repo_root / rel)
+                        for rel in exposed
+                        if _components(rel) and _components(rel)[-1] in _CONFIG_FILES
+                    }
+
                     apply_patch = subprocess.run(
                         ['git', '-C', str(repo_dir), 'apply', str(patch_path)],
                         capture_output=True,
@@ -536,6 +1027,30 @@ class PatchVerifier:
                             },
                             1,
                         )
+
+                    uncertain = {}
+                    for rel, old in configs.items():
+                        verdict = _config_tampered(rel, old, _read_config(repo_root / rel))
+                        if verdict:
+                            tampered[rel] = tampered[rel] or 'changes test configuration'
+                        elif verdict is None:
+                            uncertain[rel] = 'changes a config key that may affect the tests'
+                    tampered = {rel: reason for rel, reason in sorted(tampered.items()) if reason}
+                    if tampered:
+                        return _path_verdict(
+                            'test_infra_tampering',
+                            'Patch changes test infrastructure, so it was not tested: ',
+                            tampered,
+                        )
+                    # Not clearly tampering, not clearly safe: a path with no clean form, or a file
+                    # the (trusted) test command mentions, which it may load. The tests still run;
+                    # see below.
+                    command_text = '\\n'.join(test_commands)
+                    for rel in exposed:
+                        if _normalize(rel) is None:
+                            uncertain[rel] = 'the path does not normalize to one inside the repo'
+                        elif rel not in uncertain and _mentioned(rel, command_text):
+                            uncertain[rel] = 'the test command mentions it'
 
                     blocked = _restore(repo_dir, saved)
                     if blocked is not None:
@@ -596,6 +1111,15 @@ class PatchVerifier:
                             }
                         )
 
+                    # An uncertain edit gains nothing: failing tests score the normal 0 below, and a
+                    # pass that edit may have caused can't be trusted, so it gets no verdict (masked).
+                    if uncertain and passed_count:
+                        return _path_verdict(
+                            'validation_uncertain',
+                            'Tests passed, but the patch edits paths the guard cannot classify, so the pass was not scored: ',
+                            dict(sorted(uncertain.items())),
+                        )
+
                     pass_fraction = passed_count / len(test_commands)
                     score = apply_credit + (1 - apply_credit) * pass_fraction
                     return _emit(
@@ -633,7 +1157,10 @@ class SWEBenchProEnvironment(Environment):
     """SWE-bench Pro benchmark adapter."""
 
     name: str | None = 'swebench_pro'
-    task: str = 'Repair the repository by returning a unified diff patch.'
+    task: str = (
+        'Repair the repository by returning a unified diff patch. Change only the code: '
+        'a patch that touches tests or test configuration scores 0.'
+    )
     verifier_code: str = 'return 0.0'
     domain: str = 'software-engineering'
     tags: list[str] = Field(default_factory=lambda: ['benchmark', 'swebench-pro', 'patch'])
@@ -788,7 +1315,10 @@ class RepoPatchEnvironment(Environment):
     ``repo_dir``, such as the MiMo-V2.6-RL code subset. The model returns a unified
     diff; the SWE-bench Pro patch runner applies it, puts every file the hidden
     ``test_patch`` touches back to its prior state, applies the test patch, runs
-    ``test_command`` and scores 1.0 if it exits 0, else 0.0.
+    ``test_command`` and scores 1.0 if it exits 0, else 0.0. A diff that touches any
+    other test infrastructure (tests and their helper code, conftest.py, runner config,
+    installed dependencies) scores 0.0 with ``error_type='test_infra_tampering'``; data
+    fixtures the tests read may change.
 
     The runner and the tests run as root in the sandbox booted from ``image``:
     these test scripts expect root's toolchains and caches (``/root/go``,

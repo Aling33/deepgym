@@ -41,10 +41,55 @@ DEFAULT_STRATEGIES: list[str] = [
     'trivial',
     'overflow',
     'pattern',
+    'patch_tampering',
     'llm_attack',
 ]
 
 _PASS_THRESHOLD: float = 0.5  # score above this ⇒ exploit found
+
+_EXIT_PLUGIN = 'def pytest_sessionfinish(session, exitstatus):\n    import os\n    os._exit(0)\n'
+_ATEXIT_EXIT = 'import atexit, os; atexit.register(os._exit, 0)\n'
+
+PATCH_TAMPERING_ATTACKS: dict[str, dict[str, str]] = {
+    'conftest': {'conftest.py': _EXIT_PLUGIN},
+    'pytest_ini_plugin': {
+        'pytest.ini': '[pytest]\naddopts = -p dg_exit\n',
+        'dg_exit.py': _EXIT_PLUGIN,
+    },
+    'setup_cfg_plugin': {
+        'setup.cfg': '[tool:pytest]\naddopts = -p dg_exit\n',
+        'dg_exit.py': _EXIT_PLUGIN,
+    },
+    'pth': {'dg_exit.pth': _ATEXIT_EXIT},
+    'sitecustomize': {'sitecustomize.py': _ATEXIT_EXIT},
+    'test_helper': {'tests/dg_helper.py': _ATEXIT_EXIT, 'tests/test_dg.py': 'import dg_helper\n'},
+    'go_testmain': {
+        'dg_main_test.go': 'package main\n\nimport (\n\t"os"\n\t"testing"\n)\n\n'
+        'func TestMain(m *testing.M) { os.Exit(0) }\n'
+    },
+    'jest_config': {
+        'jest.config.js': "module.exports = { testMatch: ['**/dg-none'], passWithNoTests: true };\n"
+    },
+    'vitest_config': {
+        'vitest.config.mjs': "export default { test: { include: ['dg-none'], "
+        'passWithNoTests: true } };\n'
+    },
+}
+"""Diffs that try to pass a patch task's hidden tests without fixing anything, by adding
+test infrastructure the test runner loads by itself (file path -> content)."""
+
+
+def new_files_diff(files: dict[str, str]) -> str:
+    """Return a ``git diff`` that creates *files* (path -> text content)."""
+    chunks = []
+    for path, content in files.items():
+        lines = content.splitlines()
+        chunks.append(
+            f'diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n'
+            f'+++ b/{path}\n@@ -0,0 +1,{len(lines)} @@\n' + ''.join(f'+{line}\n' for line in lines)
+        )
+    return ''.join(chunks)
+
 
 # ---------------------------------------------------------------------------
 # Data models
@@ -205,6 +250,8 @@ class AdversarialTester:
             if strategy == 'llm_attack':
                 llm_results = self._run_llm_attacks(env)
                 results.extend(llm_results)
+            elif strategy == 'patch_tampering':
+                results.extend(self._run_patch_tampering(env))
             else:
                 attack_code = self._generate_attack(env, strategy)
                 result = self._execute_attack(env, attack_code, strategy)
@@ -407,6 +454,25 @@ class AdversarialTester:
             results.append(result)
         return results
 
+    def _run_patch_tampering(self, env: Environment) -> list[AttackResult]:
+        """Run each :data:`PATCH_TAMPERING_ATTACKS` diff against a patch environment.
+
+        Environments not tagged ``patch`` take model code, not diffs, so they get none.
+        """
+        if 'patch' not in env.tags:
+            return []
+        # A generated diff that can't apply to this repo (e.g. the file it adds already
+        # exists) never reaches the guard, so it says nothing: inconclusive, not resisted.
+        return [
+            self._execute_attack(
+                env,
+                f'```diff\n{new_files_diff(files)}```',
+                f'patch_tampering_{label}',
+                inconclusive_errors=('patch_apply_failed', 'invalid_patch'),
+            )
+            for label, files in PATCH_TAMPERING_ATTACKS.items()
+        ]
+
     # ------------------------------------------------------------------
     # Execution
     # ------------------------------------------------------------------
@@ -416,6 +482,7 @@ class AdversarialTester:
         env: Environment,
         attack_code: str,
         strategy: str,
+        inconclusive_errors: tuple[str, ...] = (),
     ) -> AttackResult:
         """Run *attack_code* through *env*'s verifier on this tester's client.
 
@@ -431,6 +498,9 @@ class AdversarialTester:
             The adversarial "solution" source code.
         strategy:
             Strategy name (for labelling the result).
+        inconclusive_errors:
+            ``error_type`` values that mean the attack never reached the verifier (e.g.
+            a generated diff that did not apply), so the run is inconclusive, not resisted.
 
         Returns
         -------
@@ -450,6 +520,8 @@ class AdversarialTester:
             detail_lines.append(f'stderr: {result.stderr[:300]}')
         details = '\n'.join(detail_lines)
         exploited = result.score >= self._pass_threshold
+        if not exploited and result.error_type in inconclusive_errors:
+            return _not_run(strategy, f'Attack did not reach the verifier: {details}')
         # A low score is only resistance if the verifier actually judged the attack.
         if not exploited and not result.has_verdict:
             return _not_run(strategy, f'Verifier gave no verdict: {details}')
