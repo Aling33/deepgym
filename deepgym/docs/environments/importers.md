@@ -307,8 +307,9 @@ deepgym qa --mode daytona ~/.deepgym/environments/osworld/<task id>
   earns nothing. OSWorld's evaluator is all-or-nothing; here a task with several rules
   pays the share it got right.
 - Whatever is at the result path, the verifier gives a verdict: a file it can't read
-  (missing, corrupt, not a regular file, or past the size limits) scores 0, never a
-  crash or a timeout, and a rule it can't evaluate fails.
+  (missing, corrupt, not a regular file, or past the size limits) scores 0, and a rule
+  it can't evaluate fails every rule. Reading and scoring run in a child process with
+  a 20 s and 1 GiB limit; a child that fails or overruns scores 0, never a timeout.
 - Each task ships a reference episode, `reference_actions.json`, that `deepgym qa`
   replays.
 - The output folder keeps OSWorld's `LICENSE` and a `NOTICE` that lists what was
