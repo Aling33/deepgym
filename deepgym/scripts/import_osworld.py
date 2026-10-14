@@ -11,6 +11,7 @@ computer-use environment folder per task:
   - variants.json   the rules (progress and guards), the reference data, result path
   - metadata.json   type, domain, tags, step budget and the Daytona snapshot
   - assets/<f>.b64  the starting file, staged into the session work directory
+  - reference_actions.json  a scripted episode that saves the reference end state
 
 The shared ``_checks.py`` (the readers and rule engine the verifier needs) is copied
 next to the environments, and ``registry.json`` indexes them all, so the imported
@@ -52,6 +53,9 @@ SNAPSHOT = 'deepgym-osworld-libreoffice'
 _SNAPSHOT_BASE = 'daytonaio/sandbox:0.9.0'
 """Daytona's desktop image (xfce, computer use) that the snapshot adds LibreOffice to."""
 _SNAPSHOT_PACKAGES = 'libreoffice-calc libreoffice-writer libreoffice-gtk3 fonts-dejavu-core'
+
+_REFERENCE_ACTIONS = Path(__file__).with_name('osworld_reference_actions.json')
+"""One scripted episode per task that saves the task's reference end state."""
 
 # (task id, OSWorld domain, environment name): the LibreOffice tasks whose evaluator
 # scores the file the task saves, so a DeepGym verifier can check them with no live
@@ -568,6 +572,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     install_shared(output_dir)
     checks = load_checks_module()
+    episodes = json.loads(_REFERENCE_ACTIONS.read_text(encoding='utf-8'))['episodes']
 
     entries = []
     for task_id, domain, title in TASKS:
@@ -581,6 +586,10 @@ def main() -> None:
                 gold = Path(tmp) / Path(task.gold_url).name
                 fetch_file(task.gold_url, gold)
             entries.append(build_environment(task, source, gold, output_dir, checks))
+        (output_dir / task_id / 'reference_actions.json').write_text(
+            json.dumps([episodes[task_id]], indent=1, ensure_ascii=False) + '\n',
+            encoding='utf-8',
+        )
 
     (output_dir / 'registry.json').write_text(
         json.dumps(entries, indent=2, ensure_ascii=False) + '\n', encoding='utf-8'

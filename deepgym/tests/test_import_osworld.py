@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from deepgym import ComputerUseEnvironment
+from deepgym import Action, ComputerUseEnvironment
 from deepgym.registry import load_environment_dir
 from tests.office_fixtures import Date, make_docx, make_xlsx
 
@@ -24,6 +24,7 @@ if str(scripts_dir) not in sys.path:
     sys.path.insert(0, str(scripts_dir))
 
 from import_osworld import (  # noqa: E402
+    _REFERENCE_ACTIONS,
     _TASK_API_URL,
     _TASK_URL,
     SNAPSHOT,
@@ -608,6 +609,15 @@ def test_the_imported_tasks_are_unique_libreoffice_tasks() -> None:
     assert {domain for _, domain, _ in TASKS} == {CALC, WRITER}
     titles = [title for _, _, title in TASKS]
     assert len(set(titles)) == len(titles) and all(titles)
+
+
+def test_every_imported_task_ships_a_reference_episode_within_its_budget() -> None:
+    episodes = json.loads(_REFERENCE_ACTIONS.read_text(encoding='utf-8'))['episodes']
+    assert set(episodes) == {task_id for task_id, _, _ in TASKS}
+    for task_id, actions in episodes.items():
+        parsed = [Action.model_validate(action) for action in actions]
+        assert parsed[-1].action_type == 'done', task_id
+        assert len(parsed) <= 30, task_id  # metadata.json's max_steps
 
 
 # --- Downloads: the fallbacks that make a blocked network work. ---
