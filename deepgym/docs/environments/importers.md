@@ -306,8 +306,9 @@ deepgym qa --mode daytona ~/.deepgym/environments/osworld/<task id>
   guard rather than progress, so saving the untouched file or adding a blank sheet
   earns nothing. OSWorld's evaluator is all-or-nothing; here a task with several rules
   pays the share it got right.
-- A saved file the readers can't read (missing, not a workbook, or past the size
-  limits) scores 0.
+- Whatever is at the result path, the verifier gives a verdict: a file it can't read
+  (missing, corrupt, not a regular file, or past the size limits) scores 0, never a
+  crash or a timeout, and a rule it can't evaluate fails.
 - Each task ships a reference episode, `reference_actions.json`, that `deepgym qa`
   replays.
 - The output folder keeps OSWorld's `LICENSE` and a `NOTICE` that lists what was

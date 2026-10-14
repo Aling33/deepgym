@@ -9,10 +9,18 @@ rules of an imported OSWorld task against the workbook the agent saved.
 from __future__ import annotations
 
 import json
+import math
+import os
 import re
+import signal
+import stat
+import threading
 import zipfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from xml.etree import ElementTree as ET
+from xml.parsers import expat
 
 
 def load_state(path: str = 'state.json') -> dict:
@@ -66,30 +74,112 @@ _REL_NS = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}
 _PKG_REL_NS = '{http://schemas.openxmlformats.org/package/2006/relationships}'
 _W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
 
-_COORD_RE = re.compile(r'([A-Z]+)(\d+)')
+_COORD_RE = re.compile(r'([A-Z]{1,3})([1-9][0-9]{0,6})')
+_MAX_ROW, _MAX_COL = 1_048_576, 16_384
+"""The largest row and column a spreadsheet cell can have."""
 
-_MAX_PART_BYTES = 32 << 20
-"""Largest unpacked XML part read from a saved file; a bigger one is unreadable."""
+_MAX_FILE_BYTES = 16 << 20
+"""Largest saved file read, packed or unpacked; a bigger one is unreadable."""
 _MAX_CELLS = 1_000_000
-"""Largest used range (rows x columns) read from a sheet; a bigger one is unreadable."""
+"""Most cells (used rows x columns, all sheets together) read from one workbook."""
+_READ_SECONDS = 15
+"""Longest a saved file may take to read; the verifier has 30 s in all."""
+_RULES_SECONDS = 10
+"""Longest the rules may take to evaluate."""
 
 
-def _read_part(archive: zipfile.ZipFile, name: str) -> ET.Element:
-    """Parse one XML part, refusing one that unpacks past :data:`_MAX_PART_BYTES`."""
-    if archive.getinfo(name).file_size > _MAX_PART_BYTES:
-        raise ValueError(f'{name} is larger than {_MAX_PART_BYTES} bytes')
-    return ET.fromstring(archive.read(name))
+@contextmanager
+def _deadline(seconds: float) -> Iterator[None]:
+    """Raise TimeoutError in the block once it has run *seconds*, as a backstop.
+
+    The bounds on the file keep every step short; this catches whatever they miss,
+    so a slow read scores 0 instead of the verifier running out of time. It needs
+    the main thread (where a verifier runs) and does nothing elsewhere.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def expire(*_: object) -> None:
+        raise TimeoutError(f'took longer than {seconds} s')
+
+    previous = signal.signal(signal.SIGALRM, expire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+@contextmanager
+def _open_package(path: str) -> Iterator[zipfile.ZipFile]:
+    """Open the saved file at *path* as a zip package.
+
+    The agent controls this file, so it is opened without blocking (a FIFO planted at
+    the path can't stall the verifier) and must be a regular file of at most
+    :data:`_MAX_FILE_BYTES`, packed and unpacked, whose parts are stored or deflated
+    (the methods :func:`_read_xml` reads with bounded output).
+
+    Raises:
+        ValueError: If the file is not a regular file, is too large or uses another
+            compression method.
+        OSError, zipfile.BadZipFile: If it can't be opened as a zip package.
+    """
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK), 'rb') as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError('not a regular file')
+        if info.st_size > _MAX_FILE_BYTES:
+            raise ValueError(f'larger than {_MAX_FILE_BYTES} bytes')
+        with zipfile.ZipFile(handle) as archive:
+            members = archive.infolist()
+            if sum(member.file_size for member in members) > _MAX_FILE_BYTES:
+                raise ValueError(f'unpacks to more than {_MAX_FILE_BYTES} bytes')
+            if any(
+                m.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED) for m in members
+            ):
+                raise ValueError('a part uses a compression method other than deflate')
+            yield archive
+
+
+def _read_xml(archive: zipfile.ZipFile, name: str) -> ET.Element:
+    """Parse one part, reading at most :data:`_MAX_FILE_BYTES` of it.
+
+    A bounded read() caps what is decompressed at the part's declared size, so a
+    part that unpacks to more than it declares fails its CRC check instead.
+    """
+    with archive.open(name) as member:
+        data = member.read(_MAX_FILE_BYTES + 1)
+    if len(data) > _MAX_FILE_BYTES:
+        raise ValueError(f'{name} unpacks to more than {_MAX_FILE_BYTES} bytes')
+    # Office parts never declare a DTD; refusing one rules out entity expansion.
+    scan = expat.ParserCreate()
+
+    def refuse(*_: object) -> None:
+        raise ValueError(f'{name} declares a DTD')
+
+    scan.StartDoctypeDeclHandler = refuse
+    scan.Parse(data, True)
+    return ET.fromstring(data)
 
 
 def _coord_to_cell(coord: str) -> tuple[int, int]:
-    """'C7' -> (row 7, column 3), both 1-based."""
+    """'C7' -> (row 7, column 3), both 1-based.
+
+    Raises:
+        ValueError: If *coord* is not a cell reference within a sheet's bounds.
+    """
     match = _COORD_RE.fullmatch(coord)
     if not match:
-        raise ValueError(f'not a cell coordinate: {coord!r}')
+        raise ValueError(f'not a cell coordinate: {coord[:20]!r}')
     col = 0
     for ch in match.group(1):
         col = col * 26 + (ord(ch) - ord('A') + 1)
-    return int(match.group(2)), col
+    row = int(match.group(2))
+    if row > _MAX_ROW or col > _MAX_COL:
+        raise ValueError(f'{coord} is outside a sheet')
+    return row, col
 
 
 def _number(text: str) -> int | float | None:
@@ -98,6 +188,8 @@ def _number(text: str) -> int | float | None:
         value = float(text)
     except ValueError:
         return None
+    if not math.isfinite(value):
+        raise ValueError(f'{text!r} is not a finite number')
     if value.is_integer() and abs(value) < 1e15:
         return int(value)
     return value
@@ -142,29 +234,42 @@ def _date_styles(archive: zipfile.ZipFile) -> set[int]:
     """
     if 'xl/styles.xml' not in archive.namelist():
         return set()
-    root = _read_part(archive, 'xl/styles.xml')
+    root = _read_xml(archive, 'xl/styles.xml')
     custom = {
         int(fmt.get('numFmtId', '-1')): fmt.get('formatCode', '')
         for fmt in root.iter(f'{_XLSX_NS}numFmt')
     }
+    if any(len(code) > 255 for code in custom.values()):  # longer than any real one
+        raise ValueError('a number format code is too long')
+    dated_ids = {
+        fmt_id
+        for fmt_id, code in custom.items()
+        if re.search(r'[dmyhs]', _FORMAT_NOISE.sub('', code.split(';')[0]), re.IGNORECASE)
+    } | (_DATE_FORMAT_IDS - set(custom))
     xfs = root.find(f'{_XLSX_NS}cellXfs')
-    dated = set()
-    for index, xf in enumerate([] if xfs is None else xfs.findall(f'{_XLSX_NS}xf')):
-        fmt_id = int(xf.get('numFmtId', '0'))
-        code = custom.get(fmt_id)
-        if code is None:
-            if fmt_id in _DATE_FORMAT_IDS:
-                dated.add(index)
-        elif re.search(r'[dmyhs]', _FORMAT_NOISE.sub('', code.split(';')[0]), re.IGNORECASE):
-            dated.add(index)
-    return dated
+    return {
+        index
+        for index, xf in enumerate([] if xfs is None else xfs.findall(f'{_XLSX_NS}xf'))
+        if int(xf.get('numFmtId', '0')) in dated_ids
+    }
 
 
 def _merge_ranges(root: ET.Element) -> list[str]:
+    """The sheet's merged ranges ('A1:C1').
+
+    Raises:
+        ValueError: If a range is not two cell references, so a malformed merge makes
+            the file unreadable (a 0) instead of failing one rule while others pass.
+    """
     merges = root.find(f'{_XLSX_NS}mergeCells')
     if merges is None:
         return []
-    return [cell.get('ref', '') for cell in merges.findall(f'{_XLSX_NS}mergeCell')]
+    refs = [cell.get('ref', '') for cell in merges.findall(f'{_XLSX_NS}mergeCell')]
+    for ref in refs:
+        start, _, end = ref.partition(':')
+        _coord_to_cell(start)
+        _coord_to_cell(end)
+    return refs
 
 
 def _trim(grid: list[list[object]]) -> list[list[object]]:
@@ -177,7 +282,9 @@ def _trim(grid: list[list[object]]) -> list[list[object]]:
     return grid
 
 
-def _sheet_grid(root: ET.Element, shared: list[str], dated: set[int]) -> list[list[object]]:
+def _sheet_grid(
+    root: ET.Element, shared: list[str], dated: set[int], budget: int
+) -> list[list[object]]:
     """Rows of cell values over the sheet's used range; missing cells are None.
 
     The used range ends at the last non-empty row and column, as after :func:`_trim`.
@@ -185,7 +292,7 @@ def _sheet_grid(root: ET.Element, shared: list[str], dated: set[int]) -> list[li
     ``{'date': serial}``, so it only equals the same serial shown as a date.
 
     Raises:
-        ValueError: If the used range holds more than :data:`_MAX_CELLS` cells.
+        ValueError: If the used range holds more than *budget* cells.
     """
     cells: dict[tuple[int, int], object] = {}
     max_row = 0
@@ -207,7 +314,7 @@ def _sheet_grid(root: ET.Element, shared: list[str], dated: set[int]) -> list[li
             cells[(r, c)] = value
             max_row = max(max_row, r)
             max_col = max(max_col, c)
-    if max_row * max_col > _MAX_CELLS:
+    if max_row * max_col > budget:
         raise ValueError(f'used range of {max_row} x {max_col} cells is too large')
     grid: list[list[object]] = []
     for r in range(1, max_row + 1):
@@ -217,8 +324,8 @@ def _sheet_grid(root: ET.Element, shared: list[str], dated: set[int]) -> list[li
 
 def _sheet_parts(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
     """(sheet name, part name) for every sheet, in workbook order."""
-    workbook = _read_part(archive, 'xl/workbook.xml')
-    rels = _read_part(archive, 'xl/_rels/workbook.xml.rels')
+    workbook = _read_xml(archive, 'xl/workbook.xml')
+    rels = _read_xml(archive, 'xl/_rels/workbook.xml.rels')
     targets = {
         rel.get('Id'): rel.get('Target') for rel in rels.findall(f'{_PKG_REL_NS}Relationship')
     }
@@ -246,24 +353,33 @@ def read_sheets(path: str) -> list[tuple[str, list[list[object]], list[str]]]:
         booleans, error text, or None for an empty cell.
 
     Raises:
-        ValueError: If the file is missing or not a readable workbook.
+        ValueError: If the file is missing or can't be read for any reason: the
+            verifier scores that a 0, since the agent controls the file.
     """
     try:
-        with zipfile.ZipFile(path) as archive:
+        with _deadline(_READ_SECONDS), _open_package(path) as archive:
             shared_node = None
             if 'xl/sharedStrings.xml' in archive.namelist():
-                shared_node = _read_part(archive, 'xl/sharedStrings.xml')
+                shared_node = _read_xml(archive, 'xl/sharedStrings.xml')
             shared = [
                 ''.join(t.text or '' for t in si.iter(f'{_XLSX_NS}t'))
                 for si in (shared_node if shared_node is not None else [])
             ]
             dated = _date_styles(archive)
             sheets = []
+            budget = _MAX_CELLS
+            parsed: dict[str, tuple[list[list[object]], list[str]]] = {}
             for name, part in _sheet_parts(archive):
-                root = _read_part(archive, part)
-                sheets.append((name, _sheet_grid(root, shared, dated), _merge_ranges(root)))
+                if part not in parsed:  # sheets naming one part parse it once
+                    root = _read_xml(archive, part)
+                    parsed[part] = (_sheet_grid(root, shared, dated, budget), _merge_ranges(root))
+                grid, merges = parsed[part]
+                budget -= len(grid) * max((len(row) for row in grid), default=0)
+                if budget < 0:
+                    raise ValueError(f'more than {_MAX_CELLS} cells')
+                sheets.append((name, grid, merges))
             return sheets
-    except (OSError, zipfile.BadZipFile, KeyError, ET.ParseError) as exc:
+    except Exception as exc:  # any way the agent's file breaks reading is a scored 0
         raise ValueError(f'{path} is not a readable workbook: {exc}') from exc
 
 
@@ -299,13 +415,14 @@ def read_docx_text(path: str) -> str:
         The normalized text.
 
     Raises:
-        ValueError: If the file is missing or not a readable document.
+        ValueError: If the file is missing or can't be read for any reason: the
+            verifier scores that a 0, since the agent controls the file.
     """
     try:
-        with zipfile.ZipFile(path) as archive:
+        with _deadline(_READ_SECONDS), _open_package(path) as archive:
             # The main part is the one the package's officeDocument relationship names,
             # as python-docx resolves it, not whatever sits at word/document.xml.
-            rels = _read_part(archive, '_rels/.rels')
+            rels = _read_xml(archive, '_rels/.rels')
             main = [
                 rel.get('Target', '').lstrip('/')
                 for rel in rels.findall(f'{_PKG_REL_NS}Relationship')
@@ -313,13 +430,10 @@ def read_docx_text(path: str) -> str:
             ]
             if len(main) != 1:
                 raise ValueError(f'{len(main)} main document parts')
-            root = _read_part(archive, main[0])
-    except (OSError, zipfile.BadZipFile, KeyError, ET.ParseError) as exc:
-        raise ValueError(f'{path} is not a readable document: {exc}') from exc
-    body = root.find(f'{_W_NS}body')
-    paragraphs = []
-    if body is not None:
-        for para in body:
+            root = _read_xml(archive, main[0])
+        body = root.find(f'{_W_NS}body')
+        paragraphs = []
+        for para in [] if body is None else body:
             if para.tag != f'{_W_NS}p':
                 continue
             text_parts = []
@@ -331,7 +445,9 @@ def read_docx_text(path: str) -> str:
                         if run.tag == f'{_W_NS}r':
                             text_parts.append(_run_text(run))
             paragraphs.append(''.join(text_parts))
-    return re.sub(r'\s+', ' ', '\n'.join(paragraphs)).strip()
+        return re.sub(r'\s+', ' ', '\n'.join(paragraphs)).strip()
+    except Exception as exc:  # any way the agent's file breaks reading is a scored 0
+        raise ValueError(f'{path} is not a readable document: {exc}') from exc
 
 
 def _np_round(value: float, precision: int) -> float:
@@ -342,7 +458,10 @@ def _np_round(value: float, precision: int) -> float:
     round(-0.00005, 4) == -0.0001 while numpy rounds it to -0.0.
     """
     scale = 10**precision
-    return round(value * scale) / scale
+    scaled = value * scale
+    if not math.isfinite(scaled):  # too large to round; pandas leaves it as it is
+        return value
+    return round(scaled) / scale
 
 
 def _is_number(value: object) -> bool:
@@ -568,17 +687,25 @@ def office_rule_checks(
     Returns:
         {rule name, e.g. 'rule0_sheet_data': passed}; a rule whose sheets, indices
         or cells cannot be resolved fails. A rule's 'name', when it has one, is
-        used as its key.
+        used as its key. If any rule can't be evaluated at all, every rule fails, so
+        an evaluation error can never leave partial credit standing.
     """
     names_r = [sheet[0] for sheet in result or []]
     names_e = [sheet[0] for sheet in expected or []]
-    checks = {}
+    names: list[str] = []
     for index, rule in enumerate(rules):
         name = str(rule.get('name') or f'rule{index}_{rule.get("type", "?")}')
-        while name in checks:  # two rules must never share one verdict slot
+        while name in names:  # two rules must never share one verdict slot
             name += '_'
-        checks[name] = _rule_verdict(rule, result, expected, names_r, names_e)
-    return checks
+        names.append(name)
+    try:
+        with _deadline(_RULES_SECONDS):
+            return {
+                name: _rule_verdict(rule, result, expected, names_r, names_e)
+                for name, rule in zip(names, rules)
+            }
+    except Exception:  # a rule that can't decide fails closed, and so does every other
+        return dict.fromkeys(names, False)
 
 
 # }}} Office files #

@@ -6,8 +6,13 @@ importer's own functions are the ones under test.
 
 import base64
 import copy
+import io
 import json
+import math
+import os
+import re
 import shutil
+import struct
 import subprocess
 import sys
 import zipfile
@@ -159,7 +164,7 @@ def _run_verifier(env: ComputerUseEnvironment, home: Path, work: Path) -> dict:
         text=True,
         cwd=work,
         env={'HOME': str(work), 'DEEPGYM_AGENT_HOME': str(home)},
-        timeout=60,
+        timeout=25,  # under the 30 s a session gives the verifier
     )
     assert proc.returncode == 0, proc.stderr
     return json.loads(proc.stdout.strip().splitlines()[-1])
@@ -357,17 +362,278 @@ def test_a_date_only_matches_a_cell_shown_as_that_date(tmp_path: Path, work: Pat
         assert _run_verifier(env, home, work)['score'] == score, label
 
 
-def test_a_saved_file_too_large_to_read_scores_zero(tmp_path: Path, work: Path) -> None:
-    """One cell at the far corner of a sheet would make a dense grid of a billion
-    cells: the workbook counts as unreadable (a scored 0), not a verifier crash."""
+def _patch_zip(data: bytes, member: str, edit) -> bytes:
+    """*data* with *edit(header, payload)* applied to *member*'s local header and data."""
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        info = archive.getinfo(member)
+    start = info.header_offset
+    name_len, extra_len = struct.unpack('<HH', data[start + 26 : start + 30])
+    body = start + 30 + name_len + extra_len
+    header, payload = bytearray(data[start:body]), bytearray(data[body:])
+    edit(header, payload)
+    return data[:start] + bytes(header) + bytes(payload)
+
+
+def _headers(data: bytes, local: int, central: int, update) -> bytes:
+    """*data* with the 2-byte field at *local* / *central* of every member's local and
+    central directory header replaced by *update(old value)*."""
+    out = bytearray(data)
+    for signature, offset in ((b'PK\x03\x04', local), (b'PK\x01\x02', central)):
+        at = out.find(signature)
+        while at != -1:
+            (value,) = struct.unpack('<H', out[at + offset : at + offset + 2])
+            out[at + offset : at + offset + 2] = struct.pack('<H', update(value))
+            at = out.find(signature, at + 4)
+    return bytes(out)
+
+
+def _flip(_: bytearray, payload: bytearray) -> None:
+    for at in range(8, 40):
+        payload[at] ^= 0xFF
+
+
+_X = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+_STYLE_BOMB = (
+    f'<styleSheet xmlns="{_X}"><numFmts><numFmt numFmtId="164" formatCode="{"[" * 1_000_000}"/>'
+    '</numFmts><cellXfs><xf numFmtId="164"/></cellXfs></styleSheet>'
+)
+"""A 1 MB format code that a backtracking regex would take minutes over."""
+_REF_BOMB = (
+    f'<worksheet xmlns="{_X}"><sheetData><row r="1">'
+    f'<c r="{"A" * 2_000_000}1"><v>1</v></c></row></sheetData></worksheet>'
+)
+"""A cell reference two million letters long."""
+_DTD = (
+    '<?xml version="1.0"?><!DOCTYPE worksheet [<!ENTITY a "aaaaaaaaaa">'
+    '<!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">]>'
+    f'<worksheet xmlns="{_X}"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>&b;</t>'
+    '</is></c></row></sheetData></worksheet>'
+)
+"""A sheet that declares entities: office parts never carry a DTD."""
+
+
+def _repacked(path: Path, good: bytes, parts: dict[str, str], method: int = zipfile.ZIP_DEFLATED):
+    """Write *good*'s parts to *path*, replaced or added from *parts*."""
+    with zipfile.ZipFile(io.BytesIO(good)) as source, zipfile.ZipFile(path, 'w', method) as out:
+        for name in source.namelist():
+            out.writestr(name, parts.pop(name, None) or source.read(name))
+        for name, text in parts.items():
+            out.writestr(name, text)
+
+
+def _understated(path: Path, good: bytes) -> None:
+    """The sheet part padded to 20 MB unpacked while it declares only its real size."""
+    sheet = 'xl/worksheets/sheet1.xml'
+    with zipfile.ZipFile(io.BytesIO(good)) as source:
+        real = source.read(sheet)
+    _repacked(path, good, {sheet: real.decode() + ' ' * (20 << 20)})
+    data = bytearray(path.read_bytes())
+    for signature, size_at, name_at in ((b'PK\x03\x04', 22, 30), (b'PK\x01\x02', 24, 46)):
+        at = data.find(signature)
+        while at != -1:
+            if data[at + name_at : at + name_at + len(sheet)] == sheet.encode():
+                data[at + size_at : at + size_at + 4] = struct.pack('<I', len(real))
+            at = data.find(signature, at + 4)
+    path.write_bytes(bytes(data))
+
+
+def _one_part_many_sheets(path: Path, tmp_path: Path) -> None:
+    """1,001 sheets that all name one 1,000-cell part: past the cell budget together."""
+    column = {f'A{row}': row for row in range(1, 1001)}
+    base = make_xlsx(tmp_path / 'one.xlsx', [('Sheet1', column, [])])
+    sheets = ''.join(f'<sheet name="S{i}" sheetId="{i + 1}" r:id="rId1"/>' for i in range(1001))
+    with zipfile.ZipFile(base) as source, zipfile.ZipFile(path, 'w') as out:
+        for name in source.namelist():
+            data = source.read(name).decode()
+            if name == 'xl/workbook.xml':
+                data = re.sub('<sheets>.*</sheets>', f'<sheets>{sheets}</sheets>', data)
+            out.writestr(name, data)
+
+
+def _plant(label: str, path: Path, tmp_path: Path) -> None:
+    """Leave *path* the way an agent could, by the GUI or a macro, instead of saving."""
+    good = make_xlsx(tmp_path / 'good.xlsx', [('Sheet1', _GOLD, _MERGED)]).read_bytes()
+    deflated = tmp_path / 'deflated.xlsx'
+    with zipfile.ZipFile(io.BytesIO(good)) as source:
+        with zipfile.ZipFile(deflated, 'w', zipfile.ZIP_DEFLATED) as out:
+            for name in source.namelist():
+                out.writestr(name, source.read(name))
+    sheet = 'xl/worksheets/sheet1.xml'
+    pipe = tmp_path / 'pipe'
+    writers = {
+        'empty file': lambda: path.write_bytes(b''),
+        'not a zip': lambda: path.write_bytes(b'not a workbook'),
+        'truncated': lambda: path.write_bytes(good[: len(good) // 2]),
+        'corrupt deflate stream': lambda: path.write_bytes(
+            _patch_zip(deflated.read_bytes(), sheet, _flip)
+        ),
+        'encrypted parts': lambda: path.write_bytes(_headers(good, 6, 8, lambda v: v | 1)),
+        'unsupported compression': lambda: path.write_bytes(_headers(good, 8, 10, lambda v: 99)),
+        'unpacks past the limit': lambda: _repacked(
+            path, good, {'xl/padding.xml': ' ' * (17 << 20)}
+        ),
+        'unpacks past what it declares': lambda: _understated(path, good),
+        'a bzip2 part': lambda: _repacked(path, good, {}, zipfile.ZIP_BZIP2),
+        'a format code past any real one': lambda: _repacked(
+            path, good, {'xl/styles.xml': _STYLE_BOMB}
+        ),
+        'a cell reference past any real one': lambda: _repacked(
+            path, good, {'xl/worksheets/sheet1.xml': _REF_BOMB}
+        ),
+        'a malformed merge': lambda: make_xlsx(path, [('Sheet1', _GOLD, ['A1:BAD'])]),
+        'a DTD': lambda: _repacked(path, good, {'xl/worksheets/sheet1.xml': _DTD}),
+        'infinite number': lambda: make_xlsx(path, [('Sheet1', {**_GOLD, 'C1': math.inf}, [])]),
+        'one part named by many sheets': lambda: _one_part_many_sheets(path, tmp_path),
+        'used range too large': lambda: make_xlsx(
+            path, [('Sheet1', {**_GOLD, 'AMJ1048576': 'x'}, _MERGED)]
+        ),
+        'a directory': path.mkdir,
+        'a FIFO': lambda: os.mkfifo(path),
+        'a link to a FIFO': lambda: (os.mkfifo(pipe), path.symlink_to(pipe)),
+        'a dangling link': lambda: path.symlink_to(tmp_path / 'gone.xlsx'),
+        'unreadable': lambda: (path.write_bytes(good), path.chmod(0)),
+    }
+    if label != 'missing':
+        writers[label]()
+
+
+@pytest.mark.parametrize(
+    'label',
+    [
+        'missing',
+        'empty file',
+        'not a zip',
+        'truncated',
+        'corrupt deflate stream',
+        'encrypted parts',
+        'unsupported compression',
+        'unpacks past the limit',
+        'unpacks past what it declares',
+        'a bzip2 part',
+        'a format code past any real one',
+        'a cell reference past any real one',
+        'a malformed merge',
+        'a DTD',
+        'infinite number',
+        'used range too large',
+        'one part named by many sheets',
+        'a directory',
+        'a FIFO',
+        'a link to a FIFO',
+        'a dangling link',
+        'unreadable',
+    ],
+)
+def test_a_saved_workbook_the_agent_broke_is_a_judged_zero(
+    label: str, tmp_path: Path, work: Path
+) -> None:
+    """Whatever the agent leaves at the result path, the verifier gives a verdict (it
+    exits 0 with protocol JSON) and scores 0, never a crash or a hang (no verdict)."""
+    if label == 'unreadable' and os.geteuid() == 0:
+        pytest.skip('root reads a file whatever its mode')
     env, _ = _calc_env(tmp_path)
     home = tmp_path / 'home'
-    _save(tmp_path, home, {**_GOLD, 'AMJ1048576': 'x'}, _MERGED)
+    (home / 'Desktop').mkdir(parents=True)
+    _plant(label, home / 'Desktop' / FILE, tmp_path)
 
     result = _run_verifier(env, home, work)
 
     assert result['score'] == 0.0
     assert 'workbook_saved' in result['details']
+
+
+def test_a_valid_file_with_700k_styles_is_read_in_time(tmp_path: Path, work: Path) -> None:
+    """700,000 cell styles sharing one long format code: each code is classified
+    once, so the verifier still finishes within its budget (and the file is correct)."""
+    env, _ = _calc_env(tmp_path)
+    home = tmp_path / 'home'
+    (home / 'Desktop').mkdir(parents=True)
+    good = make_xlsx(tmp_path / 'good.xlsx', [('Sheet1', _GOLD, _MERGED)]).read_bytes()
+    code = '&quot;' + 'x' * 240 + '&quot; yyyy'
+    xfs = '<xf numFmtId="164"/>' * 700_000
+    styles = (
+        f'<styleSheet xmlns="{_X}"><numFmts><numFmt numFmtId="164" formatCode="{code}"/>'
+        f'</numFmts><cellXfs>{xfs}</cellXfs></styleSheet>'
+    )
+    _repacked(home / 'Desktop' / FILE, good, {'xl/styles.xml': styles})
+
+    assert _run_verifier(env, home, work)['score'] == 1.0
+
+
+def test_the_read_deadline_raises_inside_a_slow_block() -> None:
+    checks = load_checks_module()
+    with pytest.raises(TimeoutError), checks._deadline(0.05):
+        while True:
+            pass
+
+
+def test_unsaved_changes_and_a_wrong_sheet_name_are_judged_zeros(
+    tmp_path: Path, work: Path
+) -> None:
+    """Changes left unsaved leave the starting file, and the right data on a sheet
+    with the wrong name fails the rule that names the sheet: both are a scored 0."""
+    source = make_xlsx(tmp_path / 'source.xlsx', [('Sheet1', _START, [])])
+    summary = {'A1': 'Total', 'A2': 1500}
+    gold = make_xlsx(tmp_path / 'gold.xlsx', [('Sheet1', _START, []), ('Sheet2', summary, [])])
+    rules = [{'type': 'sheet_data', 'sheet_idx0': 'RNSheet2', 'sheet_idx1': 'ENSheet2'}]
+    env, _ = _import(tmp_path, _task_config(rules=rules), source, gold)
+
+    home = tmp_path / 'home'
+    (home / 'Desktop').mkdir(parents=True)
+    saved = home / 'Desktop' / FILE
+    for label, sheets, score in (
+        ('changes left unsaved', [('Sheet1', _START, [])], 0.0),
+        ('wrong sheet name', [('Sheet1', _START, []), ('Sheet 2', summary, [])], 0.0),
+        ('finished', [('Sheet1', _START, []), ('Sheet2', summary, [])], 1.0),
+    ):
+        make_xlsx(saved, sheets)
+        assert _run_verifier(env, home, work)['score'] == score, label
+
+
+@pytest.mark.parametrize('label', ['missing', 'not a zip', 'a FIFO', 'no package', 'two mains'])
+def test_a_saved_document_the_agent_broke_is_a_judged_zero(
+    label: str, tmp_path: Path, work: Path
+) -> None:
+    env, _ = _doc_env(tmp_path)
+    home = tmp_path / 'home'
+    (home / 'Desktop').mkdir(parents=True)
+    saved = home / 'Desktop' / DOC
+    with zipfile.ZipFile(make_docx(tmp_path / 'gold-copy.docx', _DOC_GOLD)) as gold:
+        document = gold.read('word/document.xml')
+        rels = gold.read('_rels/.rels').decode()
+    if label == 'not a zip':
+        saved.write_bytes(b'not a document')
+    elif label == 'a FIFO':
+        os.mkfifo(saved)
+    elif label in ('no package', 'two mains'):
+        with zipfile.ZipFile(saved, 'w') as archive:
+            archive.writestr('word/document.xml', document)
+            if label == 'two mains':
+                twice = rels.replace('</Relationships>', rels[rels.index('<Relationship ') :])
+                archive.writestr('_rels/.rels', twice.replace('rId1"', 'rId2"', 1))
+
+    result = _run_verifier(env, home, work)
+
+    assert result['score'] == 0.0
+    assert 'document_saved' in result['details']
+
+
+def test_a_rule_that_cannot_be_evaluated_fails_closed() -> None:
+    checks = load_checks_module()
+    sheets = [('Sheet1', [['Item']], [])]
+    holds = {
+        'type': 'check_cell',
+        'sheet_idx': 0,
+        'coordinate': 'A1',
+        'props': {'value': {'method': 'eq', 'ref': 'Item'}},
+    }
+    broken = {'type': 'check_cell', 'sheet_idx': 0, 'coordinate': 'A1', 'props': ['value']}
+    assert checks.office_rule_checks([holds], sheets, None) == {'rule0_check_cell': True}
+    # One rule that can't be evaluated fails every rule: no partial credit survives it.
+    assert checks.office_rule_checks([holds, broken], sheets, None) == {
+        'rule0_check_cell': False,
+        'rule1_check_cell': False,
+    }
 
 
 def test_the_main_document_part_is_the_one_the_package_names(tmp_path: Path) -> None:
