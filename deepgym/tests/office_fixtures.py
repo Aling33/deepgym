@@ -24,11 +24,15 @@ class Date(int):
     """A serial number in a cell formatted as a date (built-in number format 14)."""
 
 
+class Duration(int):
+    """A serial number in a cell formatted as elapsed time (built-in format 46, [h]:mm:ss)."""
+
+
 def make_xlsx(path: Path, sheets: list[tuple[str, dict[str, object], list[str]]]) -> Path:
     """Write a minimal workbook: one entry per sheet, (name, cells, merged ranges).
 
-    A cell value may be a number, a bool, a Date, a str (shared string) or an Inline
-    (an inline string); a cell left out is empty. Cells are 1-based references like 'C7'.
+    A cell value may be a number, a bool, a Date, a Duration, a str (shared string) or
+    an Inline (an inline string); a cell left out is empty. Cells are 1-based references like 'C7'.
     """
     shared: dict[str, int] = {}
     parts = []
@@ -43,6 +47,7 @@ def make_xlsx(path: Path, sheets: list[tuple[str, dict[str, object], list[str]]]
     members.update({f'xl/worksheets/sheet{index}.xml': xml for _, xml, index in parts})
     if shared:
         members['xl/sharedStrings.xml'] = _shared_xml(shared)
+    members['[Content_Types].xml'] = _content_types(members)
     with zipfile.ZipFile(path, 'w') as archive:
         for member, xml in members.items():
             archive.writestr(member, xml)
@@ -54,6 +59,8 @@ def _cell_xml(ref: str, value: object, shared: dict[str, int]) -> str:
         return f'<c r="{ref}" t="b"><v>{int(value)}</v></c>'
     if isinstance(value, Date):
         return f'<c r="{ref}" s="1"><v>{int(value)}</v></c>'
+    if isinstance(value, Duration):
+        return f'<c r="{ref}" s="2"><v>{int(value)}</v></c>'
     if isinstance(value, (int, float)):
         return f'<c r="{ref}"><v>{value!r}</v></c>'
     if isinstance(value, Inline):
@@ -83,10 +90,11 @@ def _sheet_xml(cells: dict[str, object], merges: list[str], shared: dict[str, in
 
 
 _STYLES_XML = (
-    f'<styleSheet xmlns="{_XLSX_NS}"><cellXfs count="2">'
-    '<xf numFmtId="0"/><xf numFmtId="14" applyNumberFormat="1"/></cellXfs></styleSheet>'
+    f'<styleSheet xmlns="{_XLSX_NS}"><cellXfs count="3"><xf numFmtId="0"/>'
+    '<xf numFmtId="14" applyNumberFormat="1"/><xf numFmtId="46" applyNumberFormat="1"/>'
+    '</cellXfs></styleSheet>'
 )
-"""Style 0 is General, style 1 a date."""
+"""Style 0 is General, style 1 a date, style 2 elapsed time."""
 
 
 def _shared_xml(shared: dict[str, int]) -> str:
@@ -102,6 +110,30 @@ def _workbook_xml(names: list[str]) -> str:
         for index, name in enumerate(names, start=1)
     )
     return f'<workbook xmlns="{_XLSX_NS}" xmlns:r="{_REL_NS}"><sheets>{sheets}</sheets></workbook>'
+
+
+_SHEET_TYPES = 'application/vnd.openxmlformats-officedocument.spreadsheetml'
+_CT_NS = 'http://schemas.openxmlformats.org/package/2006/content-types'
+
+
+def _content_types(members: dict[str, str]) -> str:
+    """[Content_Types].xml declaring the workbook, sheets, shared strings and styles."""
+    kinds = {
+        'xl/workbook.xml': 'sheet.main+xml',
+        'xl/sharedStrings.xml': 'sharedStrings+xml',
+        'xl/styles.xml': 'styles+xml',
+    }
+    overrides = ''.join(
+        f'<Override PartName="/{name}" ContentType="{_SHEET_TYPES}.'
+        f'{kinds.get(name, "worksheet+xml")}"/>'
+        for name in members
+        if name.startswith('xl/') and name.endswith('.xml') and '_rels' not in name
+    )
+    return (
+        f'<Types xmlns="{_CT_NS}"><Default Extension="rels" '
+        'ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        f'{overrides}</Types>'
+    )
 
 
 def _package_rels(main: str) -> str:

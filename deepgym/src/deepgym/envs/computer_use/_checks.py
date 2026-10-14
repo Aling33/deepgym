@@ -76,6 +76,7 @@ _XLSX_NS = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
 _REL_NS = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}'
 _PKG_REL_NS = '{http://schemas.openxmlformats.org/package/2006/relationships}'
 _W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+_CT_NS = '{http://schemas.openxmlformats.org/package/2006/content-types}'
 
 _COORD_RE = re.compile(r'([A-Z]{1,3})([1-9][0-9]{0,6})')
 _MAX_ROW, _MAX_COL = 1_048_576, 16_384
@@ -294,19 +295,25 @@ def _cell_value(cell: ET.Element, shared: list[str]) -> object:
 
 
 _DATE_FORMAT_IDS = frozenset({14, 15, 16, 17, 18, 19, 20, 21, 22, 45, 46, 47})
+_DURATION_FORMAT_IDS = frozenset({46})
+"""Built-in formats openpyxl reads as a duration ([h]:mm:ss) rather than a date."""
+_ELAPSED = re.compile(r'\[(h+|m+|s+)\]', re.IGNORECASE)
+"""An elapsed-time section, which makes a format a duration."""
 """Built-in number formats that show a date or time."""
 _FORMAT_NOISE = re.compile(r'"[^"]*"|\\.|_.|\*.|\[[^\]]*\]')
 """Quoted text, escapes, padding and [colour/locale/elapsed] sections of a format code."""
 
 
-def _date_styles(archive: zipfile.ZipFile, part: str | None) -> set[int]:
-    """Indexes of the cell styles in styles *part* whose number format shows a date.
+def _date_styles(archive: zipfile.ZipFile, part: str | None) -> dict[int, str]:
+    """{style index: 'date' or 'duration'} for the cell styles in styles *part* whose
+    number format shows a date, time or elapsed time.
 
-    openpyxl reads a number in such a cell as a datetime, so pandas never equates it
-    with a plain number; :func:`_sheet_grid` marks those cells the same way.
+    openpyxl reads a number in such a cell as a datetime, a time or a timedelta, so
+    pandas never equates it with a plain number or with another kind;
+    :func:`_sheet_grid` marks those cells the same way.
     """
     if part is None:
-        return set()
+        return {}
     root = _read_xml(archive, part)
     custom = {
         int(fmt.get('numFmtId', '-1')): fmt.get('formatCode', '')
@@ -314,17 +321,21 @@ def _date_styles(archive: zipfile.ZipFile, part: str | None) -> set[int]:
     }
     if any(len(code) > 255 for code in custom.values()):  # longer than any real one
         raise ValueError('a number format code is too long')
-    dated_ids = {
-        fmt_id
-        for fmt_id, code in custom.items()
-        if re.search(r'[dmyhs]', _FORMAT_NOISE.sub('', code.split(';')[0]), re.IGNORECASE)
-    } | (_DATE_FORMAT_IDS - set(custom))
+    kinds = {fmt_id: 'date' for fmt_id in _DATE_FORMAT_IDS - set(custom)}
+    kinds |= dict.fromkeys(_DURATION_FORMAT_IDS - set(custom), 'duration')
+    for fmt_id, code in custom.items():
+        first = code.split(';')[0]
+        if _ELAPSED.search(first):
+            kinds[fmt_id] = 'duration'
+        elif re.search(r'[dmyhs]', _FORMAT_NOISE.sub('', first), re.IGNORECASE):
+            kinds[fmt_id] = 'date'
     xfs = root.find(f'{_XLSX_NS}cellXfs')
-    return {
-        index
-        for index, xf in enumerate([] if xfs is None else xfs.findall(f'{_XLSX_NS}xf'))
-        if int(xf.get('numFmtId', '0')) in dated_ids
-    }
+    styles = {}
+    for index, xf in enumerate([] if xfs is None else xfs.findall(f'{_XLSX_NS}xf')):
+        kind = kinds.get(int(xf.get('numFmtId', '0')))
+        if kind:
+            styles[index] = kind
+    return styles
 
 
 def _merge_ranges(root: ET.Element) -> list[str]:
@@ -356,14 +367,16 @@ def _trim(grid: list[list[object]]) -> list[list[object]]:
 
 
 def _sheet_grid(
-    root: ET.Element, shared: list[str], dated: set[int], shift: int, budget: int
+    root: ET.Element, shared: list[str], dated: dict[int, str], shift: int, budget: int
 ) -> list[list[object]]:
     """Rows of cell values over the sheet's used range; missing cells are None.
 
     The used range ends at the last non-empty row and column, as after :func:`_trim`.
-    A number in a date-formatted cell (style index in *dated*) becomes
-    ``{'date': serial + shift, 'serial': serial}``: *shift* puts a 1904-based serial on
-    the 1900 calendar, so a date only equals the same calendar date shown as a date.
+    A number in a date- or duration-formatted cell (style index in *dated*) is marked
+    the way openpyxl decodes it: ``{'duration': serial}``, ``{'time': serial}`` (a date
+    format below 1 day) or ``{'date': serial + shift}`` (*shift* puts a 1904-based serial
+    on the 1900 calendar), each with the raw ``'serial'`` that check_cell reads. A
+    marked cell only equals one of the same kind and value.
 
     Raises:
         ValueError: If the used range holds more than *budget* cells.
@@ -382,7 +395,12 @@ def _sheet_grid(
             value = _cell_value(cell, shared)
             if value is None:
                 continue
-            if _is_number(value) and int(cell.get('s', '0')) in dated:
+            kind = dated.get(int(cell.get('s', '0'))) if _is_number(value) else None
+            if kind == 'duration':
+                value = {'duration': value, 'serial': value}
+            elif kind and 0 <= value < 1:
+                value = {'time': value, 'serial': value}
+            elif kind:
                 value = {'date': value + shift, 'serial': value}
             r, c = _coord_to_cell(ref)
             cells[(r, c)] = value
@@ -394,6 +412,31 @@ def _sheet_grid(
     for r in range(1, max_row + 1):
         grid.append([cells.get((r, c)) for c in range(1, max_col + 1)])
     return _trim(grid)
+
+
+def _check_declarations(archive: zipfile.ZipFile, book: str, parts: dict[str, str]) -> None:
+    """Refuse a workbook whose content types and relationships name different parts.
+
+    openpyxl finds the workbook and shared strings through [Content_Types].xml and
+    reads styles from xl/styles.xml; this reader follows relationships. Where the two
+    could disagree, the file is unreadable, so both always read the same parts.
+
+    Raises:
+        ValueError: If the declarations disagree.
+    """
+    types = _read_xml(archive, '[Content_Types].xml')
+    declared = {
+        node.get('PartName', '').lstrip('/'): node.get('ContentType', '')
+        for node in types.findall(f'{_CT_NS}Override')
+    }
+    books = {name for name, kind in declared.items() if kind.endswith('.main+xml')}
+    strings = {name for name, kind in declared.items() if kind.endswith('.sharedStrings+xml')}
+    if books != {book}:
+        raise ValueError(f'content types declare {sorted(books)}, relationships {book}')
+    if strings != ({parts['sharedStrings']} if 'sharedStrings' in parts else set()):
+        raise ValueError('content types and relationships name different shared strings')
+    if parts.get('styles', 'xl/styles.xml') != 'xl/styles.xml':
+        raise ValueError(f'styles at {parts["styles"]}, not xl/styles.xml')
 
 
 def read_sheets(path: str) -> list[tuple[str, list[list[object]], list[str]]]:
@@ -418,6 +461,7 @@ def read_sheets(path: str) -> list[tuple[str, list[list[object]], list[str]]]:
             related = _relationships(archive, book_part)
             targets = {rel_id: target for rel_id, _, target in related}
             parts = {kind.rsplit('/', 1)[-1]: target for _, kind, target in related}
+            _check_declarations(archive, book_part, parts)
             shared_node = (
                 _read_xml(archive, parts['sharedStrings']) if 'sharedStrings' in parts else None
             )
@@ -425,7 +469,9 @@ def read_sheets(path: str) -> list[tuple[str, list[list[object]], list[str]]]:
                 ''.join(t.text or '' for t in si.iter(f'{_XLSX_NS}t'))
                 for si in (shared_node if shared_node is not None else [])
             ]
-            dated = _date_styles(archive, parts.get('styles'))
+            # openpyxl reads styles from xl/styles.xml whatever the relationships say.
+            styles = 'xl/styles.xml' if 'xl/styles.xml' in archive.namelist() else None
+            dated = _date_styles(archive, styles)
             properties = book.find(f'{_XLSX_NS}workbookPr')
             epoch = '' if properties is None else properties.get('date1904', '')
             shift = 1462 if epoch.lower() in ('1', 'true') else 0
@@ -526,12 +572,16 @@ def _is_number(value: object) -> bool:
 
 def _same_value(a: object, b: object) -> bool:
     """Elementwise equality as pandas uses it: None only equals None; numbers compare
-    across int/float; a boolean only equals a boolean and a date only the same
-    calendar date; other types must match."""
+    across int/float; a boolean only equals a boolean, and a date, time or duration
+    only one of the same kind and value; other types must match."""
     if a is None or b is None:
         return a is None and b is None
-    if isinstance(a, dict) or isinstance(b, dict):
-        return isinstance(a, dict) and isinstance(b, dict) and a['date'] == b['date']
+    if isinstance(a, dict) or isinstance(b, dict):  # dates, times, durations
+        if not (isinstance(a, dict) and isinstance(b, dict)):
+            return False
+        return {k: v for k, v in a.items() if k != 'serial'} == {
+            k: v for k, v in b.items() if k != 'serial'
+        }
     if isinstance(a, bool) or isinstance(b, bool):
         return isinstance(a, bool) and isinstance(b, bool) and a == b
     if isinstance(a, (int, float)) and isinstance(b, (int, float)):

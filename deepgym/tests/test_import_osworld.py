@@ -23,7 +23,7 @@ import pytest
 
 from deepgym import Action, ComputerUseEnvironment
 from deepgym.registry import load_environment_dir
-from tests.office_fixtures import Date, make_docx, make_xlsx
+from tests.office_fixtures import Date, Duration, make_docx, make_xlsx
 
 scripts_dir = Path(__file__).resolve().parent.parent / 'scripts'
 if str(scripts_dir) not in sys.path:
@@ -371,8 +371,9 @@ def _sheet_data_env(tmp_path: Path, start: dict, done: dict):
 
 
 def test_the_workbook_scored_is_the_one_the_package_names(tmp_path: Path, work: Path) -> None:
-    """openpyxl reads the workbook the package's relationships name, so a stray
-    xl/workbook.xml holding the right answer is not what gets scored."""
+    """A stray workbook holding the right answer is never what gets scored: here the
+    relationships name another workbook, the content types this one, and a package
+    whose declarations disagree is unreadable."""
     start, done = {'A1': 'Total'}, {'A1': 'Total', 'A2': 123}
     env = _sheet_data_env(tmp_path, start, done)
     home = tmp_path / 'home'
@@ -417,6 +418,47 @@ def test_a_1904_workbook_compares_calendar_dates(tmp_path: Path, work: Path) -> 
     _repacked(home / 'Desktop' / FILE, good, {'xl/workbook.xml': shifted})
 
     assert _run_verifier(env, home, work)['score'] == 0.0
+
+
+def test_shared_strings_the_declarations_disagree_on_are_unreadable(
+    tmp_path: Path, work: Path
+) -> None:
+    start, done = {'A1': 'Total'}, {'A1': 'Total', 'A2': 'Correct'}
+    env = _sheet_data_env(tmp_path, start, done)
+    home = tmp_path / 'home'
+    (home / 'Desktop').mkdir(parents=True)
+    good = make_xlsx(tmp_path / 'good.xlsx', [('Sheet1', done, [])]).read_bytes()
+    with zipfile.ZipFile(io.BytesIO(good)) as archive:
+        types = archive.read('[Content_Types].xml').decode()
+        strings = archive.read('xl/sharedStrings.xml').decode()
+    _repacked(
+        home / 'Desktop' / FILE,
+        good,
+        {
+            '[Content_Types].xml': types.replace('/xl/sharedStrings.xml', '/xl/other.xml'),
+            'xl/other.xml': strings.replace('Correct', 'Wrong'),
+        },
+    )
+
+    result = _run_verifier(env, home, work)
+
+    assert result['score'] == 0.0
+    assert 'workbook_saved' in result['details']
+
+
+def test_an_elapsed_time_does_not_match_a_date(tmp_path: Path, work: Path) -> None:
+    """openpyxl reads [h]:mm:ss as a timedelta, so the date's serial shown as elapsed
+    time is not the date."""
+    start = {'A1': 'Start', 'B1': 'Due', 'A2': Date(40437)}
+    done = {**start, 'B2': Date(40557)}
+    env = _sheet_data_env(tmp_path, start, done)
+    home = tmp_path / 'home'
+    for label, cells, score in (
+        ('elapsed time', {**start, 'B2': Duration(40557)}, 0.0),
+        ('the date', done, 1.0),
+    ):
+        _save(tmp_path, home, cells, [])
+        assert _run_verifier(env, home, work)['score'] == score, label
 
 
 def test_a_boolean_does_not_match_a_number(tmp_path: Path, work: Path) -> None:
