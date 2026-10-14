@@ -547,6 +547,17 @@ def test_a_boolean_is_read_as_openpyxl_reads_it(tmp_path: Path, work: Path) -> N
     assert _run_verifier(env, home, work)['score'] == 0.0
 
 
+def test_an_int_column_does_not_match_a_float_column(tmp_path: Path, work: Path) -> None:
+    """pandas' equals compares dtypes: int64 1 against float64 1.00001 is unequal, even
+    though both round to 1 at the rule's precision."""
+    start, done = {'A1': 'Amount'}, {'A1': 'Amount', 'A2': 1}
+    env = _sheet_data_env(tmp_path, start, done)
+    home = tmp_path / 'home'
+    for label, cells, score in (('a float', {**start, 'A2': 1.00001}, 0.0), ('the int', done, 1.0)):
+        _save(tmp_path, home, cells, [])
+        assert _run_verifier(env, home, work)['score'] == score, label
+
+
 def test_a_boolean_does_not_match_a_number(tmp_path: Path, work: Path) -> None:
     start, done = {'A1': 'Flag'}, {'A1': 'Flag', 'A2': 1}
     env = _sheet_data_env(tmp_path, start, done)
@@ -846,6 +857,7 @@ def test_unsaved_changes_and_a_wrong_sheet_name_are_judged_zeros(
         'two mains',
         'no manifest',
         'a missing related part',
+        'a malformed related part',
         'an inexact main relationship',
         'not a w:document',
     ],
@@ -862,10 +874,18 @@ def test_a_saved_document_the_agent_broke_is_a_judged_zero(
         rels = gold.read('_rels/.rels').decode()
     if label == 'not a zip':
         saved.write_bytes(b'not a document')
-    elif label in ('a missing related part', 'an inexact main relationship', 'not a w:document'):
+    elif label in (
+        'a missing related part',
+        'a malformed related part',
+        'an inexact main relationship',
+        'not a w:document',
+    ):
         with zipfile.ZipFile(make_docx(tmp_path / 'right.docx', _DOC_GOLD)) as right:
             parts = {name: right.read(name) for name in right.namelist()}
-        if label == 'a missing related part':  # python-docx loads every related part
+        if label in ('a missing related part', 'a malformed related part'):
+            # python-docx loads and parses every related part
+            if label == 'a malformed related part':
+                parts['word/styles.xml'] = b'<broken'
             parts['word/_rels/document.xml.rels'] = (
                 b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
                 b'relationships"><Relationship Id="rId1" Target="styles.xml" Type="http://'

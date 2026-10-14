@@ -244,11 +244,13 @@ def _relationships(archive: zipfile.ZipFile, part: str) -> list[tuple[str, str, 
 def _check_related_parts(archive: zipfile.ZipFile) -> None:
     """Refuse a package whose relationships name a part it doesn't hold.
 
-    python-docx loads every part reachable from the package's relationships and fails
-    on a missing one, so such a document is unreadable here too.
+    python-docx loads every part reachable from the package's relationships and parses
+    its XML parts, failing on a missing or malformed one, so such a document is
+    unreadable here too.
 
     Raises:
         ValueError: If a relationship's target is missing.
+        ET.ParseError: If a related XML part doesn't parse.
     """
     names = set(archive.namelist())
     seen, queue = {''}, ['']
@@ -257,6 +259,8 @@ def _check_related_parts(archive: zipfile.ZipFile) -> None:
             if target not in names:
                 raise ValueError(f'a relationship names {target}, which the package lacks')
             if target not in seen:
+                if target.lower().endswith('.xml'):  # python-docx parses its XML parts
+                    _read_xml(archive, target)
                 seen.add(target)
                 queue.append(target)
 
@@ -292,17 +296,20 @@ def _coord_to_cell(coord: str) -> tuple[int, int]:
     return row, col
 
 
-def _number(text: str) -> int | float | None:
-    """A numeric cell's value: float when fractional, int when integral (pandas-like)."""
-    try:
+def _number(text: str) -> int | float:
+    """A numeric cell's value as openpyxl casts it: a float if the text has a '.' or an
+    exponent, else an int. pandas types the column from these, so the type matters.
+
+    Raises:
+        ValueError: If the text isn't such a number (openpyxl fails on it too) or the
+            float isn't finite.
+    """
+    if '.' in text or 'e' in text.lower():
         value = float(text)
-    except ValueError:
-        return None
-    if not math.isfinite(value):
-        raise ValueError(f'{text!r} is not a finite number')
-    if value.is_integer() and abs(value) < 1e15:
-        return int(value)
-    return value
+        if not math.isfinite(value):
+            raise ValueError(f'{text!r} is not a finite number')
+        return value
+    return int(text)
 
 
 def _cell_value(cell: ET.Element, shared: list[str]) -> object:
@@ -687,20 +694,42 @@ def _round_grid(grid: list[list[object]], precision: int) -> list[list[object]]:
     return rounded
 
 
+def _numeric_dtypes(grid: list[list[object]]) -> list[str | None]:
+    """The dtype pandas gives each all-number data column: int64 when every cell holds an
+    int, float64 once one holds a float or is empty; None for any other column.
+
+    Other dtype differences need values _same_value already tells apart.
+    """
+    width = max((len(row) for row in grid), default=0)
+    dtypes: list[str | None] = []
+    for column in range(width):
+        values = [row[column] if column < len(row) else None for row in grid[1:]]
+        present = [value for value in values if value is not None]
+        if not present or not all(_is_number(value) for value in present):
+            dtypes.append(None)
+        elif len(present) == len(values) and all(isinstance(v, int) for v in present):
+            dtypes.append('int64')
+        else:
+            dtypes.append('float64')
+    return dtypes
+
+
 def sheets_match(
     agent: list[list[object]], expected: list[list[object]], precision: int = 4
 ) -> bool:
     """Whether two grids are the same sheet, as compare_table's sheet_data sees it.
 
     Mirrors `pd.read_excel(a).round(precision).equals(pd.read_excel(b).round(precision))`:
-    each side is rounded by its own column dtypes first, then shapes and every value
-    must match.
+    each side is rounded by its own column dtypes first, then shapes, numeric column
+    dtypes (int64 against float64 is unequal, as in pandas) and every value must match.
     """
     if len(agent) != len(expected):
         return False
     for row_a, row_e in zip(agent, expected):
         if len(row_a) != len(row_e):
             return False
+    if _numeric_dtypes(agent) != _numeric_dtypes(expected):
+        return False
     agent = _round_grid(agent, precision)
     expected = _round_grid(expected, precision)
     for row_a, row_e in zip(agent, expected):
