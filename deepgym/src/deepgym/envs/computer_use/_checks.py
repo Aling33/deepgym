@@ -101,7 +101,12 @@ def bounded_call(judge: Callable[[], dict], seconds: float = JUDGE_SECONDS) -> d
         ran past *seconds*: the caller scores that a 0.
     """
     read_fd, write_fd = os.pipe()
-    pid = os.fork()
+    try:
+        pid = os.fork()
+    except OSError:  # our sandbox couldn't start the child: no verdict, nothing left open
+        os.close(read_fd)
+        os.close(write_fd)
+        raise
     if pid == 0:
         status = 1
         try:
@@ -118,18 +123,23 @@ def bounded_call(judge: Callable[[], dict], seconds: float = JUDGE_SECONDS) -> d
     os.close(write_fd)
     deadline = time.monotonic() + seconds
     chunks = []
-    with os.fdopen(read_fd, 'rb') as pipe:
-        while True:
-            left = deadline - time.monotonic()
-            if left <= 0 or not select.select([pipe], [], [], left)[0]:
-                os.kill(pid, signal.SIGKILL)
-                os.waitpid(pid, 0)
-                return None
-            chunk = os.read(pipe.fileno(), 1 << 16)
-            if not chunk:
-                break
-            chunks.append(chunk)
-    _, status = os.waitpid(pid, 0)
+    reaped = False
+    try:
+        with os.fdopen(read_fd, 'rb') as pipe:
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0 or not select.select([pipe], [], [], left)[0]:
+                    return None
+                chunk = os.read(pipe.fileno(), 1 << 16)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        _, status = os.waitpid(pid, 0)
+        reaped = True
+    finally:
+        if not reaped:  # past the deadline, or the parent failed: never leave it running
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
     return json.loads(b''.join(chunks)) if status == 0 else None
 
 

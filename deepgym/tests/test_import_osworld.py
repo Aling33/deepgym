@@ -580,6 +580,30 @@ def test_the_judging_child_returns_its_verdict_or_none() -> None:
     assert time.monotonic() - started < 5
 
 
+@pytest.mark.filterwarnings('ignore:This process .* is multi-threaded')
+def test_a_failing_parent_still_kills_the_judging_child(monkeypatch: pytest.MonkeyPatch) -> None:
+    checks = load_checks_module()
+    children: list[int] = []
+    fork = os.fork
+
+    def recording_fork() -> int:
+        pid = fork()
+        children.append(pid)
+        return pid
+
+    def broken_select(*_: object) -> None:
+        raise RuntimeError('select failed')
+
+    monkeypatch.setattr(checks.os, 'fork', recording_fork)
+    monkeypatch.setattr(checks.select, 'select', broken_select)
+
+    with pytest.raises(RuntimeError):
+        checks.bounded_call(_slow, 30)
+
+    with pytest.raises(ProcessLookupError):  # killed and reaped, not left running
+        os.kill(children[0], 0)
+
+
 def test_a_judge_that_runs_out_of_time_is_a_judged_zero(tmp_path: Path, work: Path) -> None:
     """When judging the file overruns (or dies), the verifier still reports a 0."""
     env, _ = _calc_env(tmp_path)
