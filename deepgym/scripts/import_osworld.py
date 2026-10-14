@@ -377,7 +377,9 @@ def build_variants(task: Task, source: Path, gold: Path | None, checks: ModuleTy
     Each rule is progress or a guard, decided here by evaluating it against the
     untouched starting file: a rule the file already satisfies is not something the
     task asks for, so it becomes a guard (keep it holding) instead of a progress
-    check that saving nothing would collect.
+    check that saving nothing would collect. So does a rule the starting file holds
+    once the sheets the rules name are added empty ("D1 is not merged"): adding a
+    blank sheet is not progress either.
 
     Raises:
         ValueError: If the reference file fails one of the task's own rules, or
@@ -398,9 +400,23 @@ def build_variants(task: Task, source: Path, gold: Path | None, checks: ModuleTy
             failed = [name for name, ok in reference.items() if not ok]
             if failed:
                 raise ValueError(f'{task.task_id}: the reference file fails {failed}')
-        untouched = checks.office_rule_checks(named, checks.read_sheets(str(source)), expected)
-        variant['progress'] = [rule for rule in named if not untouched[rule['name']]]
-        variant['guards'] = [rule for rule in named if untouched[rule['name']]]
+        start = checks.read_sheets(str(source))
+        names = {sheet[0] for sheet in start}
+        new_sheets = {
+            str(rule[key])[2:]
+            for rule in named
+            for key in ('sheet_idx', 'sheet_idx0', 'sheet_idx1')
+            if str(rule.get(key, '')).startswith('RN') and str(rule[key])[2:] not in names
+        }
+        blank = start + [(name, [], []) for name in sorted(new_sheets)]
+        held = {
+            name
+            for sheets in (start, blank)
+            for name, ok in checks.office_rule_checks(named, sheets, expected).items()
+            if ok
+        }
+        variant['progress'] = [rule for rule in named if rule['name'] not in held]
+        variant['guards'] = [rule for rule in named if rule['name'] in held]
         if not variant['progress']:
             raise ValueError(f'{task.task_id}: needs no work; saving nothing would score')
         variant['expected'] = expected

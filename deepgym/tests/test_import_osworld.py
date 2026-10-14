@@ -303,6 +303,34 @@ def test_rules_the_starting_file_holds_become_guards(tmp_path: Path, work: Path)
     assert _run_verifier(env, home, work)['score'] == 0.0
 
 
+def test_a_rule_an_empty_new_sheet_holds_is_a_guard(tmp_path: Path, work: Path) -> None:
+    """'D1 is not merged' on a sheet the task adds holds as soon as an empty sheet is
+    added, so it is a guard: adding a blank Sheet2 earns nothing."""
+    source = make_xlsx(tmp_path / 'source.xlsx', [('Sheet1', _START, [])])
+    summary = {'A1': 'Summary'}
+    gold = make_xlsx(
+        tmp_path / 'gold.xlsx', [('Sheet1', _START, []), ('Sheet2', summary, ['A1:B1'])]
+    )
+    rules = [
+        _cell('RNSheet2', 'A1', 'value', {'method': 'eq', 'ref': 'Summary'}),
+        _cell('RNSheet2', 'B1', 'merge', {'method': 'eq', 'ref': True}),
+        _cell('RNSheet2', 'C1', 'merge', {'method': 'eq', 'ref': False}),
+    ]
+    env, out = _import(tmp_path, _task_config(rules=rules), source, gold)
+    variant = json.loads((out / TASK_ID / 'variants.json').read_text())[0]
+    assert [rule['coordinate'] for rule in variant['progress']] == ['A1', 'B1']
+    assert [rule['coordinate'] for rule in variant['guards']] == ['C1']
+
+    home = tmp_path / 'home'
+    (home / 'Desktop').mkdir(parents=True)
+    for label, sheets, score in (
+        ('blank Sheet2', [('Sheet1', _START, []), ('Sheet2', {}, [])], 0.0),
+        ('finished', [('Sheet1', _START, []), ('Sheet2', summary, ['A1:B1'])], 1.0),
+    ):
+        make_xlsx(home / 'Desktop' / FILE, sheets)
+        assert _run_verifier(env, home, work)['score'] == score, label
+
+
 def test_a_date_only_matches_a_cell_shown_as_that_date(tmp_path: Path, work: Path) -> None:
     """pandas reads a date-formatted cell as a datetime, so the right serial typed as
     a plain number does not match the reference's date."""
