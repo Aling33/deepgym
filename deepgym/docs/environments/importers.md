@@ -2,8 +2,9 @@
 
 This page covers the public benchmarks DeepGym can load or import: the code benchmarks
 (HumanEval, MBPP, EvalPlus, BigCodeBench), repo-level patch tasks (SWE-bench Pro, MiMo),
-shell tasks (Terminal-Bench 2.0 and any Harbor dataset), CyberGym, mixing benchmarks
-behind one reward function, and sharing environments on the Hugging Face Hub.
+shell tasks (Terminal-Bench 2.0 and any Harbor dataset), CyberGym, OSWorld desktop
+tasks, mixing benchmarks behind one reward function, and sharing environments on the
+Hugging Face Hub.
 
 ## Code benchmarks
 
@@ -282,6 +283,35 @@ Use the generated `data/cyberbench/*.jsonl` files as curriculum inputs for
 TRL, verl or OpenRLHF. Keep training and evaluation splits separate, use a sandbox for
 untrusted completions, and don't train on metadata-only scores. See
 [CyberBench](../cyberbench.md) for the full workflow and diagnostic numbers.
+
+## OSWorld desktop tasks
+
+`scripts/import_osworld.py` imports 16 LibreOffice Calc and Writer tasks from
+[OSWorld](https://github.com/xlang-ai/OSWorld) (Apache-2.0) as
+[computer-use](computer-use.md) environments. The agent gets the task's file open in
+Calc or Writer and saves it with Ctrl+S. The verifier scores the saved file with the
+task's own `compare_table` rules or reference text, never the screen.
+
+The desktop needs LibreOffice, which Daytona's default image doesn't have, so the
+environments boot the Daytona snapshot `deepgym-osworld-libreoffice`. Create it once
+per Daytona account, then import:
+
+```bash
+python scripts/import_osworld.py --build-snapshot   # needs DAYTONA_API_KEY
+python scripts/import_osworld.py                    # writes ~/.deepgym/environments/osworld/
+deepgym qa --mode daytona ~/.deepgym/environments/osworld/<task id>
+```
+
+- A rule the starting file already holds, or holds once an empty sheet is added, is a
+  guard rather than progress, so saving the untouched file or adding a blank sheet
+  earns nothing. OSWorld's evaluator is all-or-nothing; here a task with several rules
+  pays the share it got right.
+- A saved file the readers can't read (missing, not a workbook, or past the size
+  limits) scores 0.
+- Each task ships a reference episode, `reference_actions.json`, that `deepgym qa`
+  replays.
+- The output folder keeps OSWorld's `LICENSE` and a `NOTICE` that lists what was
+  changed.
 
 ## Mix benchmarks behind one reward function
 
