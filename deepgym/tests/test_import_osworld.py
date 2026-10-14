@@ -15,6 +15,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import time
 import zipfile
 from pathlib import Path
 
@@ -560,11 +561,39 @@ def test_a_valid_file_with_700k_styles_is_read_in_time(tmp_path: Path, work: Pat
     assert _run_verifier(env, home, work)['score'] == 1.0
 
 
-def test_the_read_deadline_raises_inside_a_slow_block() -> None:
+def _slow() -> dict:
+    time.sleep(60)
+    return {}
+
+
+def _broken() -> dict:
+    raise RuntimeError('judge failed')
+
+
+@pytest.mark.filterwarnings('ignore:This process .* is multi-threaded')
+def test_the_judging_child_returns_its_verdict_or_none() -> None:
     checks = load_checks_module()
-    with pytest.raises(TimeoutError), checks._deadline(0.05):
-        while True:
-            pass
+    assert checks.bounded_call(lambda: {'ok': True}) == {'ok': True}
+    assert checks.bounded_call(_broken) is None
+    started = time.monotonic()
+    assert checks.bounded_call(_slow, 0.5) is None
+    assert time.monotonic() - started < 5
+
+
+def test_a_judge_that_runs_out_of_time_is_a_judged_zero(tmp_path: Path, work: Path) -> None:
+    """When judging the file overruns (or dies), the verifier still reports a 0."""
+    env, _ = _calc_env(tmp_path)
+    home = tmp_path / 'home'
+    _save(tmp_path, home, _GOLD, _MERGED)
+    assert 'bounded_call(judge)' in env.final_verifier_code
+    stalled = env.final_verifier_code.replace(
+        'bounded_call(judge)', "bounded_call(lambda: __import__('time').sleep(60), 0.5)"
+    )
+
+    result = _run_verifier(env.model_copy(update={'final_verifier_code': stalled}), home, work)
+
+    assert result['score'] == 0.0
+    assert 'workbook_saved' in result['details']
 
 
 def test_unsaved_changes_and_a_wrong_sheet_name_are_judged_zeros(

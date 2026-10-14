@@ -369,18 +369,28 @@ import os
 from pathlib import Path
 
 workbook = Path(os.environ['DEEPGYM_AGENT_HOME']) / PARAMS['result']
-try:
-    sheets = read_sheets(str(workbook))
-except ValueError:
-    sheets = None
 
-report(
-    progress=office_rule_checks(PARAMS['progress'], sheets, PARAMS['expected']),
-    guards={
-        'workbook_saved': sheets is not None,
-        **office_rule_checks(PARAMS['guards'], sheets, PARAMS['expected']),
-    },
-)
+
+def judge():
+    try:
+        sheets = read_sheets(str(workbook))
+    except ValueError:
+        sheets = None
+    return {
+        'progress': office_rule_checks(PARAMS['progress'], sheets, PARAMS['expected']),
+        'guards': {
+            'workbook_saved': sheets is not None,
+            **office_rule_checks(PARAMS['guards'], sheets, PARAMS['expected']),
+        },
+    }
+
+
+# Judged in a bounded child: a file too slow or too large to judge scores 0.
+verdict = bounded_call(judge) or {
+    'progress': office_rule_checks(PARAMS['progress'], None, None),
+    'guards': {'workbook_saved': False},
+}
+report(**verdict)
 """
 
 _TEXT_VERIFIER_BODY = """
@@ -388,15 +398,25 @@ import os
 from pathlib import Path
 
 document = Path(os.environ['DEEPGYM_AGENT_HOME']) / PARAMS['result']
-try:
-    text = read_docx_text(str(document))
-except ValueError:
-    text = None
 
-report(
-    progress={'matches_reference': text == PARAMS['expected_text']},
-    guards={'document_saved': text is not None},
-)
+
+def judge():
+    try:
+        text = read_docx_text(str(document))
+    except ValueError:
+        text = None
+    return {
+        'progress': {'matches_reference': text == PARAMS['expected_text']},
+        'guards': {'document_saved': text is not None},
+    }
+
+
+# Judged in a bounded child: a file too slow or too large to judge scores 0.
+verdict = bounded_call(judge) or {
+    'progress': {'matches_reference': False},
+    'guards': {'document_saved': False},
+}
+report(**verdict)
 """
 
 

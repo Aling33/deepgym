@@ -12,11 +12,13 @@ import json
 import math
 import os
 import re
+import resource
+import select
 import signal
 import stat
-import threading
+import time
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -82,34 +84,53 @@ _MAX_FILE_BYTES = 16 << 20
 """Largest saved file read, packed or unpacked; a bigger one is unreadable."""
 _MAX_CELLS = 1_000_000
 """Most cells (used rows x columns, all sheets together) read from one workbook."""
-_READ_SECONDS = 15
-"""Longest a saved file may take to read; the verifier has 30 s in all."""
-_RULES_SECONDS = 10
-"""Longest the rules may take to evaluate."""
+JUDGE_SECONDS = 20
+"""How long judging a saved file may take; a session gives the whole verifier 30 s."""
+_JUDGE_MEMORY = 1 << 30
+"""Address space the judging process may use, where the platform enforces it."""
 
 
-@contextmanager
-def _deadline(seconds: float) -> Iterator[None]:
-    """Raise TimeoutError in the block once it has run *seconds*, as a backstop.
+def bounded_call(judge: Callable[[], dict], seconds: float = JUDGE_SECONDS) -> dict | None:
+    """Return ``judge()``, computed in a forked child under a time and memory limit.
 
-    The bounds on the file keep every step short; this catches whatever they miss,
-    so a slow read scores 0 instead of the verifier running out of time. It needs
-    the main thread (where a verifier runs) and does nothing elsewhere.
+    Reading a file the agent controls can't be made cheap in every case, so the work
+    runs where running out of memory or time kills only the child.
+
+    Returns:
+        The child's JSON-serializable result, or None if it raised, was killed, or
+        ran past *seconds*: the caller scores that a 0.
     """
-    if threading.current_thread() is not threading.main_thread():
-        yield
-        return
-
-    def expire(*_: object) -> None:
-        raise TimeoutError(f'took longer than {seconds} s')
-
-    previous = signal.signal(signal.SIGALRM, expire)
-    signal.setitimer(signal.ITIMER_REAL, seconds)
-    try:
-        yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous)
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        status = 1
+        try:
+            os.close(read_fd)
+            try:
+                resource.setrlimit(resource.RLIMIT_AS, (_JUDGE_MEMORY, _JUDGE_MEMORY))
+            except (ValueError, OSError):  # not enforced on macOS
+                pass
+            with os.fdopen(write_fd, 'wb') as out:
+                out.write(json.dumps(judge()).encode())
+            status = 0
+        finally:
+            os._exit(status)
+    os.close(write_fd)
+    deadline = time.monotonic() + seconds
+    chunks = []
+    with os.fdopen(read_fd, 'rb') as pipe:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([pipe], [], [], left)[0]:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                return None
+            chunk = os.read(pipe.fileno(), 1 << 16)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    _, status = os.waitpid(pid, 0)
+    return json.loads(b''.join(chunks)) if status == 0 else None
 
 
 @contextmanager
@@ -154,12 +175,18 @@ def _read_xml(archive: zipfile.ZipFile, name: str) -> ET.Element:
     if len(data) > _MAX_FILE_BYTES:
         raise ValueError(f'{name} unpacks to more than {_MAX_FILE_BYTES} bytes')
     # Office parts never declare a DTD; refusing one rules out entity expansion.
-    scan = expat.ParserCreate()
+    # Nor a namespace URI longer than any real one, which every name would repeat.
+    scan = expat.ParserCreate(namespace_separator=' ')
 
     def refuse(*_: object) -> None:
         raise ValueError(f'{name} declares a DTD')
 
+    def check_namespace(_: str | None, uri: str) -> None:
+        if len(uri) > 200:
+            raise ValueError(f'{name} declares a namespace URI of {len(uri)} characters')
+
     scan.StartDoctypeDeclHandler = refuse
+    scan.StartNamespaceDeclHandler = check_namespace
     scan.Parse(data, True)
     return ET.fromstring(data)
 
@@ -357,7 +384,7 @@ def read_sheets(path: str) -> list[tuple[str, list[list[object]], list[str]]]:
             verifier scores that a 0, since the agent controls the file.
     """
     try:
-        with _deadline(_READ_SECONDS), _open_package(path) as archive:
+        with _open_package(path) as archive:
             shared_node = None
             if 'xl/sharedStrings.xml' in archive.namelist():
                 shared_node = _read_xml(archive, 'xl/sharedStrings.xml')
@@ -419,7 +446,7 @@ def read_docx_text(path: str) -> str:
             verifier scores that a 0, since the agent controls the file.
     """
     try:
-        with _deadline(_READ_SECONDS), _open_package(path) as archive:
+        with _open_package(path) as archive:
             # The main part is the one the package's officeDocument relationship names,
             # as python-docx resolves it, not whatever sits at word/document.xml.
             rels = _read_xml(archive, '_rels/.rels')
@@ -699,11 +726,10 @@ def office_rule_checks(
             name += '_'
         names.append(name)
     try:
-        with _deadline(_RULES_SECONDS):
-            return {
-                name: _rule_verdict(rule, result, expected, names_r, names_e)
-                for name, rule in zip(names, rules)
-            }
+        return {
+            name: _rule_verdict(rule, result, expected, names_r, names_e)
+            for name, rule in zip(names, rules)
+        }
     except Exception:  # a rule that can't decide fails closed, and so does every other
         return dict.fromkeys(names, False)
 
