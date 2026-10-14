@@ -78,6 +78,21 @@ _PKG_REL_NS = '{http://schemas.openxmlformats.org/package/2006/relationships}'
 _W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
 _CT_NS = '{http://schemas.openxmlformats.org/package/2006/content-types}'
 _WML_MAIN = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'
+_WORKBOOK_TYPES = frozenset(
+    {
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml',
+        'application/vnd.ms-excel.sheet.macroEnabled.main+xml',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.template.main+xml',
+        'application/vnd.ms-excel.template.macroEnabled.main+xml',
+    }
+)
+"""The workbook content types openpyxl opens."""
+_SHARED_STRINGS_TYPE = (
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml'
+)
+_OFFICE_DOCUMENT = (
+    'http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument'
+)
 
 _COORD_RE = re.compile(r'([A-Z]{1,3})([1-9][0-9]{0,6})')
 _MAX_ROW, _MAX_COL = 1_048_576, 16_384
@@ -226,6 +241,26 @@ def _relationships(archive: zipfile.ZipFile, part: str) -> list[tuple[str, str, 
     return found
 
 
+def _check_related_parts(archive: zipfile.ZipFile) -> None:
+    """Refuse a package whose relationships name a part it doesn't hold.
+
+    python-docx loads every part reachable from the package's relationships and fails
+    on a missing one, so such a document is unreadable here too.
+
+    Raises:
+        ValueError: If a relationship's target is missing.
+    """
+    names = set(archive.namelist())
+    seen, queue = {''}, ['']
+    while queue:
+        for _, _, target in _relationships(archive, queue.pop()):
+            if target not in names:
+                raise ValueError(f'a relationship names {target}, which the package lacks')
+            if target not in seen:
+                seen.add(target)
+                queue.append(target)
+
+
 def _main_part(archive: zipfile.ZipFile) -> str:
     """The part the package's officeDocument relationship names, as python-docx and
     openpyxl resolve it, not whatever sits at the usual path.
@@ -233,7 +268,7 @@ def _main_part(archive: zipfile.ZipFile) -> str:
     Raises:
         ValueError: If the package names no main part or more than one.
     """
-    main = [t for _, kind, t in _relationships(archive, '') if kind.endswith('/officeDocument')]
+    main = [t for _, kind, t in _relationships(archive, '') if kind == _OFFICE_DOCUMENT]
     if len(main) != 1:
         raise ValueError(f'{len(main)} main parts')
     return main[0]
@@ -289,7 +324,7 @@ def _cell_value(cell: ET.Element, shared: list[str]) -> object:
     if kind == 'str':
         return value.text
     if kind == 'b':
-        return value.text == '1'
+        return bool(int(value.text))  # as openpyxl reads it; not an integer is unreadable
     if kind == 'e':
         return value.text
     return _number(value.text)
@@ -307,16 +342,16 @@ _FORMAT_NOISE = re.compile(r'".*?"|\[(?!hh?\]|mm?\]|ss?\])[^\]]*\]')
 """openpyxl's STRIP_RE: quoted text and bracketed sections other than [h], [m], [s]."""
 
 
-def _date_styles(archive: zipfile.ZipFile, part: str | None) -> dict[int, str]:
-    """{style index: 'date' or 'duration'} for the cell styles in styles *part* whose
-    number format shows a date, time or elapsed time.
+def _date_styles(archive: zipfile.ZipFile, part: str | None) -> tuple[dict[int, str], int]:
+    """({style index: 'date' or 'duration'}, how many cell styles there are) for styles
+    *part*: the styles whose number format shows a date, time or elapsed time.
 
     openpyxl reads a number in such a cell as a datetime, a time or a timedelta, so
     pandas never equates it with a plain number or with another kind;
     :func:`_sheet_grid` marks those cells the same way.
     """
     if part is None:
-        return {}
+        return {}, 1  # openpyxl's default stylesheet has one cell style
     root = _read_xml(archive, part)
     custom = {
         int(fmt.get('numFmtId', '-1')): fmt.get('formatCode', '')
@@ -331,12 +366,13 @@ def _date_styles(archive: zipfile.ZipFile, part: str | None) -> dict[int, str]:
         if re.search(r'(?<![_\\])[dmhysDMHYS]', _FORMAT_NOISE.sub('', first)):
             kinds[fmt_id] = 'duration' if _TIMEDELTA.search(first) else 'date'
     xfs = root.find(f'{_XLSX_NS}cellXfs')
+    entries = [] if xfs is None else xfs.findall(f'{_XLSX_NS}xf')
     styles = {}
-    for index, xf in enumerate([] if xfs is None else xfs.findall(f'{_XLSX_NS}xf')):
+    for index, xf in enumerate(entries):
         kind = kinds.get(int(xf.get('numFmtId', '0')))
         if kind:
             styles[index] = kind
-    return styles
+    return styles, max(len(entries), 1)
 
 
 def _merge_ranges(root: ET.Element) -> list[str]:
@@ -368,20 +404,24 @@ def _trim(grid: list[list[object]]) -> list[list[object]]:
 
 
 def _sheet_grid(
-    root: ET.Element, shared: list[str], dated: dict[int, str], shift: int, budget: int
+    root: ET.Element, shared: list[str], styles: tuple[dict[int, str], int], shift: int, budget: int
 ) -> list[list[object]]:
     """Rows of cell values over the sheet's used range; missing cells are None.
 
     The used range ends at the last non-empty row and column, as after :func:`_trim`.
-    A number in a date- or duration-formatted cell (style index in *dated*) is marked
+    *styles* is :func:`_date_styles`' result; a cell naming a style that doesn't exist
+    makes the sheet unreadable, as it does for openpyxl. A number in a date- or
+    duration-formatted cell is marked
     the way openpyxl decodes it: ``{'duration': serial}``, ``{'time': serial}`` (a date
     format below 1 day) or ``{'date': serial + shift}`` (*shift* puts a 1904-based serial
     on the 1900 calendar), each with the raw ``'serial'`` that check_cell reads. A
     marked cell only equals one of the same kind and value.
 
     Raises:
-        ValueError: If the used range holds more than *budget* cells.
+        ValueError: If the used range holds more than *budget* cells, or a cell names a
+            style that doesn't exist.
     """
+    dated, style_count = styles
     cells: dict[tuple[int, int], object] = {}
     max_row = 0
     max_col = 0
@@ -390,13 +430,16 @@ def _sheet_grid(
         return []
     for row in data.findall(f'{_XLSX_NS}row'):
         for cell in row.findall(f'{_XLSX_NS}c'):
+            style = int(cell.get('s', '0'))
+            if not 0 <= style < style_count:
+                raise ValueError(f'a cell names style {style}; there are {style_count}')
             ref = cell.get('r')
             if not ref:
                 continue
             value = _cell_value(cell, shared)
             if value is None:
                 continue
-            kind = dated.get(int(cell.get('s', '0'))) if _is_number(value) else None
+            kind = dated.get(style) if _is_number(value) else None
             if kind == 'duration':
                 value = {'duration': value, 'serial': value}
             elif kind and 0 <= value < 1:
@@ -444,8 +487,8 @@ def _check_declarations(archive: zipfile.ZipFile, book: str, parts: dict[str, st
         ValueError: If the declarations disagree.
     """
     declared, _ = _content_types(archive)
-    books = {name for name, kind in declared.items() if kind.endswith('.main+xml')}
-    strings = {name for name, kind in declared.items() if kind.endswith('.sharedStrings+xml')}
+    books = {name for name, kind in declared.items() if kind in _WORKBOOK_TYPES}
+    strings = {name for name, kind in declared.items() if kind == _SHARED_STRINGS_TYPE}
     if books != {book.lower()}:
         raise ValueError(f'content types declare {sorted(books)}, relationships {book}')
     if strings != ({parts['sharedStrings'].lower()} if 'sharedStrings' in parts else set()):
@@ -486,7 +529,7 @@ def read_sheets(path: str) -> list[tuple[str, list[list[object]], list[str]]]:
             ]
             # openpyxl reads styles from xl/styles.xml whatever the relationships say.
             styles = 'xl/styles.xml' if 'xl/styles.xml' in archive.namelist() else None
-            dated = _date_styles(archive, styles)
+            cell_styles = _date_styles(archive, styles)
             properties = book.find(f'{_XLSX_NS}workbookPr')
             epoch = '' if properties is None else properties.get('date1904', '')
             shift = 1462 if epoch.lower() in ('1', 'true') else 0
@@ -498,7 +541,7 @@ def read_sheets(path: str) -> list[tuple[str, list[list[object]], list[str]]]:
                 name, part = sheet.get('name', ''), targets[sheet.get(f'{_REL_NS}id', '')]
                 if part not in parsed:  # sheets naming one part parse it once
                     root = _read_xml(archive, part)
-                    grid = _sheet_grid(root, shared, dated, shift, budget)
+                    grid = _sheet_grid(root, shared, cell_styles, shift, budget)
                     parsed[part] = (grid, _merge_ranges(root))
                 grid, merges = parsed[part]
                 budget -= len(grid) * max((len(row) for row in grid), default=0)
@@ -553,7 +596,10 @@ def read_docx_text(path: str) -> str:
             kind = declared.get(main.lower()) or defaults.get(main.rpartition('.')[2].lower())
             if kind != _WML_MAIN:
                 raise ValueError(f'{main} has content type {kind!r}, not a Word document')
+            _check_related_parts(archive)
             root = _read_xml(archive, main)
+            if root.tag != f'{_W_NS}document':
+                raise ValueError(f'{main} is not a w:document')
         body = root.find(f'{_W_NS}body')
         paragraphs = []
         for para in [] if body is None else body:

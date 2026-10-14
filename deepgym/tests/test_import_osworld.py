@@ -506,6 +506,47 @@ def test_a_number_in_a_format_openpyxl_reads_as_a_date_is_not_that_number(
     assert _run_verifier(env, home, work)['score'] == 0.0
 
 
+def test_workbooks_openpyxl_cannot_open_are_unreadable(tmp_path: Path, work: Path) -> None:
+    """A style index past the stylesheet, or a workbook content type openpyxl doesn't
+    know, makes openpyxl fail; here it makes the file a 0, not a pass."""
+    start, done = {'A1': 'Total'}, {'A1': 'Total', 'A2': 123}
+    env = _sheet_data_env(tmp_path, start, done)
+    home = tmp_path / 'home'
+    (home / 'Desktop').mkdir(parents=True)
+    good = make_xlsx(tmp_path / 'good.xlsx', [('Sheet1', done, [])]).read_bytes()
+    with zipfile.ZipFile(io.BytesIO(good)) as archive:
+        sheet = archive.read('xl/worksheets/sheet1.xml').decode()
+        types = archive.read('[Content_Types].xml').decode()
+    for label, parts in (
+        (
+            'a missing style',
+            {'xl/worksheets/sheet1.xml': sheet.replace('<c r="A2">', '<c r="A2" s="999">')},
+        ),
+        (
+            'an unknown workbook type',
+            {'[Content_Types].xml': types.replace('spreadsheetml.sheet.main', 'nonsense.main')},
+        ),
+    ):
+        _repacked(home / 'Desktop' / FILE, good, parts)
+        assert _run_verifier(env, home, work)['score'] == 0.0, label
+
+
+def test_a_boolean_is_read_as_openpyxl_reads_it(tmp_path: Path, work: Path) -> None:
+    """openpyxl reads <v>2</v> in a boolean cell as True, so it doesn't match False."""
+    start, done = {'A1': 'Flag'}, {'A1': 'Flag', 'A2': False}
+    env = _sheet_data_env(tmp_path, start, done)
+    home = tmp_path / 'home'
+    (home / 'Desktop').mkdir(parents=True)
+    good = make_xlsx(tmp_path / 'good.xlsx', [('Sheet1', done, [])]).read_bytes()
+    with zipfile.ZipFile(io.BytesIO(good)) as archive:
+        sheet = archive.read('xl/worksheets/sheet1.xml').decode()
+    two = sheet.replace('<c r="A2" t="b"><v>0</v></c>', '<c r="A2" t="b"><v>2</v></c>')
+    assert two != sheet
+    _repacked(home / 'Desktop' / FILE, good, {'xl/worksheets/sheet1.xml': two})
+
+    assert _run_verifier(env, home, work)['score'] == 0.0
+
+
 def test_a_boolean_does_not_match_a_number(tmp_path: Path, work: Path) -> None:
     start, done = {'A1': 'Flag'}, {'A1': 'Flag', 'A2': 1}
     env = _sheet_data_env(tmp_path, start, done)
@@ -796,7 +837,18 @@ def test_unsaved_changes_and_a_wrong_sheet_name_are_judged_zeros(
 
 
 @pytest.mark.parametrize(
-    'label', ['missing', 'not a zip', 'a FIFO', 'no package', 'two mains', 'no manifest']
+    'label',
+    [
+        'missing',
+        'not a zip',
+        'a FIFO',
+        'no package',
+        'two mains',
+        'no manifest',
+        'a missing related part',
+        'an inexact main relationship',
+        'not a w:document',
+    ],
 )
 def test_a_saved_document_the_agent_broke_is_a_judged_zero(
     label: str, tmp_path: Path, work: Path
@@ -810,6 +862,31 @@ def test_a_saved_document_the_agent_broke_is_a_judged_zero(
         rels = gold.read('_rels/.rels').decode()
     if label == 'not a zip':
         saved.write_bytes(b'not a document')
+    elif label in ('a missing related part', 'an inexact main relationship', 'not a w:document'):
+        with zipfile.ZipFile(make_docx(tmp_path / 'right.docx', _DOC_GOLD)) as right:
+            parts = {name: right.read(name) for name in right.namelist()}
+        if label == 'a missing related part':  # python-docx loads every related part
+            parts['word/_rels/document.xml.rels'] = (
+                b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/'
+                b'relationships"><Relationship Id="rId1" Target="styles.xml" Type="http://'
+                b'schemas.openxmlformats.org/officeDocument/2006/relationships/styles"/>'
+                b'</Relationships>'
+            )
+        elif label == 'an inexact main relationship':
+            parts['_rels/.rels'] = parts['_rels/.rels'].replace(
+                b'http://schemas.openxmlformats.org/officeDocument/2006/relationships/'
+                b'officeDocument',
+                b'https://invalid/officeDocument',
+            )
+        else:
+            parts['word/document.xml'] = (
+                parts['word/document.xml']
+                .replace(b'<w:document', b'<w:other')
+                .replace(b'</w:document>', b'</w:other>')
+            )
+        with zipfile.ZipFile(saved, 'w') as archive:
+            for name, data in parts.items():
+                archive.writestr(name, data)
     elif label == 'no manifest':  # python-docx can't open a package without one
         with zipfile.ZipFile(make_docx(tmp_path / 'right.docx', _DOC_GOLD)) as right:
             with zipfile.ZipFile(saved, 'w') as archive:
