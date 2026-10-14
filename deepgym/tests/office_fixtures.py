@@ -166,6 +166,17 @@ def make_docx(path: Path, paragraphs: list[str]) -> Path:
     )
     document = f'<w:document xmlns:w="{_W_NS}"><w:body>{body}</w:body></w:document>'
     with zipfile.ZipFile(path, 'w') as archive:
+        archive.writestr('[Content_Types].xml', docx_content_types('word/document.xml'))
         archive.writestr('_rels/.rels', _package_rels('word/document.xml'))
         archive.writestr('word/document.xml', document)
     return path
+
+
+def docx_content_types(main: str) -> str:
+    """[Content_Types].xml declaring *main* as a Word document."""
+    wml = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'
+    return (
+        f'<Types xmlns="{_CT_NS}"><Default Extension="rels" '
+        'ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        f'<Override PartName="/{main}" ContentType="{wml}"/></Types>'
+    )

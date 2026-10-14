@@ -23,7 +23,7 @@ import pytest
 
 from deepgym import Action, ComputerUseEnvironment
 from deepgym.registry import load_environment_dir
-from tests.office_fixtures import Date, Duration, make_docx, make_xlsx
+from tests.office_fixtures import Date, Duration, docx_content_types, make_docx, make_xlsx
 
 scripts_dir = Path(__file__).resolve().parent.parent / 'scripts'
 if str(scripts_dir) not in sys.path:
@@ -461,6 +461,51 @@ def test_an_elapsed_time_does_not_match_a_date(tmp_path: Path, work: Path) -> No
         assert _run_verifier(env, home, work)['score'] == score, label
 
 
+def test_a_part_declared_twice_is_unreadable(tmp_path: Path, work: Path) -> None:
+    """Readers disagree on which of two declarations counts, so the file is a 0."""
+    start, done = {'A1': 'Total'}, {'A1': 'Total', 'A2': 123}
+    env = _sheet_data_env(tmp_path, start, done)
+    home = tmp_path / 'home'
+    (home / 'Desktop').mkdir(parents=True)
+    good = make_xlsx(tmp_path / 'good.xlsx', [('Sheet1', done, [])]).read_bytes()
+    with zipfile.ZipFile(io.BytesIO(good)) as archive:
+        types = archive.read('[Content_Types].xml').decode()
+    twice = types.replace(
+        '</Types>',
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-'
+        'officedocument.spreadsheetml.worksheet+xml"/></Types>',
+    )
+    _repacked(home / 'Desktop' / FILE, good, {'[Content_Types].xml': twice})
+
+    assert _run_verifier(env, home, work)['score'] == 0.0
+
+
+def test_a_number_in_a_format_openpyxl_reads_as_a_date_is_not_that_number(
+    tmp_path: Path, work: Path
+) -> None:
+    """'*d0' pads with 'd', and openpyxl's classifier counts it as a date format."""
+    start, done = {'A1': 'Total'}, {'A1': 'Total', 'A2': 123}
+    env = _sheet_data_env(tmp_path, start, done)
+    home = tmp_path / 'home'
+    (home / 'Desktop').mkdir(parents=True)
+    good = make_xlsx(tmp_path / 'good.xlsx', [('Sheet1', done, [])]).read_bytes()
+    with zipfile.ZipFile(io.BytesIO(good)) as archive:
+        sheet = archive.read('xl/worksheets/sheet1.xml').decode()
+    styles = (
+        f'<styleSheet xmlns="{_X}"><numFmts><numFmt numFmtId="164" formatCode="*d0"/>'
+        '</numFmts><cellXfs><xf numFmtId="0"/><xf numFmtId="164"/></cellXfs></styleSheet>'
+    )
+    padded = sheet.replace('<c r="A2">', '<c r="A2" s="1">')
+    assert padded != sheet
+    _repacked(
+        home / 'Desktop' / FILE,
+        good,
+        {'xl/styles.xml': styles, 'xl/worksheets/sheet1.xml': padded},
+    )
+
+    assert _run_verifier(env, home, work)['score'] == 0.0
+
+
 def test_a_boolean_does_not_match_a_number(tmp_path: Path, work: Path) -> None:
     start, done = {'A1': 'Flag'}, {'A1': 'Flag', 'A2': 1}
     env = _sheet_data_env(tmp_path, start, done)
@@ -750,7 +795,9 @@ def test_unsaved_changes_and_a_wrong_sheet_name_are_judged_zeros(
         assert _run_verifier(env, home, work)['score'] == score, label
 
 
-@pytest.mark.parametrize('label', ['missing', 'not a zip', 'a FIFO', 'no package', 'two mains'])
+@pytest.mark.parametrize(
+    'label', ['missing', 'not a zip', 'a FIFO', 'no package', 'two mains', 'no manifest']
+)
 def test_a_saved_document_the_agent_broke_is_a_judged_zero(
     label: str, tmp_path: Path, work: Path
 ) -> None:
@@ -763,6 +810,12 @@ def test_a_saved_document_the_agent_broke_is_a_judged_zero(
         rels = gold.read('_rels/.rels').decode()
     if label == 'not a zip':
         saved.write_bytes(b'not a document')
+    elif label == 'no manifest':  # python-docx can't open a package without one
+        with zipfile.ZipFile(make_docx(tmp_path / 'right.docx', _DOC_GOLD)) as right:
+            with zipfile.ZipFile(saved, 'w') as archive:
+                for name in right.namelist():
+                    if name != '[Content_Types].xml':
+                        archive.writestr(name, right.read(name))
     elif label == 'a FIFO':
         os.mkfifo(saved)
     elif label in ('no package', 'two mains'):
@@ -811,6 +864,7 @@ def test_the_main_document_part_is_the_one_the_package_names(tmp_path: Path) -> 
             '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
             f'<Relationship Id="rId1" Type="{main}" Target="word/real.xml"/></Relationships>',
         )
+        archive.writestr('[Content_Types].xml', docx_content_types('word/real.xml'))
         archive.writestr('word/real.xml', real)
         with zipfile.ZipFile(make_docx(tmp_path / 'gold.docx', _DOC_GOLD)) as gold:
             archive.writestr('word/document.xml', gold.read('word/document.xml'))

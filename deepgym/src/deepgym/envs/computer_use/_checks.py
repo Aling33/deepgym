@@ -77,6 +77,7 @@ _REL_NS = '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}
 _PKG_REL_NS = '{http://schemas.openxmlformats.org/package/2006/relationships}'
 _W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
 _CT_NS = '{http://schemas.openxmlformats.org/package/2006/content-types}'
+_WML_MAIN = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml'
 
 _COORD_RE = re.compile(r'([A-Z]{1,3})([1-9][0-9]{0,6})')
 _MAX_ROW, _MAX_COL = 1_048_576, 16_384
@@ -297,11 +298,13 @@ def _cell_value(cell: ET.Element, shared: list[str]) -> object:
 _DATE_FORMAT_IDS = frozenset({14, 15, 16, 17, 18, 19, 20, 21, 22, 45, 46, 47})
 _DURATION_FORMAT_IDS = frozenset({46})
 """Built-in formats openpyxl reads as a duration ([h]:mm:ss) rather than a date."""
-_ELAPSED = re.compile(r'\[(h+|m+|s+)\]', re.IGNORECASE)
-"""An elapsed-time section, which makes a format a duration."""
+_TIMEDELTA = re.compile(
+    r'\[hh?\](:mm(:ss(\.0*)?)?)?|\[mm?\](:ss(\.0*)?)?|\[ss?\](\.0*)?', re.IGNORECASE
+)
+"""openpyxl's TIMEDELTA_RE: an elapsed-time section makes a date format a duration."""
 """Built-in number formats that show a date or time."""
-_FORMAT_NOISE = re.compile(r'"[^"]*"|\\.|_.|\*.|\[[^\]]*\]')
-"""Quoted text, escapes, padding and [colour/locale/elapsed] sections of a format code."""
+_FORMAT_NOISE = re.compile(r'".*?"|\[(?!hh?\]|mm?\]|ss?\])[^\]]*\]')
+"""openpyxl's STRIP_RE: quoted text and bracketed sections other than [h], [m], [s]."""
 
 
 def _date_styles(archive: zipfile.ZipFile, part: str | None) -> dict[int, str]:
@@ -323,12 +326,10 @@ def _date_styles(archive: zipfile.ZipFile, part: str | None) -> dict[int, str]:
         raise ValueError('a number format code is too long')
     kinds = {fmt_id: 'date' for fmt_id in _DATE_FORMAT_IDS - set(custom)}
     kinds |= dict.fromkeys(_DURATION_FORMAT_IDS - set(custom), 'duration')
-    for fmt_id, code in custom.items():
+    for fmt_id, code in custom.items():  # openpyxl's is_date_format, then is_timedelta_format
         first = code.split(';')[0]
-        if _ELAPSED.search(first):
-            kinds[fmt_id] = 'duration'
-        elif re.search(r'[dmyhs]', _FORMAT_NOISE.sub('', first), re.IGNORECASE):
-            kinds[fmt_id] = 'date'
+        if re.search(r'(?<![_\\])[dmhysDMHYS]', _FORMAT_NOISE.sub('', first)):
+            kinds[fmt_id] = 'duration' if _TIMEDELTA.search(first) else 'date'
     xfs = root.find(f'{_XLSX_NS}cellXfs')
     styles = {}
     for index, xf in enumerate([] if xfs is None else xfs.findall(f'{_XLSX_NS}xf')):
@@ -414,6 +415,24 @@ def _sheet_grid(
     return _trim(grid)
 
 
+def _content_types(archive: zipfile.ZipFile) -> tuple[dict[str, str], dict[str, str]]:
+    """[Content_Types].xml as ({part name: type}, {extension: type}).
+
+    Raises:
+        ValueError: If a part or extension is declared twice: readers would disagree
+            on which declaration counts.
+    """
+    types = _read_xml(archive, '[Content_Types].xml')
+    found: tuple[dict[str, str], dict[str, str]] = ({}, {})
+    for table, tag, key in ((found[0], 'Override', 'PartName'), (found[1], 'Default', 'Extension')):
+        for node in types.findall(f'{_CT_NS}{tag}'):
+            name = node.get(key, '').lstrip('/').lower()
+            if name in table:
+                raise ValueError(f'[Content_Types].xml declares {name} twice')
+            table[name] = node.get('ContentType', '')
+    return found
+
+
 def _check_declarations(archive: zipfile.ZipFile, book: str, parts: dict[str, str]) -> None:
     """Refuse a workbook whose content types and relationships name different parts.
 
@@ -424,16 +443,12 @@ def _check_declarations(archive: zipfile.ZipFile, book: str, parts: dict[str, st
     Raises:
         ValueError: If the declarations disagree.
     """
-    types = _read_xml(archive, '[Content_Types].xml')
-    declared = {
-        node.get('PartName', '').lstrip('/'): node.get('ContentType', '')
-        for node in types.findall(f'{_CT_NS}Override')
-    }
+    declared, _ = _content_types(archive)
     books = {name for name, kind in declared.items() if kind.endswith('.main+xml')}
     strings = {name for name, kind in declared.items() if kind.endswith('.sharedStrings+xml')}
-    if books != {book}:
+    if books != {book.lower()}:
         raise ValueError(f'content types declare {sorted(books)}, relationships {book}')
-    if strings != ({parts['sharedStrings']} if 'sharedStrings' in parts else set()):
+    if strings != ({parts['sharedStrings'].lower()} if 'sharedStrings' in parts else set()):
         raise ValueError('content types and relationships name different shared strings')
     if parts.get('styles', 'xl/styles.xml') != 'xl/styles.xml':
         raise ValueError(f'styles at {parts["styles"]}, not xl/styles.xml')
@@ -532,7 +547,13 @@ def read_docx_text(path: str) -> str:
     """
     try:
         with _open_package(path) as archive:
-            root = _read_xml(archive, _main_part(archive))
+            main = _main_part(archive)
+            # python-docx opens only a main part whose content type is a Word document.
+            declared, defaults = _content_types(archive)
+            kind = declared.get(main.lower()) or defaults.get(main.rpartition('.')[2].lower())
+            if kind != _WML_MAIN:
+                raise ValueError(f'{main} has content type {kind!r}, not a Word document')
+            root = _read_xml(archive, main)
         body = root.find(f'{_W_NS}body')
         paragraphs = []
         for para in [] if body is None else body:
