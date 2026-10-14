@@ -35,6 +35,7 @@ def make_xlsx(path: Path, sheets: list[tuple[str, dict[str, object], list[str]]]
     for index, (name, cells, merges) in enumerate(sheets, start=1):
         parts.append((name, _sheet_xml(cells, merges, shared), index))
     members = {
+        '_rels/.rels': _package_rels('xl/workbook.xml'),
         'xl/workbook.xml': _workbook_xml([name for name, _, _ in parts]),
         'xl/_rels/workbook.xml.rels': _rels_xml(len(parts)),
         'xl/styles.xml': _STYLES_XML,
@@ -103,10 +104,24 @@ def _workbook_xml(names: list[str]) -> str:
     return f'<workbook xmlns="{_XLSX_NS}" xmlns:r="{_REL_NS}"><sheets>{sheets}</sheets></workbook>'
 
 
+def _package_rels(main: str) -> str:
+    """The package's relationships: its main part, at *main*."""
+    return (
+        f'<Relationships xmlns="{_PKG_REL_NS}"><Relationship Id="rId1" '
+        f'Type="{_REL_NS}/officeDocument" Target="{main}"/></Relationships>'
+    )
+
+
 def _rels_xml(count: int) -> str:
+    """The workbook's relationships: its sheets, shared strings and styles."""
     rels = ''.join(
-        f'<Relationship Id="rId{index}" Type="worksheet" Target="worksheets/sheet{index}.xml"/>'
+        f'<Relationship Id="rId{index}" Type="{_REL_NS}/worksheet" '
+        f'Target="worksheets/sheet{index}.xml"/>'
         for index in range(1, count + 1)
+    )
+    rels += (
+        f'<Relationship Id="rIdS" Type="{_REL_NS}/sharedStrings" Target="sharedStrings.xml"/>'
+        f'<Relationship Id="rIdT" Type="{_REL_NS}/styles" Target="styles.xml"/>'
     )
     return f'<Relationships xmlns="{_PKG_REL_NS}">{rels}</Relationships>'
 
@@ -118,12 +133,7 @@ def make_docx(path: Path, paragraphs: list[str]) -> Path:
         for para in paragraphs
     )
     document = f'<w:document xmlns:w="{_W_NS}"><w:body>{body}</w:body></w:document>'
-    main = f'{_REL_NS}/officeDocument'
-    rels = (
-        f'<Relationships xmlns="{_PKG_REL_NS}">'
-        f'<Relationship Id="rId1" Type="{main}" Target="word/document.xml"/></Relationships>'
-    )
     with zipfile.ZipFile(path, 'w') as archive:
-        archive.writestr('_rels/.rels', rels)
+        archive.writestr('_rels/.rels', _package_rels('word/document.xml'))
         archive.writestr('word/document.xml', document)
     return path

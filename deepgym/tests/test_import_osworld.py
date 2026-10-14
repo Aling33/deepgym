@@ -363,6 +363,71 @@ def test_a_date_only_matches_a_cell_shown_as_that_date(tmp_path: Path, work: Pat
         assert _run_verifier(env, home, work)['score'] == score, label
 
 
+def _sheet_data_env(tmp_path: Path, start: dict, done: dict):
+    source = make_xlsx(tmp_path / 'source.xlsx', [('Sheet1', start, [])])
+    gold = make_xlsx(tmp_path / 'gold.xlsx', [('Sheet1', done, [])])
+    rules = [{'type': 'sheet_data', 'sheet_idx0': 0, 'sheet_idx1': 'EI0'}]
+    return _import(tmp_path, _task_config(rules=rules), source, gold)[0]
+
+
+def test_the_workbook_scored_is_the_one_the_package_names(tmp_path: Path, work: Path) -> None:
+    """openpyxl reads the workbook the package's relationships name, so a stray
+    xl/workbook.xml holding the right answer is not what gets scored."""
+    start, done = {'A1': 'Total'}, {'A1': 'Total', 'A2': 123}
+    env = _sheet_data_env(tmp_path, start, done)
+    home = tmp_path / 'home'
+    (home / 'Desktop').mkdir(parents=True)
+    right = make_xlsx(tmp_path / 'right.xlsx', [('Sheet1', done, [])]).read_bytes()
+    with zipfile.ZipFile(io.BytesIO(right)) as archive:
+        book = archive.read('xl/workbook.xml').decode()
+        book_rels = archive.read('xl/_rels/workbook.xml.rels').decode()
+    wrong = make_xlsx(tmp_path / 'wrong.xlsx', [('Sheet1', {'A1': 'Total', 'A2': 999}, [])])
+    with zipfile.ZipFile(wrong) as archive:
+        wrong_sheet = archive.read('xl/worksheets/sheet1.xml').decode()
+    rels = (
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Target="xl/declared.xml" Type="http://schemas.openxmlformats.org'
+        '/officeDocument/2006/relationships/officeDocument"/></Relationships>'
+    )
+    _repacked(
+        home / 'Desktop' / FILE,
+        right,
+        {
+            '_rels/.rels': rels,
+            'xl/declared.xml': book,
+            'xl/_rels/declared.xml.rels': book_rels.replace('sheet1.xml', 'wrong.xml'),
+            'xl/worksheets/wrong.xml': wrong_sheet,
+        },
+    )
+
+    assert _run_verifier(env, home, work)['score'] == 0.0
+
+
+def test_a_1904_workbook_compares_calendar_dates(tmp_path: Path, work: Path) -> None:
+    """The same serial is a different date in a 1904-based workbook: it fails."""
+    start = {'A1': 'Start', 'B1': 'Due', 'A2': Date(40437)}
+    done = {**start, 'B2': Date(40557)}
+    env = _sheet_data_env(tmp_path, start, done)
+    home = tmp_path / 'home'
+    (home / 'Desktop').mkdir(parents=True)
+    good = make_xlsx(tmp_path / 'good.xlsx', [('Sheet1', done, [])]).read_bytes()
+    with zipfile.ZipFile(io.BytesIO(good)) as archive:
+        book = archive.read('xl/workbook.xml').decode()
+    shifted = book.replace('<sheets>', '<workbookPr date1904="1"/><sheets>', 1)
+    _repacked(home / 'Desktop' / FILE, good, {'xl/workbook.xml': shifted})
+
+    assert _run_verifier(env, home, work)['score'] == 0.0
+
+
+def test_a_boolean_does_not_match_a_number(tmp_path: Path, work: Path) -> None:
+    start, done = {'A1': 'Flag'}, {'A1': 'Flag', 'A2': 1}
+    env = _sheet_data_env(tmp_path, start, done)
+    home = tmp_path / 'home'
+    for label, cells, score in (('TRUE for 1', {**start, 'A2': True}, 0.0), ('1', done, 1.0)):
+        _save(tmp_path, home, cells, [])
+        assert _run_verifier(env, home, work)['score'] == score, label
+
+
 def _patch_zip(data: bytes, member: str, edit) -> bytes:
     """*data* with *edit(header, payload)* applied to *member*'s local header and data."""
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
