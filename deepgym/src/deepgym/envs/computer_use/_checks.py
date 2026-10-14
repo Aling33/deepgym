@@ -323,11 +323,8 @@ def _cell_value(cell: ET.Element, shared: list[str]) -> object:
     value = cell.find(f'{_XLSX_NS}v')
     if value is None or value.text is None:
         return None
-    if kind == 's':
-        try:
-            return shared[int(value.text)]
-        except (ValueError, IndexError):
-            return None
+    if kind == 's':  # a reference past the shared strings is unreadable, as for openpyxl
+        return shared[int(value.text)]
     if kind == 'str':
         return value.text
     if kind == 'b':

@@ -558,6 +558,27 @@ def test_an_int_column_does_not_match_a_float_column(tmp_path: Path, work: Path)
         assert _run_verifier(env, home, work)['score'] == score, label
 
 
+def test_a_cell_past_the_shared_strings_is_unreadable(tmp_path: Path, work: Path) -> None:
+    """An extra cell naming a shared string that doesn't exist is not an empty cell:
+    openpyxl can't open the file, so it scores 0 rather than the right answer's 1.0."""
+    start, done = {'A1': 'Amount'}, {'A1': 'Amount', 'A2': 42}
+    env = _sheet_data_env(tmp_path, start, done)
+    home = tmp_path / 'home'
+    (home / 'Desktop').mkdir(parents=True)
+    good = make_xlsx(tmp_path / 'good.xlsx', [('Sheet1', done, [])]).read_bytes()
+    with zipfile.ZipFile(io.BytesIO(good)) as archive:
+        sheet = archive.read('xl/worksheets/sheet1.xml').decode()
+    extra = sheet.replace(
+        '</sheetData>', '<row r="3"><c r="A3" t="s"><v>999</v></c></row></sheetData>'
+    )
+    _repacked(home / 'Desktop' / FILE, good, {'xl/worksheets/sheet1.xml': extra})
+
+    result = _run_verifier(env, home, work)
+
+    assert result['score'] == 0.0
+    assert 'workbook_saved' in result['details']
+
+
 def test_a_boolean_does_not_match_a_number(tmp_path: Path, work: Path) -> None:
     start, done = {'A1': 'Flag'}, {'A1': 'Flag', 'A2': 1}
     env = _sheet_data_env(tmp_path, start, done)
