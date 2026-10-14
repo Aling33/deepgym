@@ -20,11 +20,15 @@ class Inline(str):
     """A string cell stored inline (t="inlineStr") instead of in sharedStrings."""
 
 
+class Date(int):
+    """A serial number in a cell formatted as a date (built-in number format 14)."""
+
+
 def make_xlsx(path: Path, sheets: list[tuple[str, dict[str, object], list[str]]]) -> Path:
     """Write a minimal workbook: one entry per sheet, (name, cells, merged ranges).
 
-    A cell value may be a number, a bool, a str (shared string) or an Inline (an
-    inline string); a cell left out is empty. Cells are 1-based references like 'C7'.
+    A cell value may be a number, a bool, a Date, a str (shared string) or an Inline
+    (an inline string); a cell left out is empty. Cells are 1-based references like 'C7'.
     """
     shared: dict[str, int] = {}
     parts = []
@@ -33,6 +37,7 @@ def make_xlsx(path: Path, sheets: list[tuple[str, dict[str, object], list[str]]]
     members = {
         'xl/workbook.xml': _workbook_xml([name for name, _, _ in parts]),
         'xl/_rels/workbook.xml.rels': _rels_xml(len(parts)),
+        'xl/styles.xml': _STYLES_XML,
     }
     members.update({f'xl/worksheets/sheet{index}.xml': xml for _, xml, index in parts})
     if shared:
@@ -46,6 +51,8 @@ def make_xlsx(path: Path, sheets: list[tuple[str, dict[str, object], list[str]]]
 def _cell_xml(ref: str, value: object, shared: dict[str, int]) -> str:
     if isinstance(value, bool):
         return f'<c r="{ref}" t="b"><v>{int(value)}</v></c>'
+    if isinstance(value, Date):
+        return f'<c r="{ref}" s="1"><v>{int(value)}</v></c>'
     if isinstance(value, (int, float)):
         return f'<c r="{ref}"><v>{value!r}</v></c>'
     if isinstance(value, Inline):
@@ -72,6 +79,13 @@ def _sheet_xml(cells: dict[str, object], merges: list[str], shared: dict[str, in
         else ''
     )
     return f'<worksheet xmlns="{_XLSX_NS}"><sheetData>{body}</sheetData>{merge}</worksheet>'
+
+
+_STYLES_XML = (
+    f'<styleSheet xmlns="{_XLSX_NS}"><cellXfs count="2">'
+    '<xf numFmtId="0"/><xf numFmtId="14" applyNumberFormat="1"/></cellXfs></styleSheet>'
+)
+"""Style 0 is General, style 1 a date."""
 
 
 def _shared_xml(shared: dict[str, int]) -> str:
@@ -104,6 +118,12 @@ def make_docx(path: Path, paragraphs: list[str]) -> Path:
         for para in paragraphs
     )
     document = f'<w:document xmlns:w="{_W_NS}"><w:body>{body}</w:body></w:document>'
+    main = f'{_REL_NS}/officeDocument'
+    rels = (
+        f'<Relationships xmlns="{_PKG_REL_NS}">'
+        f'<Relationship Id="rId1" Type="{main}" Target="word/document.xml"/></Relationships>'
+    )
     with zipfile.ZipFile(path, 'w') as archive:
+        archive.writestr('_rels/.rels', rels)
         archive.writestr('word/document.xml', document)
     return path

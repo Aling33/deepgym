@@ -10,13 +10,14 @@ import json
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
 
 from deepgym import ComputerUseEnvironment
 from deepgym.registry import load_environment_dir
-from tests.office_fixtures import make_docx, make_xlsx
+from tests.office_fixtures import Date, make_docx, make_xlsx
 
 scripts_dir = Path(__file__).resolve().parent.parent / 'scripts'
 if str(scripts_dir) not in sys.path:
@@ -300,6 +301,61 @@ def test_rules_the_starting_file_holds_become_guards(tmp_path: Path, work: Path)
     home = tmp_path / 'home'
     _save(tmp_path, home, _START, [])
     assert _run_verifier(env, home, work)['score'] == 0.0
+
+
+def test_a_date_only_matches_a_cell_shown_as_that_date(tmp_path: Path, work: Path) -> None:
+    """pandas reads a date-formatted cell as a datetime, so the right serial typed as
+    a plain number does not match the reference's date."""
+    head = {'A1': 'Start', 'B1': 'Due'}
+    start = {**head, 'A2': Date(40437)}
+    done = {**start, 'B2': Date(40557)}
+    source = make_xlsx(tmp_path / 'source.xlsx', [('Sheet1', start, [])])
+    gold = make_xlsx(tmp_path / 'gold.xlsx', [('Sheet1', done, [])])
+    rules = [{'type': 'sheet_data', 'sheet_idx0': 0, 'sheet_idx1': 'EI0'}]
+    env, _ = _import(tmp_path, _task_config(rules=rules), source, gold)
+
+    home = tmp_path / 'home'
+    for label, cells, score in (
+        ('the serial as a plain number', {**start, 'B2': 40557}, 0.0),
+        ('the date', done, 1.0),
+    ):
+        _save(tmp_path, home, cells, [])
+        assert _run_verifier(env, home, work)['score'] == score, label
+
+
+def test_a_saved_file_too_large_to_read_scores_zero(tmp_path: Path, work: Path) -> None:
+    """One cell at the far corner of a sheet would make a dense grid of a billion
+    cells: the workbook counts as unreadable (a scored 0), not a verifier crash."""
+    env, _ = _calc_env(tmp_path)
+    home = tmp_path / 'home'
+    _save(tmp_path, home, {**_GOLD, 'AMJ1048576': 'x'}, _MERGED)
+
+    result = _run_verifier(env, home, work)
+
+    assert result['score'] == 0.0
+    assert 'workbook_saved' in result['details']
+
+
+def test_the_main_document_part_is_the_one_the_package_names(tmp_path: Path) -> None:
+    """python-docx reads the part the officeDocument relationship names, so a stray
+    word/document.xml holding the expected text is not what gets scored."""
+    checks = load_checks_module()
+    doc = make_docx(tmp_path / 'real.docx', _DOC_TEXT)
+    with zipfile.ZipFile(doc) as archive:
+        real = archive.read('word/document.xml')
+    forged = tmp_path / 'forged.docx'
+    main = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument'
+    with zipfile.ZipFile(forged, 'w') as archive:
+        archive.writestr(
+            '_rels/.rels',
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            f'<Relationship Id="rId1" Type="{main}" Target="word/real.xml"/></Relationships>',
+        )
+        archive.writestr('word/real.xml', real)
+        with zipfile.ZipFile(make_docx(tmp_path / 'gold.docx', _DOC_GOLD)) as gold:
+            archive.writestr('word/document.xml', gold.read('word/document.xml'))
+
+    assert checks.read_docx_text(str(forged)) == checks.read_docx_text(str(doc))
 
 
 def test_a_sheet_rule_is_one_all_or_nothing_check(tmp_path: Path, work: Path) -> None:

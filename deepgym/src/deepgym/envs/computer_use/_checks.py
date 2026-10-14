@@ -55,8 +55,9 @@ def report(progress: dict[str, bool], guards: dict[str, bool]) -> None:
 #
 # The readers follow what OSWorld's own evaluators see through pandas, openpyxl
 # and python-docx: cached formula values (not formula text), empty cells as
-# None, numbers int when integral (dates stay raw serials, so both sides of a
-# comparison encode the same way), and docx text as python-docx reads it.
+# None, numbers int when integral, a number shown as a date marked as one (openpyxl
+# reads it as a datetime; check_cell reads the raw serial), and docx text as
+# python-docx reads it.
 # office_rule_checks() evaluates compare_table's rules with the same semantics,
 # including DataFrame.round's rounding (numpy's, not Python's, half-to-even).
 
@@ -66,6 +67,18 @@ _PKG_REL_NS = '{http://schemas.openxmlformats.org/package/2006/relationships}'
 _W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
 
 _COORD_RE = re.compile(r'([A-Z]+)(\d+)')
+
+_MAX_PART_BYTES = 32 << 20
+"""Largest unpacked XML part read from a saved file; a bigger one is unreadable."""
+_MAX_CELLS = 1_000_000
+"""Largest used range (rows x columns) read from a sheet; a bigger one is unreadable."""
+
+
+def _read_part(archive: zipfile.ZipFile, name: str) -> ET.Element:
+    """Parse one XML part, refusing one that unpacks past :data:`_MAX_PART_BYTES`."""
+    if archive.getinfo(name).file_size > _MAX_PART_BYTES:
+        raise ValueError(f'{name} is larger than {_MAX_PART_BYTES} bytes')
+    return ET.fromstring(archive.read(name))
 
 
 def _coord_to_cell(coord: str) -> tuple[int, int]:
@@ -91,7 +104,7 @@ def _number(text: str) -> int | float | None:
 
 
 def _cell_value(cell: ET.Element, shared: list[str]) -> object:
-    """The value of one <c> element, as pandas reads it (dates stay serials)."""
+    """The value of one <c> element, as pandas reads it (a date is its serial here)."""
     kind = cell.get('t')
     if kind == 'inlineStr':
         node = cell.find(f'{_XLSX_NS}is')
@@ -115,6 +128,38 @@ def _cell_value(cell: ET.Element, shared: list[str]) -> object:
     return _number(value.text)
 
 
+_DATE_FORMAT_IDS = frozenset({14, 15, 16, 17, 18, 19, 20, 21, 22, 45, 46, 47})
+"""Built-in number formats that show a date or time."""
+_FORMAT_NOISE = re.compile(r'"[^"]*"|\\.|_.|\*.|\[[^\]]*\]')
+"""Quoted text, escapes, padding and [colour/locale/elapsed] sections of a format code."""
+
+
+def _date_styles(archive: zipfile.ZipFile) -> set[int]:
+    """Indexes of the cell styles whose number format shows a date or time.
+
+    openpyxl reads a number in such a cell as a datetime, so pandas never equates it
+    with a plain number; :func:`_sheet_grid` marks those cells the same way.
+    """
+    if 'xl/styles.xml' not in archive.namelist():
+        return set()
+    root = _read_part(archive, 'xl/styles.xml')
+    custom = {
+        int(fmt.get('numFmtId', '-1')): fmt.get('formatCode', '')
+        for fmt in root.iter(f'{_XLSX_NS}numFmt')
+    }
+    xfs = root.find(f'{_XLSX_NS}cellXfs')
+    dated = set()
+    for index, xf in enumerate([] if xfs is None else xfs.findall(f'{_XLSX_NS}xf')):
+        fmt_id = int(xf.get('numFmtId', '0'))
+        code = custom.get(fmt_id)
+        if code is None:
+            if fmt_id in _DATE_FORMAT_IDS:
+                dated.add(index)
+        elif re.search(r'[dmyhs]', _FORMAT_NOISE.sub('', code.split(';')[0]), re.IGNORECASE):
+            dated.add(index)
+    return dated
+
+
 def _merge_ranges(root: ET.Element) -> list[str]:
     merges = root.find(f'{_XLSX_NS}mergeCells')
     if merges is None:
@@ -132,8 +177,16 @@ def _trim(grid: list[list[object]]) -> list[list[object]]:
     return grid
 
 
-def _sheet_grid(root: ET.Element, shared: list[str]) -> list[list[object]]:
-    """Rows of cell values over the sheet's used range; missing cells are None."""
+def _sheet_grid(root: ET.Element, shared: list[str], dated: set[int]) -> list[list[object]]:
+    """Rows of cell values over the sheet's used range; missing cells are None.
+
+    The used range ends at the last non-empty row and column, as after :func:`_trim`.
+    A number in a date-formatted cell (style index in *dated*) becomes
+    ``{'date': serial}``, so it only equals the same serial shown as a date.
+
+    Raises:
+        ValueError: If the used range holds more than :data:`_MAX_CELLS` cells.
+    """
     cells: dict[tuple[int, int], object] = {}
     max_row = 0
     max_col = 0
@@ -145,10 +198,17 @@ def _sheet_grid(root: ET.Element, shared: list[str]) -> list[list[object]]:
             ref = cell.get('r')
             if not ref:
                 continue
+            value = _cell_value(cell, shared)
+            if value is None:
+                continue
+            if _is_number(value) and int(cell.get('s', '0')) in dated:
+                value = {'date': value}
             r, c = _coord_to_cell(ref)
-            cells[(r, c)] = _cell_value(cell, shared)
+            cells[(r, c)] = value
             max_row = max(max_row, r)
             max_col = max(max_col, c)
+    if max_row * max_col > _MAX_CELLS:
+        raise ValueError(f'used range of {max_row} x {max_col} cells is too large')
     grid: list[list[object]] = []
     for r in range(1, max_row + 1):
         grid.append([cells.get((r, c)) for c in range(1, max_col + 1)])
@@ -157,8 +217,8 @@ def _sheet_grid(root: ET.Element, shared: list[str]) -> list[list[object]]:
 
 def _sheet_parts(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
     """(sheet name, part name) for every sheet, in workbook order."""
-    workbook = ET.fromstring(archive.read('xl/workbook.xml'))
-    rels = ET.fromstring(archive.read('xl/_rels/workbook.xml.rels'))
+    workbook = _read_part(archive, 'xl/workbook.xml')
+    rels = _read_part(archive, 'xl/_rels/workbook.xml.rels')
     targets = {
         rel.get('Id'): rel.get('Target') for rel in rels.findall(f'{_PKG_REL_NS}Relationship')
     }
@@ -182,7 +242,8 @@ def read_sheets(path: str) -> list[tuple[str, list[list[object]], list[str]]]:
 
     Returns:
         Sheets in workbook order. A grid's cells are strings, numbers (int when
-        integral), booleans, error text, or None for an empty cell.
+        integral), ``{'date': serial}`` for a number shown as a date or time,
+        booleans, error text, or None for an empty cell.
 
     Raises:
         ValueError: If the file is missing or not a readable workbook.
@@ -191,15 +252,16 @@ def read_sheets(path: str) -> list[tuple[str, list[list[object]], list[str]]]:
         with zipfile.ZipFile(path) as archive:
             shared_node = None
             if 'xl/sharedStrings.xml' in archive.namelist():
-                shared_node = ET.fromstring(archive.read('xl/sharedStrings.xml'))
+                shared_node = _read_part(archive, 'xl/sharedStrings.xml')
             shared = [
                 ''.join(t.text or '' for t in si.iter(f'{_XLSX_NS}t'))
                 for si in (shared_node if shared_node is not None else [])
             ]
+            dated = _date_styles(archive)
             sheets = []
             for name, part in _sheet_parts(archive):
-                root = ET.fromstring(archive.read(part))
-                sheets.append((name, _sheet_grid(root, shared), _merge_ranges(root)))
+                root = _read_part(archive, part)
+                sheets.append((name, _sheet_grid(root, shared, dated), _merge_ranges(root)))
             return sheets
     except (OSError, zipfile.BadZipFile, KeyError, ET.ParseError) as exc:
         raise ValueError(f'{path} is not a readable workbook: {exc}') from exc
@@ -241,7 +303,17 @@ def read_docx_text(path: str) -> str:
     """
     try:
         with zipfile.ZipFile(path) as archive:
-            root = ET.fromstring(archive.read('word/document.xml'))
+            # The main part is the one the package's officeDocument relationship names,
+            # as python-docx resolves it, not whatever sits at word/document.xml.
+            rels = _read_part(archive, '_rels/.rels')
+            main = [
+                rel.get('Target', '').lstrip('/')
+                for rel in rels.findall(f'{_PKG_REL_NS}Relationship')
+                if rel.get('Type', '').endswith('/relationships/officeDocument')
+            ]
+            if len(main) != 1:
+                raise ValueError(f'{len(main)} main document parts')
+            root = _read_part(archive, main[0])
     except (OSError, zipfile.BadZipFile, KeyError, ET.ParseError) as exc:
         raise ValueError(f'{path} is not a readable document: {exc}') from exc
     body = root.find(f'{_W_NS}body')
@@ -279,9 +351,12 @@ def _is_number(value: object) -> bool:
 
 def _same_value(a: object, b: object) -> bool:
     """Elementwise equality as pandas uses it: None only equals None; numbers compare
-    across int/float (and bool, as Python's `==` does); other types must match."""
+    across int/float (and bool, as Python's `==` does); other types must match, and
+    a date only equals the same date."""
     if a is None or b is None:
         return a is None and b is None
+    if isinstance(a, dict) or isinstance(b, dict):
+        return a == b
     if isinstance(a, (int, float)) and isinstance(b, (int, float)):
         return float(a) == float(b)
     if isinstance(a, str) and isinstance(b, str):
@@ -462,6 +537,8 @@ def _rule_verdict(
             try:
                 if prop == 'value':
                     value = cell_at(rows, rule['coordinate'])
+                    if isinstance(value, dict):  # check_cell reads a date's raw serial
+                        value = value['date']
                 elif prop == 'merge':
                     value = is_merged(merges, rule['coordinate'])
                 else:

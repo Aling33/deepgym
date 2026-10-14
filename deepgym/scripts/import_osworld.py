@@ -45,7 +45,6 @@ _TASK_URL = f'https://raw.githubusercontent.com/{_OSWORLD_REPO}/main/evaluation_
 _TASK_API_URL = (
     f'https://api.github.com/repos/{_OSWORLD_REPO}/contents/evaluation_examples/examples'
 )
-
 # (task id, OSWorld domain, environment name): the LibreOffice tasks whose evaluator
 # scores the file the task saves, so a DeepGym verifier can check them with no live
 # desktop. Chrome tasks are excluded: the desktop is locked down and offline.
