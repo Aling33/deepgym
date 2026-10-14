@@ -9,7 +9,7 @@ computer-use environment folder per task:
   - setup.sh        decodes the starting file and opens it in LibreOffice Calc/Writer
   - verifier.py     scores the saved file with the task's own compare_table rules
   - variants.json   the rules (progress and guards), the reference data, result path
-  - metadata.json   type, domain, tags and step budget
+  - metadata.json   type, domain, tags, step budget and the Daytona snapshot
   - assets/<f>.b64  the starting file, staged into the session work directory
 
 The shared ``_checks.py`` (the readers and rule engine the verifier needs) is copied
@@ -21,11 +21,13 @@ OSWorld is Apache-2.0 (https://github.com/xlang-ai/OSWorld); the imported task
 configs, instructions and files keep that license.
 
 Usage:
-    python scripts/import_osworld.py
+    python scripts/import_osworld.py                   # write the environments
+    python scripts/import_osworld.py --build-snapshot  # once: the Daytona snapshot
 """
 
 from __future__ import annotations
 
+import argparse
 import base64
 import importlib.resources
 import importlib.util
@@ -45,6 +47,12 @@ _TASK_URL = f'https://raw.githubusercontent.com/{_OSWORLD_REPO}/main/evaluation_
 _TASK_API_URL = (
     f'https://api.github.com/repos/{_OSWORLD_REPO}/contents/evaluation_examples/examples'
 )
+SNAPSHOT = 'deepgym-osworld-libreoffice'
+"""The Daytona snapshot every imported env boots; ``--build-snapshot`` creates it."""
+_SNAPSHOT_BASE = 'daytonaio/sandbox:0.9.0'
+"""Daytona's desktop image (xfce, computer use) that the snapshot adds LibreOffice to."""
+_SNAPSHOT_PACKAGES = 'libreoffice-calc libreoffice-writer libreoffice-gtk3 fonts-dejavu-core'
+
 # (task id, OSWorld domain, environment name): the LibreOffice tasks whose evaluator
 # scores the file the task saves, so a DeepGym verifier can check them with no live
 # desktop. Chrome tasks are excluded: the desktop is locked down and offline.
@@ -271,8 +279,9 @@ def build_task_md(task: Task) -> str:
 def build_setup(task: Task) -> str:
     """The setup script: decode the starting file and open it in LibreOffice.
 
-    The document window is awaited like OSWorld's own open step does (by title),
-    with a plain wait as the fallback for images without wmctrl.
+    Setup waits for LibreOffice's lock file next to the document, which appears once
+    the document is open, and fails when it never does, so a desktop that can't open
+    the file gives no verdict rather than a 0.
     """
     component = '--calc' if task.func == 'compare_table' else '--writer'
     return _SETUP.replace('<file>', task.file_name).replace('<component>', component)
@@ -292,14 +301,16 @@ file="$HOME/Desktop/<file>"
 mkdir -p "$(dirname "$file")"
 base64 -d "assets/<file>.b64" > "$file"
 (setsid nohup "$soffice_app" --norestore <component> "$file" >/tmp/deepgym_soffice.log 2>&1 &)
-if command -v wmctrl >/dev/null 2>&1; then
-  for _ in $(seq 60); do
-    if wmctrl -l 2>/dev/null | grep -qF '<file>'; then break; fi
-    sleep 1
-  done
-else
-  sleep 10
+lock="$HOME/Desktop/.~lock.<file>#"
+for _ in $(seq 90); do
+  if [ -e "$lock" ]; then break; fi
+  sleep 1
+done
+if [ ! -e "$lock" ]; then
+  echo "LibreOffice did not open <file> within 90 seconds." >&2
+  exit 1
 fi
+sleep 3
 """
 
 
@@ -443,6 +454,7 @@ def build_metadata(task: Task) -> str:
         'domain': task.domain.replace('_', '-'),
         'tags': _tags(task),
         'max_steps': 30,
+        'snapshot': SNAPSHOT,
     }
     return json.dumps(metadata, indent=2) + '\n'
 
@@ -522,7 +534,36 @@ def install_shared(output_dir: Path) -> Path:
     return target
 
 
+def build_snapshot() -> None:
+    """Create the Daytona snapshot the envs boot (:data:`SNAPSHOT`), once per account.
+
+    Daytona builds it remotely from its desktop image plus LibreOffice; sessions run
+    offline, so the apps have to be in the image.
+    """
+    from daytona import CreateSnapshotParams, Daytona, Image
+
+    image = Image.base(_SNAPSHOT_BASE).run_commands(
+        'if [ "$(id -u)" = 0 ]; then S=; else S="sudo -n"; fi; '
+        '$S apt-get update && $S env DEBIAN_FRONTEND=noninteractive apt-get install -y '
+        f'--no-install-recommends {_SNAPSHOT_PACKAGES} && $S rm -rf /var/lib/apt/lists/*'
+    )
+    Daytona().snapshot.create(
+        CreateSnapshotParams(name=SNAPSHOT, image=image), on_logs=print, timeout=0
+    )
+    print(f'Created Daytona snapshot {SNAPSHOT}')
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        '--build-snapshot',
+        action='store_true',
+        help=f'create the Daytona snapshot {SNAPSHOT} the envs run on (needs DAYTONA_API_KEY)',
+    )
+    if parser.parse_args().build_snapshot:
+        build_snapshot()
+        return
+
     output_dir = Path.home() / '.deepgym' / 'environments' / 'osworld'
     output_dir.mkdir(parents=True, exist_ok=True)
     install_shared(output_dir)
@@ -545,6 +586,7 @@ def main() -> None:
         json.dumps(entries, indent=2, ensure_ascii=False) + '\n', encoding='utf-8'
     )
     print(f'Generated {len(entries)} OSWorld environments in {output_dir}')
+    print(f'They run on the Daytona snapshot {SNAPSHOT}; create it once with --build-snapshot.')
 
 
 if __name__ == '__main__':

@@ -26,6 +26,7 @@ if str(scripts_dir) not in sys.path:
 from import_osworld import (  # noqa: E402
     _TASK_API_URL,
     _TASK_URL,
+    SNAPSHOT,
     TASKS,
     Task,
     build_environment,
@@ -215,7 +216,9 @@ def test_metadata_and_registry_entry_describe_a_desktop_task(tmp_path: Path) -> 
         'domain': 'libreoffice-calc',
         'tags': ['osworld', 'libreoffice', 'calc', 'desktop', 'gui'],
         'max_steps': 30,
+        'snapshot': SNAPSHOT,
     }
+    assert load_environment_dir(out / TASK_ID).snapshot == SNAPSHOT
     assert build_registry_entry(_parse(_task_config())) == {
         'id': TASK_ID,
         'name': TITLE,
@@ -251,6 +254,8 @@ def test_setup_script_decodes_the_staged_file() -> None:
     assert f'"$HOME/Desktop/{FILE}"' in script
     assert '--calc' in script and '--writer' not in script
     assert 'sudo' not in script
+    # A document LibreOffice never opens fails setup (no verdict), not the episode.
+    assert f'.~lock.{FILE}#' in script and 'exit 1' in script
 
     writer = _parse(_task_config(DOC, func='compare_docx_files'), domain=WRITER)
     assert '--writer' in build_setup(writer)
