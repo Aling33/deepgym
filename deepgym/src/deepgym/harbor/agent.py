@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import math
+import time
 from typing import NamedTuple
 
-from deepgym.exceptions import DeepGymError, TimeoutError
+from deepgym.exceptions import DeepGymError, SandboxExpiredError, TimeoutError
 from deepgym.harbor.task import HARNESS_PATHS, STAGING_DIR, HarborTask
+from deepgym.models import RunResult
 from deepgym.sandboxes import Sandbox
-from deepgym.session import SandboxBackend, check_workdir
+from deepgym.session import SandboxBackend, check_workdir, failure_result, ran_out_the_clock
 
 DEFAULT_AGENT_TIMEOUT_S = 1800
 """Seconds the agent's script may run when task.toml sets no ``[agent].timeout_sec``."""
@@ -30,12 +32,19 @@ class AgentRun(NamedTuple):
     """Whether the script was killed at the agent timeout."""
 
 
-def run_agent(sandbox: Sandbox, task: HarborTask, script: str) -> AgentRun:
+def run_agent(sandbox: Sandbox, task: HarborTask, script: str) -> AgentRun | RunResult:
     """Run *script* with bash in *task*'s work directory, then archive that directory.
 
     The script runs as an unprivileged user with no capabilities and no network
     (:class:`~deepgym.session.SandboxBackend`), and owns the work directory. Its processes
     are killed before the archive is made. A timeout ends the script, not the run.
+
+    Returns:
+        What the agent left behind; or, once its script has started, the result of any
+        failure (see :func:`~deepgym.session.failure_result`): no verdict only if it is ours
+        for certain (or the provider's lifetime ran out before the script took half the
+        time), else the agent's judged 0 (its sandbox died, its work directory can't be
+        packed or read back, ...).
 
     Args:
         sandbox: A fresh sandbox from the task's image; deleted afterwards.
@@ -44,19 +53,32 @@ def run_agent(sandbox: Sandbox, task: HarborTask, script: str) -> AgentRun:
 
     Raises:
         DeepGymError: If the image's WORKDIR can't be the agent's (``/``, /root, /tmp ...).
-        SandboxError: If setting up the sandbox or archiving fails.
+        SandboxError: If setting up the sandbox or uploading the script fails.
     """
+    opened = time.monotonic()
     workdir = task.workdir or _image_workdir(sandbox, task.name)
     backend = SandboxBackend(sandbox, workdir)  # deletes the sandbox if setup fails
     try:
         sandbox.upload(script.encode('utf-8'), _SCRIPT)
         timeout = math.ceil(task.agent_timeout_sec or DEFAULT_AGENT_TIMEOUT_S)
+        started = time.monotonic()
+        acting_s = None
         try:
-            backend.exec(f'bash {_SCRIPT}', timeout)
-            timed_out = False
-        except TimeoutError:
-            timed_out = True
-        return AgentRun(backend.archive_workdir(), backend.workdir, timed_out)
+            try:
+                backend.exec(f'bash {_SCRIPT}', timeout)
+                timed_out = False
+            except TimeoutError:
+                timed_out = True
+            acting_s = time.monotonic() - started
+            workspace = backend.archive_workdir()
+        except SandboxExpiredError as exc:
+            acting_s = time.monotonic() - started if acting_s is None else acting_s
+            exhausted = ran_out_the_clock(exc, acting_s, time.monotonic() - opened)
+            return failure_result(exc, sandbox.id, exhausted=exhausted)
+        except Exception as exc:
+            # The script has started: only a failure that is ours for certain has no verdict.
+            return failure_result(exc, sandbox.id)
+        return AgentRun(workspace, backend.workdir, timed_out)
     finally:
         sandbox.delete()  # Never raises; a failed delete is logged, not traded for the run.
 

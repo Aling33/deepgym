@@ -11,12 +11,19 @@ import shlex
 import shutil
 import subprocess
 import tarfile
+import time
 from pathlib import Path
 
 import pytest
 
 from deepgym.benchmark_envs import TerminalBenchEnvironment
-from deepgym.exceptions import DeepGymError, SandboxError, VerifierError
+from deepgym.exceptions import (
+    DeepGymError,
+    SandboxDiedError,
+    SandboxError,
+    SandboxExpiredError,
+    VerifierError,
+)
 from deepgym.harbor import HarborEnvironment, HarborTask
 from deepgym.harbor.agent import run_agent
 from deepgym.harbor.grading import grade
@@ -103,10 +110,43 @@ def test_agent_timeout_ends_the_script_not_the_run() -> None:
     assert run_agent(box, HarborTask.from_dir(HELLO), 'sleep 999').timed_out
 
 
-def test_a_corrupted_archive_is_a_sandbox_error() -> None:
+@pytest.mark.parametrize(
+    'archive', ['unreadable', 'refused', 'host_error', 'provider_outage', 'not_started']
+)
+def test_after_the_script_starts_only_a_failure_that_is_ours_for_certain_is_masked(
+    archive: str,
+) -> None:
+    """Fail closed: the agent can make its archive fail (fill the disk, unreadable files),
+    so any failure once its script started is its 0, unless it is certainly ours. A
+    failure before the script starts (its upload) stays ours."""
     box = _box(('base64 /opt', 'H4sI\nnot base64: warning from stderr\n'))
-    with pytest.raises(SandboxError, match='read the archive'):
-        run_agent(box, HarborTask.from_dir(HELLO), '')
+    real_exec = box.exec
+    errors = {
+        'refused': SandboxError('the provider refused the command'),
+        'host_error': OSError(5, 'Input/output error'),
+        'provider_outage': ConnectionError('provider unreachable'),
+    }
+
+    def exec_(command: str, **kwargs: object) -> object:
+        if '-czf' in command and archive in errors:
+            raise errors[archive]
+        return real_exec(command, **kwargs)
+
+    def upload(content: bytes, path: str) -> None:
+        raise SandboxError('script upload failed')
+
+    box.exec = exec_  # type: ignore[method-assign]
+    if archive == 'not_started':
+        box.upload = upload  # type: ignore[method-assign]
+        with pytest.raises(SandboxError, match='script upload failed'):
+            run_agent(box, HarborTask.from_dir(HELLO), '')
+        assert box.deleted
+        return
+    result = run_agent(box, HarborTask.from_dir(HELLO), '')
+
+    ours = archive == 'provider_outage'
+    assert (result.score, result.has_verdict) == (0.0, not ours)
+    assert result.error_type == ('unknown_error' if ours else 'policy_sandbox_failure')
     assert box.deleted
 
 
@@ -122,16 +162,33 @@ def test_a_failed_delete_costs_neither_the_run_nor_the_grade() -> None:
     assert agent_box.deleted and grader_box.deleted
 
 
-def test_agent_sandbox_is_deleted_when_archiving_fails() -> None:
+@pytest.mark.parametrize(
+    'breaks', ['its_work_directory', 'packing_time', 'its_sandbox', 'the_provider_lifetime']
+)
+def test_an_agent_that_breaks_its_archive_or_sandbox_scores_zero(breaks: str) -> None:
+    """A failed or overlong pack is taken as the agent's (its work directory moved, a link,
+    too big; the tools failing themselves can't be told apart), and only the agent's script
+    runs in the sandbox: masking any of these would let it dodge its 0."""
     box = _box()
     real_exec = box.exec
-    box.exec = lambda command, **kw: (  # type: ignore[method-assign]
-        real_exec(command, **kw)._replace(exit_code=2)
-        if '-czf' in command
-        else real_exec(command, **kw)
-    )
-    with pytest.raises(SandboxError, match='archive'):
-        run_agent(box, HarborTask.from_dir(HELLO), '')
+
+    def exec_(command: str, **kwargs: object) -> object:
+        if 'agent.sh' in command and breaks == 'its_sandbox':
+            raise SandboxDiedError('the sandbox ran out of memory')
+        if 'agent.sh' in command and breaks == 'the_provider_lifetime':
+            time.sleep(0.3)  # the script stalls until the provider retires the sandbox
+            raise SandboxExpiredError('the sandbox reached its provider lifetime')
+        if '-czf' in command and breaks == 'packing_time':
+            raise SandboxTimeoutError('command exceeded 600s')
+        if '-czf' in command:
+            return real_exec(command, **kwargs)._replace(exit_code=1)
+        return real_exec(command, **kwargs)
+
+    box.exec = exec_  # type: ignore[method-assign]
+    result = run_agent(box, HarborTask.from_dir(HELLO), '')
+
+    assert (result.score, result.has_verdict) == (0.0, True)
+    assert result.error_type == 'policy_sandbox_failure'
     assert box.deleted
 
 
